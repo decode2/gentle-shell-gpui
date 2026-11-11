@@ -17,7 +17,8 @@ fn base_url_from(env: impl Fn(&str) -> Option<String>) -> String {
     }
 }
 
-fn base_url() -> String {
+/// The daemon's loopback base URL (or `ORCHESTRATOR_URL`).
+pub fn base_url() -> String {
     base_url_from(|key| std::env::var(key).ok())
 }
 

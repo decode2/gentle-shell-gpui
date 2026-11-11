@@ -19,6 +19,7 @@ use gentle_core::orchestrator::{Board, JournalEntry, Lane};
 use gpui::Entity;
 
 use super::client;
+use super::stream;
 use crate::shared::ui;
 
 /// Millisecond wall timestamp for unique worker ids.
@@ -61,6 +62,7 @@ pub struct FleetView {
     chat: Entity<InputState>,
     _load: Task<()>,
     _once: Task<()>,
+    _stream: Task<()>,
 }
 
 impl FleetView {
@@ -86,6 +88,26 @@ impl FleetView {
                 cx.background_executor().timer(Duration::from_secs(5)).await;
             }
         });
+        let (tx, rx) = smol::channel::unbounded::<Board>();
+        stream::spawn_stream(client::base_url(), move |board| {
+            let _ = tx.try_send(board);
+        });
+        let _stream: Task<()> = cx.spawn(async move |this, cx| {
+            loop {
+                let Ok(board) = rx.recv().await else { return };
+                if this
+                    .update(cx, |view, cx| {
+                        view.board = Some(board.clone());
+                        view.error = None;
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        });
+
         let _once: Task<()> = cx.spawn(async move |this, cx| {
             if let Ok(agents) = client::get_agents() {
                 _ = this.update(cx, |view, cx| {
@@ -127,6 +149,7 @@ impl FleetView {
             chat,
             _load: _poll,
             _once,
+            _stream,
         }
     }
 }
