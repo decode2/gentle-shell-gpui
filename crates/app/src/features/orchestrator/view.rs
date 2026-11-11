@@ -20,6 +20,7 @@ use gpui::Entity;
 
 use super::client;
 use super::stream;
+use super::terminal;
 use crate::shared::ui;
 
 /// Millisecond wall timestamp for unique worker ids.
@@ -52,6 +53,7 @@ pub struct FleetView {
     selected_project: String,
     selected: Option<String>,
     journal: Vec<JournalEntry>,
+    terminal: Option<crate::features::orchestrator::terminal::TerminalHandle>,
     diff_files: Vec<gentle_core::orchestrator::DiffFile>,
     evidence_status: Option<String>,
     evidence_summary: Option<String>,
@@ -139,6 +141,7 @@ impl FleetView {
             selected_project: String::new(),
             selected: None,
             journal: Vec::new(),
+            terminal: None,
             diff_files: Vec::new(),
             evidence_status: None,
             evidence_summary: None,
@@ -274,6 +277,33 @@ impl Render for FleetView {
 
         let detail = self.selected.as_ref().map(|session| {
             let id = session.clone();
+            let terminal_panel = self.terminal.as_ref().map(|_term| {
+                v_flex()
+                    .gap_1()
+                    .p_2()
+                    .rounded_lg()
+                    .bg(ui::well())
+                    .border_1()
+                    .border_color(ui::border())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(ui::muted())
+                            .child(format!("terminal (PTY en {id})")),
+                    )
+                    .children(self.terminal_events_tail())
+                    .child(
+                        Button::new("fleet-terminal-ctrlc")
+                            .label("^C")
+                            .small()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(term) = this.terminal.as_mut() {
+                                    let _ = term.send(b"\x03");
+                                }
+                                cx.notify();
+                            })),
+                    )
+            });
             let journal_rows: Vec<AnyElement> = self
                 .journal
                 .iter()
@@ -358,6 +388,7 @@ impl Render for FleetView {
                                 })),
                         ),
                 )
+                .children(terminal_panel)
                 .children(journal_rows)
                 .children(diff_rows)
                 .children(self.evidence_status.iter().map(|status| {
@@ -546,7 +577,37 @@ impl Render for FleetView {
 }
 
 impl FleetView {
+    fn terminal_events_tail(&self) -> Vec<AnyElement> {
+        let Some(handle) = self.terminal.as_ref() else {
+            return Vec::new();
+        };
+        handle
+            .events()
+            .try_iter()
+            .filter_map(|event| match event {
+                terminal::TerminalEvent::Output(bytes) => {
+                    Some(String::from_utf8_lossy(&bytes).to_string())
+                }
+                terminal::TerminalEvent::Closed => None,
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .take(20)
+            .rev()
+            .map(|line| {
+                div()
+                    .text_xs()
+                    .text_color(ui::fg())
+                    .child(line)
+                    .into_any_element()
+            })
+            .collect()
+    }
+
     fn load_detail(&mut self, session: String, cx: &mut Context<Self>) {
+        self.terminal =
+            crate::features::orchestrator::terminal::TerminalHandle::connect(&session).ok();
         if let Ok(entries) = client::get_events(&session) {
             self.journal = entries;
         }

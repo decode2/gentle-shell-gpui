@@ -7,6 +7,7 @@
 pub mod client;
 pub mod sidecar;
 pub mod stream;
+pub mod terminal;
 mod view;
 
 pub use view::{FleetEvent, FleetView};
