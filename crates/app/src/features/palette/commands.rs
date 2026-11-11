@@ -55,6 +55,12 @@ pub(super) fn screen_rows() -> Vec<Row> {
             PaletteAction::Devices,
         ),
         row(
+            IconName::Layers,
+            "Fleet",
+            "Multi-agent orchestration: board, workers, receipts",
+            PaletteAction::Fleet,
+        ),
+        row(
             IconName::Gauge,
             "Usage & stats",
             "Subscription windows and local token/cost stats",

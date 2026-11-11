@@ -22,6 +22,7 @@ use crate::features::files::FileTreeView;
 use crate::features::memory::{MemoryEvent, MemoryView};
 use crate::features::notices::{self, Notices};
 use crate::features::onboarding::{OnboardingEvent, OnboardingView, Probe};
+use crate::features::orchestrator::{FleetEvent, FleetView};
 use crate::features::palette::{
     Category, PaletteAction, PaletteEvent, PaletteInput, PaletteView, WorkspaceRow,
 };
@@ -97,6 +98,7 @@ enum Overlay {
     Palette(Entity<PaletteView>),
     Usage(Entity<UsageView>),
     Memory(Entity<MemoryView>),
+    Fleet(Entity<FleetView>),
     Settings(Entity<SettingsView>),
     Profiles(Entity<ProfilesView>),
     Onboarding(Entity<OnboardingView>),

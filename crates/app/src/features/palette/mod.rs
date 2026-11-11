@@ -29,6 +29,7 @@ pub enum PaletteAction {
     Sessions,
     Usage,
     Memory,
+    Fleet,
     Devices,
     Settings,
     /// The onboarding screen: dependency checks and installs.

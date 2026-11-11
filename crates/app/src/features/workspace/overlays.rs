@@ -78,6 +78,7 @@ impl Workspace {
             PaletteAction::Profiles => self.open_profiles(window, cx),
             PaletteAction::Usage => self.open_usage(window, cx),
             PaletteAction::Memory => self.open_memory(window, cx),
+            PaletteAction::Fleet => self.open_fleet(window, cx),
             PaletteAction::Devices => self.devices.update(cx, |panel, cx| panel.show(cx)),
             PaletteAction::Settings => self.open_settings(window, cx),
             PaletteAction::Setup => self.open_onboarding(None, window, cx),
@@ -360,6 +361,23 @@ impl Workspace {
             },
         );
         self.overlay = Some((Overlay::Memory(view), subscription));
+        cx.notify();
+    }
+
+    pub(super) fn open_fleet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cwd = self.active_cwd(cx);
+        if let Err(error) = crate::features::orchestrator::sidecar::ensure_daemon(&cwd) {
+            eprintln!("orchestrator: {error}");
+        }
+        let view = cx.new(|cx| FleetView::new(window, cx));
+        let subscription = cx.subscribe_in(
+            &view,
+            window,
+            |this, _, event: &FleetEvent, window, cx| match event {
+                FleetEvent::Close => this.close_overlay(window, cx),
+            },
+        );
+        self.overlay = Some((Overlay::Fleet(view), subscription));
         cx.notify();
     }
 
