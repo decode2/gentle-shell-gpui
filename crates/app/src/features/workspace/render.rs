@@ -403,6 +403,7 @@ impl Render for Workspace {
                 Overlay::Palette(view) => view.clone().into_any_element(),
                 Overlay::Usage(view) => view.clone().into_any_element(),
                 Overlay::Memory(view) => view.clone().into_any_element(),
+                Overlay::Fleet(view) => view.clone().into_any_element(),
                 Overlay::Settings(view) => view.clone().into_any_element(),
                 Overlay::Profiles(view) => view.clone().into_any_element(),
                 Overlay::Onboarding(view) => view.clone().into_any_element(),

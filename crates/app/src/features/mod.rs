@@ -10,6 +10,7 @@ pub mod memory;
 pub mod music;
 pub mod notices;
 pub mod onboarding;
+pub mod orchestrator;
 pub mod palette;
 pub mod profiles;
 pub mod providers;
