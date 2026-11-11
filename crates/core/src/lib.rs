@@ -12,6 +12,7 @@ pub mod gentle_state;
 pub mod git;
 pub mod music;
 pub mod notifications;
+pub mod orchestrator;
 pub mod profiles;
 pub mod scroll;
 pub mod sessions;
