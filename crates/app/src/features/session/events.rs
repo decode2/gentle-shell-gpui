@@ -9,6 +9,7 @@ use gpui_kit::*;
 use pi_rpc::{Incoming, UiAnswer, UiMethod, UiRequest};
 use serde_json::Value;
 
+use super::state::desktop;
 use super::state::{BackendStatus, Dialog, TurnActivity};
 use super::{SessionEvent, SessionView, view};
 use crate::features::browser::CanvasNotice;
@@ -65,6 +66,8 @@ impl SessionView {
                 self.backend.status = BackendStatus::Exited(code);
                 self.transcript.interrupt();
                 self.extension.dialogs.clear();
+                // Nothing the dead backend said or numbered applies any more.
+                self.desktop.reset();
             }
         }
     }
@@ -160,6 +163,14 @@ impl SessionView {
     }
 
     fn handle_ui(&mut self, request: UiRequest, window: &mut Window, cx: &mut Context<Self>) {
+        // Gentle Desktop's records travel as a widget but are control traffic:
+        // the adapter correlates them, so they never land in widget storage.
+        // Every other widget keeps the handling below unchanged.
+        if desktop::is_desktop_widget(&request) {
+            let applied = self.desktop.ui(&request);
+            self.apply_desktop(applied, cx);
+            return;
+        }
         if request.method.is_dialog() {
             if let Some(timeout) = request.timeout {
                 let id = request.id.clone();

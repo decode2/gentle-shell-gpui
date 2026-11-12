@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use gpui_kit::component::notification::Notification;
@@ -11,9 +11,42 @@ use gpui_kit::*;
 use pi_rpc::PiProcess;
 use serde_json::{Value, json};
 
+use super::state::desktop::{self, Applied as DesktopApplied, Send as DesktopSend};
 use super::state::{BackendStatus, ModelInfo};
 use super::{SessionView, attachments, builtins};
 use gentle_core::transcript::NoticeLevel;
+
+/// How long a Desktop request may stay unanswered before the tab drops it.
+/// The extension answers from the same session, so this only fires when
+/// something is genuinely wrong.
+const DESKTOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether Pi's `get_commands` answer lists the Gentle Desktop extension. A
+/// failed request lists nothing, so its prompt is never sent.
+fn discovers_desktop(result: &Result<Value>) -> bool {
+    result
+        .as_ref()
+        .is_ok_and(|data| desktop::registers_desktop(&parse_commands(data)))
+}
+
+/// Pi's `get_commands` data as `(name, description)`, skipping anything that is
+/// not a named command.
+fn parse_commands(data: &Value) -> Vec<(String, String)> {
+    data["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|command| {
+            Some((
+                command["name"].as_str()?.to_string(),
+                command["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ))
+        })
+        .collect()
+}
 
 impl SessionView {
     pub(super) fn process(&self) -> Option<Arc<PiProcess>> {
@@ -61,6 +94,72 @@ impl SessionView {
         }
     }
 
+    /// Act on a Desktop decision: say what failed through the tab's report
+    /// path, then send whatever the channel asked for.
+    pub(super) fn apply_desktop(&mut self, applied: DesktopApplied, cx: &mut Context<Self>) {
+        if let Some(report) = applied.report {
+            self.transcript
+                .notice(NoticeLevel::Warning, report.message());
+            cx.notify();
+        }
+        self.send_desktop(applied.sends, cx);
+    }
+
+    /// Hand Gentle Desktop requests to the backend. Each one is a `prompt` the
+    /// transport answers with a disposition, and the domain answer arrives
+    /// later as the Desktop widget; a guarded timer drops one that never comes.
+    pub(super) fn send_desktop(&mut self, sends: Vec<DesktopSend>, cx: &mut Context<Self>) {
+        for send in sends {
+            self.send_one_desktop(send, cx);
+        }
+    }
+
+    fn send_one_desktop(&mut self, send: DesktopSend, cx: &mut Context<Self>) {
+        if self.process().is_none() {
+            // No backend to answer: drop it like a timeout, silently.
+            let _ = self.desktop.expire(send.generation);
+            return;
+        }
+        let generation = send.generation;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DESKTOP_TIMEOUT).await;
+            let _ = this.update(cx, |this, cx| {
+                // Only its own request: a newer one has another generation.
+                let sends = this.desktop.expire(generation);
+                this.send_desktop(sends, cx);
+            });
+        })
+        .detach();
+        self.request(
+            send.request.prompt_command(),
+            cx,
+            move |this, result, cx| {
+                // `handled` only means the prompt was accepted; nothing but that
+                // keeps the request waiting for its widget record.
+                let handled = result.is_ok_and(|data| data["disposition"] == "handled");
+                let applied = this.desktop.outer(generation, handled);
+                this.apply_desktop(applied, cx);
+            },
+        );
+    }
+
+    /// Pi's command list: what the `/` menu offers, and the discovery that
+    /// decides whether Gentle Desktop's extension is there at all. The prompt
+    /// carrying a Desktop record must never be sent on a guess, because a Shell
+    /// without the command would run that JSON as a conversation prompt.
+    fn refresh_commands(&mut self, cx: &mut Context<Self>) {
+        self.request(json!({"type": "get_commands"}), cx, |this, result, cx| {
+            // Read before the result is consumed: a failed listing leaves the
+            // channel closed, and `report` puts that error in the conversation.
+            let registered = discovers_desktop(&result);
+            if let Some(data) = this.report(result) {
+                this.commands = parse_commands(&data);
+                let applied = this.desktop.ready(registered);
+                this.apply_desktop(applied, cx);
+            }
+        });
+    }
+
     pub(super) fn refresh_state(&mut self, cx: &mut Context<Self>) {
         self.request(json!({"type": "get_state"}), cx, |this, result, _| {
             if let Some(state) = this.report(result) {
@@ -88,21 +187,7 @@ impl SessionView {
             },
         );
         self.refresh_thinking_levels(cx);
-        self.request(json!({"type": "get_commands"}), cx, |this, result, _| {
-            if let Some(data) = this.report(result) {
-                this.commands = data["commands"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|c| {
-                        Some((
-                            c["name"].as_str()?.to_string(),
-                            c["description"].as_str().unwrap_or_default().to_string(),
-                        ))
-                    })
-                    .collect();
-            }
-        });
+        self.refresh_commands(cx);
         self.request(json!({"type": "get_messages"}), cx, |this, result, _| {
             if let Some(data) = this.report(result) {
                 let messages = data["messages"].as_array().cloned().unwrap_or_default();
@@ -486,7 +571,40 @@ fn export_file_stem(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::export_file_stem;
+    use anyhow::anyhow;
+    use serde_json::{Value, json};
+
+    use super::{discovers_desktop, export_file_stem, parse_commands};
+
+    #[test]
+    fn only_a_listed_desktop_command_opens_the_channel() {
+        let listed = Ok(json!({"commands": [
+            {"name": "gentle:mode", "description": "Permissions"},
+            {"name": "gentle:desktop", "description": "Desktop records"},
+        ]}));
+        assert!(discovers_desktop(&listed));
+
+        // Another Gentle Shell command is not the extension.
+        let other = Ok(json!({"commands": [{"name": "gentle:mode"}]}));
+        assert!(!discovers_desktop(&other));
+
+        // A failed listing, or data without commands, opens nothing: its prompt
+        // would reach Pi as raw JSON.
+        let failed: anyhow::Result<Value> = Err(anyhow!("get_commands failed"));
+        assert!(!discovers_desktop(&failed));
+        assert!(!discovers_desktop(&Ok(json!({"commands": "nope"}))));
+    }
+
+    #[test]
+    fn command_lists_keep_their_names_and_descriptions() {
+        let commands = parse_commands(&json!({"commands": [
+            {"name": "a", "description": "d"},
+            {"description": "no name"},
+            "junk",
+        ]}));
+        assert_eq!(commands, vec![("a".to_string(), "d".to_string())]);
+        assert!(parse_commands(&json!({})).is_empty());
+    }
 
     #[test]
     fn export_names_are_safe_file_names() {

@@ -222,6 +222,9 @@ impl SessionView {
         self.backend.started = true;
         self.backend.status = BackendStatus::Starting;
         self.models.loaded = false;
+        // This tab now has a backend of its own to ask: the previous one's
+        // Desktop answers and event numbering are gone.
+        self.desktop.reset();
         self.transcript = Transcript::default();
         self.markdown.clear();
         self.expanded.clear();

@@ -77,6 +77,8 @@ struct Chrome {
 pub struct SessionView {
     cwd: PathBuf,
     backend: state::Backend,
+    /// Gentle Desktop's RPC channel on this backend (see [`state::desktop`]).
+    desktop: state::desktop::Desktop,
     transcript: Transcript,
     /// Rendered Markdown per (item, block), with the byte length already pushed.
     markdown: HashMap<(usize, usize), (Entity<TextViewState>, usize)>,
@@ -231,6 +233,7 @@ impl SessionView {
         let mut this = Self {
             cwd,
             backend: state::Backend::new(prompt),
+            desktop: state::desktop::Desktop::default(),
             transcript: Transcript::default(),
             markdown: HashMap::new(),
             expanded: HashSet::new(),
