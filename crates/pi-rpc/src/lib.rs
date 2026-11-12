@@ -5,6 +5,7 @@
 //! `extension_ui_request` records come out. Records are split on LF only, never
 //! on Unicode line separators, which are valid inside JSON strings.
 
+pub mod desktop_rpc;
 pub mod file_cache;
 mod home;
 mod launch;
