@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
+use pi_rpc::desktop_rpc::{DesktopMethod, DesktopRecord, DesktopRpcError, decode_widget};
 use pi_rpc::{Incoming, UiAnswer, UiMethod, UiRequest};
 use serde_json::Value;
 
@@ -68,6 +69,7 @@ impl SessionView {
                 self.extension.dialogs.clear();
                 // Nothing the dead backend said or numbered applies any more.
                 self.desktop.reset();
+                self.permission.reset(self.desktop.session());
             }
         }
     }
@@ -167,8 +169,7 @@ impl SessionView {
         // the adapter correlates them, so they never land in widget storage.
         // Every other widget keeps the handling below unchanged.
         if desktop::is_desktop_widget(&request) {
-            let applied = self.desktop.ui(&request);
-            self.apply_desktop(applied, cx);
+            self.handle_desktop_ui(&request, cx);
             return;
         }
         if request.method.is_dialog() {
@@ -280,6 +281,63 @@ impl SessionView {
         }
     }
 
+    /// Route one Desktop widget record to the slice that owns it, then hand
+    /// the original request to that slice so the shared session accepts it
+    /// exactly once. Permission responses go to whoever's request is pending;
+    /// permission events to the permission slice; everything else stays on the
+    /// channel (probe, sequencing, resync, and every benign foreign record).
+    fn handle_desktop_ui(&mut self, request: &UiRequest, cx: &mut Context<Self>) {
+        let decoded = decode_widget(request);
+        let pending = self.desktop.session().pending().map(|(_, method)| method);
+        match route_desktop_widget(&decoded, pending) {
+            DesktopRoute::Permission => {
+                // Capture the intent before the slice consumes it, so a server
+                // `unsupported_method` can still fall back to the legacy
+                // save+restart path once.
+                let requested_mode = self
+                    .permission
+                    .requested()
+                    .map(|requested| super::from_desktop_mode(requested.mode));
+                let applied = self.permission.apply(self.desktop.session(), request);
+                match applied.report.as_ref() {
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync. The record was already accepted by the permission
+                    // slice, so it is never accepted again here.
+                    Some(desktop::permission::Report::OutOfOrderSequence) => {
+                        let sends = self.desktop.resync();
+                        self.send_desktop(sends, cx);
+                    }
+                    Some(desktop::permission::Report::UnsupportedMethod) => {
+                        if let Some(mode) = requested_mode {
+                            self.legacy_choose_mode_deferred(mode, cx);
+                            return;
+                        }
+                        self.apply_permission(applied, cx);
+                    }
+                    _ => self.apply_permission(applied, cx),
+                }
+            }
+            DesktopRoute::Channel => {
+                let applied = self.desktop.ui(request);
+                self.apply_desktop(applied, cx);
+                self.sync_permission_capabilities(cx);
+            }
+        }
+    }
+
+    /// Keep the permission slice's view of the peer's capabilities in step with
+    /// the channel's probe, and seed the confirmed mode once those capabilities
+    /// are known.
+    fn sync_permission_capabilities(&mut self, cx: &mut Context<Self>) {
+        if let Some(capabilities) = self.desktop.capabilities().cloned() {
+            self.permission.set_capabilities(capabilities);
+        }
+        // The seed waits for any in-flight request, so the probe and the
+        // permission slice never issue two requests at once.
+        let seeded = self.permission.seed(self.desktop.session());
+        self.apply_permission(seeded, cx);
+    }
+
     /// Point keyboard focus at the front dialog: its text field, or the
     /// session itself so typing does not leak into the composer.
     fn prepare_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -363,6 +421,40 @@ impl SessionView {
             });
         })
         .detach();
+    }
+}
+
+/// Which slice owns one incoming Desktop record. A record is routed to the
+/// permission slice only when it is a permission response or the advertised
+/// permission event; everything else belongs to the channel (probe, resync,
+/// and every benign foreign/late record). The shared session then accepts the
+/// record exactly once, in the slice that owns it.
+enum DesktopRoute {
+    Permission,
+    Channel,
+}
+
+fn route_desktop_widget(
+    decoded: &Result<Option<DesktopRecord>, DesktopRpcError>,
+    pending: Option<DesktopMethod>,
+) -> DesktopRoute {
+    match decoded {
+        Ok(Some(DesktopRecord::Response(_))) => {
+            if matches!(
+                pending,
+                Some(DesktopMethod::GetPermissionMode) | Some(DesktopMethod::SetPermissionMode)
+            ) {
+                DesktopRoute::Permission
+            } else {
+                DesktopRoute::Channel
+            }
+        }
+        Ok(Some(DesktopRecord::Event(event)))
+            if event.event == desktop::permission::PERMISSION_MODE_CHANGED =>
+        {
+            DesktopRoute::Permission
+        }
+        _ => DesktopRoute::Channel,
     }
 }
 
@@ -466,11 +558,13 @@ fn git_refresh_wait(since_last: Option<Duration>) -> Duration {
 mod tests {
     use std::time::Duration;
 
-    use serde_json::json;
+    use pi_rpc::desktop_rpc::{DesktopMethod, SCHEMA, WIDGET_KEY, decode_widget};
+    use pi_rpc::{UiMethod, UiRequest};
+    use serde_json::{Value, json};
 
     use super::{
-        GIT_REFRESH_INTERVAL, design_canvas, git_refresh_wait, notice_level, queued_count,
-        tool_output,
+        DesktopRoute, GIT_REFRESH_INTERVAL, design_canvas, git_refresh_wait, notice_level,
+        queued_count, route_desktop_widget, tool_output,
     };
     use crate::features::browser::CanvasNotice;
     use crate::features::session::state::TurnActivity;
@@ -576,5 +670,90 @@ mod tests {
         activity.tool_started(&json!({"toolName": "unknown_tool", "args": {}}));
         assert_eq!(activity.phase, Some("exploring"));
         assert!(activity.job_commands.is_empty());
+    }
+
+    /// A Desktop widget as Pi delivers a record.
+    fn widget(lines: Option<Vec<String>>) -> UiRequest {
+        UiRequest {
+            id: "ui-1".into(),
+            timeout: None,
+            method: UiMethod::SetWidget {
+                key: WIDGET_KEY.into(),
+                lines,
+                placement: None,
+            },
+        }
+    }
+
+    fn record(value: Value) -> Vec<String> {
+        vec![value.to_string()]
+    }
+
+    #[test]
+    fn desktop_records_route_to_the_slice_that_owns_them() {
+        // Responses go to whoever's request is pending.
+        let response = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": "desktop-1",
+            "ok": true,
+            "data": {"mode": "yolo", "default_mode": "yolo"},
+        }))));
+        let decoded = decode_widget(&response);
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::SetPermissionMode)),
+            DesktopRoute::Permission
+        ));
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::Capabilities)),
+            DesktopRoute::Channel
+        ));
+
+        // The advertised permission event goes to the permission slice; every
+        // other event stays on the channel for sequencing and resync.
+        let permission_event = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "event",
+            "seq": 1,
+            "event": "permission_mode_changed",
+            "data": {
+                "mode": "yolo",
+                "previous_mode": "normal",
+                "default_mode": "yolo",
+                "persisted": true,
+                "source": "desktop",
+            },
+        }))));
+        let decoded = decode_widget(&permission_event);
+        assert!(matches!(
+            route_desktop_widget(&decoded, None),
+            DesktopRoute::Permission
+        ));
+
+        let state_event = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "event",
+            "seq": 1,
+            "event": "state_changed",
+            "data": {},
+        }))));
+        let decoded = decode_widget(&state_event);
+        assert!(matches!(
+            route_desktop_widget(&decoded, None),
+            DesktopRoute::Channel
+        ));
+
+        // A cleared widget and a broken record are not this protocol's answer:
+        // the channel owns them, and they stay benign.
+        let cleared = decode_widget(&widget(None));
+        assert!(matches!(
+            route_desktop_widget(&cleared, None),
+            DesktopRoute::Channel
+        ));
+        let broken = decode_widget(&widget(Some(vec!["not json".into()])));
+        assert!(matches!(
+            route_desktop_widget(&broken, None),
+            DesktopRoute::Channel
+        ));
     }
 }

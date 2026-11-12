@@ -327,6 +327,9 @@ pub(in crate::features::session) mod desktop {
         step: Step,
         /// Bumped per request, so an old timer cannot abandon a newer one.
         generation: u64,
+        /// A gap arrived while a permission request was in flight: one
+        /// `get_snapshot` is owed once that request settles or rolls back.
+        pending_resync: bool,
     }
 
     impl Default for Desktop {
@@ -344,6 +347,7 @@ pub(in crate::features::session) mod desktop {
                 covered: None,
                 step: Step::Idle,
                 generation: 0,
+                pending_resync: false,
             }
         }
 
@@ -357,6 +361,7 @@ pub(in crate::features::session) mod desktop {
             self.covered = None;
             self.step = Step::Idle;
             self.generation += 1;
+            self.pending_resync = false;
         }
 
         /// The backend is ready and Pi listed (or did not list) the extension's
@@ -388,13 +393,15 @@ pub(in crate::features::session) mod desktop {
         ///
         /// `generation` is the one its [`Send`] carried: a late answer to a
         /// prompt whose widget record already moved the channel on must not
-        /// drop the request that is pending now.
+        /// drop the request that is pending now. Because the permission slice
+        /// borrows this same session, a late disposition also never drops a
+        /// permission request this channel did not issue.
         pub(in crate::features::session) fn outer(
             &mut self,
             generation: u64,
             handled: bool,
         ) -> Applied {
-            if handled || generation != self.generation || self.session.pending().is_none() {
+            if handled || generation != self.generation || !self.owns_pending() {
                 return Applied::default();
             }
             self.abandon();
@@ -434,6 +441,10 @@ pub(in crate::features::session) mod desktop {
                         }
                         Err(error) => self.unavailable(Report::Snapshot(error)),
                     },
+                    // The permission methods are served by the permission
+                    // slice; this channel only probes and sequences.
+                    Some(DesktopMethod::GetPermissionMode)
+                    | Some(DesktopMethod::SetPermissionMode) => Applied::default(),
                     None => Applied::default(),
                 },
                 Ok(Some(DesktopRecord::Event(event))) => {
@@ -456,7 +467,7 @@ pub(in crate::features::session) mod desktop {
 
         /// The pending timeout for `generation` fired.
         pub(in crate::features::session) fn expire(&mut self, generation: u64) -> Vec<Send> {
-            if generation != self.generation || self.session.pending().is_none() {
+            if generation != self.generation || !self.owns_pending() {
                 return Vec::new();
             }
             self.abandon();
@@ -487,6 +498,13 @@ pub(in crate::features::session) mod desktop {
             self.step
         }
 
+        /// The shared [`DesktopSession`] the permission slice borrows, so its
+        /// requests and the channel's probes share one id space and one
+        /// pending slot. The wiring routes each record to exactly one slice.
+        pub(in crate::features::session) fn session(&mut self) -> &mut DesktopSession {
+            &mut self.session
+        }
+
         /// Stop asking this backend and say why once: the channel is unusable
         /// here until the backend is replaced.
         fn unavailable(&mut self, report: Report) -> Applied {
@@ -499,13 +517,38 @@ pub(in crate::features::session) mod desktop {
         }
 
         /// Ask for the state again after a gap in the events.
-        fn resync(&mut self) -> Vec<Send> {
-            // One request at a time: an answer already on its way brings the
-            // sequence forward, and the next gap asks once more.
+        pub(in crate::features::session) fn resync(&mut self) -> Vec<Send> {
             if self.session.pending().is_some() {
+                // A request is in flight. A channel probe or resync already
+                // covers the gap; a permission request owes one resync once it
+                // settles or rolls back.
+                if !self.owns_pending() {
+                    self.pending_resync = true;
+                }
                 return Vec::new();
             }
             self.issue(DesktopMethod::GetSnapshot, Step::Snapshot)
+        }
+
+        /// Issue the resync deferred while a permission request was in flight.
+        /// Exactly one `get_snapshot` goes out once that request settles or
+        /// rolls back; nothing while another request is still pending.
+        pub(in crate::features::session) fn flush_resync(&mut self) -> Vec<Send> {
+            if !self.pending_resync || self.session.pending().is_some() {
+                return Vec::new();
+            }
+            self.pending_resync = false;
+            self.issue(DesktopMethod::GetSnapshot, Step::Snapshot)
+        }
+
+        /// Whether the pending request is one this channel issued (a probe or
+        /// resync). The permission slice borrows the same session, so a stale
+        /// probe timer must not abandon a permission request now in flight.
+        fn owns_pending(&self) -> bool {
+            matches!(
+                self.session.pending().map(|(_, method)| method),
+                Some(DesktopMethod::Capabilities) | Some(DesktopMethod::GetSnapshot)
+            )
         }
 
         fn abandon(&mut self) {
@@ -528,14 +571,492 @@ pub(in crate::features::session) mod desktop {
             }]
         }
     }
+
+    /// Gentle Desktop's permission-mode state in one tab.
+    ///
+    /// This slice owns only the permission concern: the confirmed state the
+    /// server reported and the one pending `set_permission_mode` intent. It is
+    /// pure state on purpose: the tab only sends what these calls return and
+    /// feeds back what arrives. It adds no consent claim — the human picker
+    /// represents consent later — and never restarts or writes config. It
+    /// borrows the parent's [`DesktopSession`], so probe and permission
+    /// requests share one id space, one pending slot and one event baseline.
+    ///
+    /// Every entry point here is called by the lifecycle/rpc slice that wires
+    /// the picker later, so none of them is live yet.
+    #[allow(dead_code)]
+    pub(in crate::features::session) mod permission {
+        use pi_rpc::UiRequest;
+        use pi_rpc::desktop_rpc::{
+            Capabilities, DesktopErrorInfo, DesktopEvent, DesktopMethod, DesktopRecord,
+            DesktopResponse, DesktopRpcError, DesktopSession, PermissionMode,
+        };
+
+        use super::Send;
+
+        /// The wire name of the only event this slice applies.
+        pub(in crate::features::session) const PERMISSION_MODE_CHANGED: &str =
+            "permission_mode_changed";
+
+        /// The confirmed (server-reported) permission state. Every field is the
+        /// server's truth, never an echo of a request; `None` means the server
+        /// has not said yet.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+        pub(in crate::features::session) struct Confirmed {
+            pub(in crate::features::session) mode: Option<PermissionMode>,
+            pub(in crate::features::session) default_mode: Option<PermissionMode>,
+            pub(in crate::features::session) persisted: Option<bool>,
+        }
+
+        /// The one pending `set_permission_mode` intent: the mode and persist
+        /// flag the user picked. It is not consent, and it never claims the
+        /// server applied anything.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(in crate::features::session) struct Requested {
+            pub(in crate::features::session) mode: PermissionMode,
+            pub(in crate::features::session) persist: Option<bool>,
+        }
+
+        /// What one decision produced: the requests to send, and a failure or
+        /// warning the tab shows through its report path.
+        #[derive(Debug, Default)]
+        pub(in crate::features::session) struct Applied {
+            pub(in crate::features::session) sends: Vec<Send>,
+            pub(in crate::features::session) report: Option<Report>,
+        }
+
+        /// Why a permission request stopped or what it surfaced. The first two
+        /// variants are the legacy-fallback signals; every other variant leaves
+        /// the confirmed state unchanged.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub(in crate::features::session) enum Report {
+            /// The extension does not advertise the method at all.
+            Unsupported,
+            /// The server answered `unsupported_method` for a method its
+            /// capabilities claimed.
+            UnsupportedMethod,
+            /// Capabilities are not known yet: the peer may still offer the
+            /// method, so this is not a legacy-fallback signal.
+            NotReady,
+            /// The request timed out before the server answered.
+            Timeout,
+            /// The mode changed live, but the default could not be saved.
+            PersistError(DesktopErrorInfo),
+            /// A transport, server or decoding failure.
+            Failure(DesktopRpcError),
+            /// A gap in the event sequence: events were lost, so the channel
+            /// must resync on a fresh snapshot. The record was already
+            /// accepted, so the wiring must not accept it again.
+            OutOfOrderSequence,
+        }
+
+        impl Report {
+            /// What the conversation says about it.
+            pub(in crate::features::session) fn message(&self) -> String {
+                match self {
+                    Self::Unsupported | Self::UnsupportedMethod => {
+                        "This Gentle Shell does not support changing the permission mode from Desktop."
+                            .to_string()
+                    }
+                    Self::NotReady => {
+                        "Gentle Desktop is still loading; try the permission change again in a moment."
+                            .to_string()
+                    }
+                    Self::Timeout => {
+                        "The permission request timed out; it was not applied.".to_string()
+                    }
+                    Self::PersistError(error) => format!(
+                        "The permission mode changed, but the new default was not saved ({}: {}).",
+                        error.code, error.message
+                    ),
+                    Self::Failure(error) => {
+                        format!("The permission mode change failed ({error}).")
+                    }
+                    Self::OutOfOrderSequence => {
+                        "Gentle Desktop events were lost; resyncing the channel.".to_string()
+                    }
+                }
+            }
+        }
+
+        /// Whether the pending request belongs to this slice (a permission
+        /// method). The probe channel shares the session, so a stale permission
+        /// timer or disposition must not abandon a probe now in flight.
+        fn owns_pending(session: &DesktopSession) -> bool {
+            matches!(
+                session.pending().map(|(_, method)| method),
+                Some(DesktopMethod::GetPermissionMode) | Some(DesktopMethod::SetPermissionMode)
+            )
+        }
+
+        pub(in crate::features::session) struct Permission {
+            capabilities: Option<Capabilities>,
+            confirmed: Confirmed,
+            requested: Option<Requested>,
+            /// Bumped per request, so an old timer cannot drop a newer one.
+            generation: u64,
+            /// The live state was fetched once for this backend.
+            seeded: bool,
+        }
+
+        impl Default for Permission {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl Permission {
+            pub(in crate::features::session) fn new() -> Self {
+                Self {
+                    capabilities: None,
+                    confirmed: Confirmed::default(),
+                    requested: None,
+                    generation: 0,
+                    seeded: false,
+                }
+            }
+
+            /// Adopt the peer's capabilities once the probe completes; kept so
+            /// requests and events are refused when the peer does not offer
+            /// them.
+            pub(in crate::features::session) fn set_capabilities(
+                &mut self,
+                capabilities: Capabilities,
+            ) {
+                self.capabilities = Some(capabilities);
+            }
+
+            /// What the extension offers, when the probe has said.
+            #[allow(dead_code)]
+            pub(in crate::features::session) fn capabilities(&self) -> Option<&Capabilities> {
+                self.capabilities.as_ref()
+            }
+
+            /// The confirmed (server-reported) permission state.
+            pub(in crate::features::session) fn confirmed(&self) -> Confirmed {
+                self.confirmed
+            }
+
+            /// The pending `set_permission_mode` intent, if one is in flight.
+            pub(in crate::features::session) fn requested(&self) -> Option<Requested> {
+                self.requested
+            }
+
+            /// Ask the server for its live permission state.
+            pub(in crate::features::session) fn get_permission_mode(
+                &mut self,
+                session: &mut DesktopSession,
+            ) -> Applied {
+                let Some(capabilities) = &self.capabilities else {
+                    return Applied {
+                        report: Some(Report::NotReady),
+                        ..Applied::default()
+                    };
+                };
+                if !capabilities.supports(DesktopMethod::GetPermissionMode) {
+                    return Applied {
+                        report: Some(Report::Unsupported),
+                        ..Applied::default()
+                    };
+                }
+                let request = match session.issue(DesktopMethod::GetPermissionMode) {
+                    Ok(request) => request,
+                    Err(error) => return self.failure(error),
+                };
+                self.generation += 1;
+                Applied {
+                    sends: vec![Send {
+                        request,
+                        generation: self.generation,
+                    }],
+                    report: None,
+                }
+            }
+
+            /// Fetch the server's live permission state once this backend's
+            /// capabilities are known. It waits for any in-flight request to
+            /// settle, so the probe and the permission slice never issue two
+            /// requests at once.
+            pub(in crate::features::session) fn seed(
+                &mut self,
+                session: &mut DesktopSession,
+            ) -> Applied {
+                if self.seeded || !self.supports(DesktopMethod::GetPermissionMode) {
+                    return Applied::default();
+                }
+                if session.pending().is_some() {
+                    return Applied::default();
+                }
+                self.seeded = true;
+                self.get_permission_mode(session)
+            }
+
+            /// Request a permission mode change. `persist` is `None` to let the
+            /// server default it to `false`; the confirmed state moves only when
+            /// the server answers. Consent is the caller's concern.
+            pub(in crate::features::session) fn set_permission_mode(
+                &mut self,
+                session: &mut DesktopSession,
+                mode: PermissionMode,
+                persist: Option<bool>,
+            ) -> Applied {
+                let Some(capabilities) = &self.capabilities else {
+                    return Applied {
+                        report: Some(Report::NotReady),
+                        ..Applied::default()
+                    };
+                };
+                if !capabilities.supports(DesktopMethod::SetPermissionMode) {
+                    return Applied {
+                        report: Some(Report::Unsupported),
+                        ..Applied::default()
+                    };
+                }
+                let request = match session.issue_set_permission_mode(mode, persist) {
+                    Ok(request) => request,
+                    Err(error) => return self.failure(error),
+                };
+                self.generation += 1;
+                self.requested = Some(Requested { mode, persist });
+                Applied {
+                    sends: vec![Send {
+                        request,
+                        generation: self.generation,
+                    }],
+                    report: None,
+                }
+            }
+
+            /// Pi answered the outer `prompt`. Only `handled` means the request
+            /// was accepted; anything else rolls it back instead of waiting
+            /// forever. `generation` is the one its [`Send`] carried.
+            pub(in crate::features::session) fn outer(
+                &mut self,
+                session: &mut DesktopSession,
+                generation: u64,
+                handled: bool,
+            ) -> Applied {
+                if handled || generation != self.generation || !owns_pending(session) {
+                    return Applied::default();
+                }
+                self.rollback(session);
+                Applied {
+                    sends: Vec::new(),
+                    report: Some(Report::Failure(DesktopRpcError::UnexpectedDisposition {
+                        disposition: None,
+                    })),
+                }
+            }
+
+            /// One incoming UI request; applies only the records this slice owns
+            /// (typed get/set responses and `permission_mode_changed` events)
+            /// and leaves everything else alone.
+            pub(in crate::features::session) fn apply(
+                &mut self,
+                session: &mut DesktopSession,
+                request: &UiRequest,
+            ) -> Applied {
+                // The session clears the pending request while correlating, so
+                // the method it answered is read first.
+                let awaiting = session.pending().map(|(_, method)| method);
+                match session.accept(request) {
+                    Ok(Some(DesktopRecord::Response(response))) => match awaiting {
+                        Some(DesktopMethod::GetPermissionMode) => self.apply_get(response),
+                        Some(DesktopMethod::SetPermissionMode) => self.apply_set(response),
+                        _ => Applied::default(),
+                    },
+                    Ok(Some(DesktopRecord::Event(event))) => self.apply_event(event),
+                    // Events were lost: surface the gap so the wiring asks the
+                    // channel for a fresh snapshot. The record was already
+                    // accepted, so it must not be accepted again.
+                    Err(DesktopRpcError::OutOfOrderSequence { .. }) => Applied {
+                        report: Some(Report::OutOfOrderSequence),
+                        ..Applied::default()
+                    },
+                    // Not this protocol's widget, or a late, repeated or
+                    // malformed record: the outer channel owns resync, so this
+                    // slice only refuses to apply it.
+                    _ => Applied::default(),
+                }
+            }
+
+            /// The pending timeout for `generation` fired. The request is
+            /// dropped, and the timeout is reported rather than disappearing
+            /// silently.
+            pub(in crate::features::session) fn expire(
+                &mut self,
+                session: &mut DesktopSession,
+                generation: u64,
+            ) -> Applied {
+                if generation != self.generation || !owns_pending(session) {
+                    return Applied::default();
+                }
+                self.rollback(session);
+                Applied {
+                    sends: Vec::new(),
+                    report: Some(Report::Timeout),
+                }
+            }
+
+            /// Give up on the request in flight and its intent (a cancelled
+            /// picker, a closed tab). The confirmed state stays as the server
+            /// last reported it.
+            pub(in crate::features::session) fn abandon(
+                &mut self,
+                session: &mut DesktopSession,
+            ) -> Applied {
+                if !owns_pending(session) {
+                    return Applied::default();
+                }
+                self.rollback(session);
+                Applied::default()
+            }
+
+            /// The backend was replaced or exited: nothing it said or numbered
+            /// applies. Request ids keep advancing, so a late answer can never
+            /// match a new request.
+            pub(in crate::features::session) fn reset(&mut self, session: &mut DesktopSession) {
+                session.reset();
+                self.capabilities = None;
+                self.confirmed = Confirmed::default();
+                self.requested = None;
+                self.generation += 1;
+                self.seeded = false;
+            }
+
+            /// Whether the peer offers `method`. Without capabilities nothing
+            /// is offered, so nothing is requested or applied.
+            fn supports(&self, method: DesktopMethod) -> bool {
+                self.capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.supports(method))
+            }
+
+            /// A request could not be issued (one already in flight, or the
+            /// request itself failed validation).
+            fn failure(&self, error: DesktopRpcError) -> Applied {
+                Applied {
+                    sends: Vec::new(),
+                    report: Some(Report::Failure(error)),
+                }
+            }
+
+            /// Drop the request in flight and the intent behind it. The
+            /// generation moves, so a late timer or disposition for the
+            /// abandoned request is stale.
+            fn rollback(&mut self, session: &mut DesktopSession) {
+                session.abandon();
+                self.requested = None;
+                self.generation += 1;
+            }
+
+            /// The typed `get_permission_mode` answer: server truth.
+            fn apply_get(&mut self, response: DesktopResponse) -> Applied {
+                match response.permission_mode() {
+                    Ok(state) => {
+                        self.confirmed.mode = Some(state.mode);
+                        self.confirmed.default_mode = Some(state.default_mode);
+                        Applied::default()
+                    }
+                    Err(DesktopRpcError::RemoteError(info))
+                        if info.code == "unsupported_method" =>
+                    {
+                        Applied {
+                            report: Some(Report::UnsupportedMethod),
+                            ..Applied::default()
+                        }
+                    }
+                    Err(error) => Applied {
+                        report: Some(Report::Failure(error)),
+                        ..Applied::default()
+                    },
+                }
+            }
+
+            /// The typed `set_permission_mode` answer. `mode` and `default_mode`
+            /// are server truth, never the request echoed back; `changed: false`
+            /// is a no-op; `persist_error` is live success plus a warning that
+            /// the default was not saved.
+            fn apply_set(&mut self, response: DesktopResponse) -> Applied {
+                // The request is answered either way; only a real answer moves
+                // the confirmed state.
+                self.requested = None;
+                match response.set_permission_mode() {
+                    Ok(result) => {
+                        if !result.changed {
+                            return Applied::default();
+                        }
+                        self.confirmed = Confirmed {
+                            mode: Some(result.mode),
+                            default_mode: Some(result.default_mode),
+                            persisted: Some(result.persisted),
+                        };
+                        match result.persist_error {
+                            Some(error) => Applied {
+                                report: Some(Report::PersistError(error)),
+                                ..Applied::default()
+                            },
+                            None => Applied::default(),
+                        }
+                    }
+                    Err(DesktopRpcError::RemoteError(info))
+                        if info.code == "unsupported_method" =>
+                    {
+                        Applied {
+                            report: Some(Report::UnsupportedMethod),
+                            ..Applied::default()
+                        }
+                    }
+                    Err(error) => Applied {
+                        report: Some(Report::Failure(error)),
+                        ..Applied::default()
+                    },
+                }
+            }
+
+            /// A `permission_mode_changed` event, applied only when the peer
+            /// advertised that exact event. Foreign names and unadvertised
+            /// events never touch the confirmed state.
+            fn apply_event(&mut self, event: DesktopEvent) -> Applied {
+                if event.event != PERMISSION_MODE_CHANGED {
+                    return Applied::default();
+                }
+                if !self
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.emits(PERMISSION_MODE_CHANGED))
+                {
+                    return Applied::default();
+                }
+                match event.permission_mode_changed() {
+                    Ok(change) => {
+                        self.confirmed = Confirmed {
+                            mode: Some(change.mode),
+                            default_mode: Some(change.default_mode),
+                            persisted: Some(change.persisted),
+                        };
+                        Applied::default()
+                    }
+                    Err(error) => Applied {
+                        report: Some(Report::Failure(error)),
+                        ..Applied::default()
+                    },
+                }
+            }
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
     use pi_rpc::UiMethod;
     use pi_rpc::UiRequest;
-    use pi_rpc::desktop_rpc::{DesktopMethod, PROMPT_COMMAND, SCHEMA, WIDGET_KEY};
+    use pi_rpc::desktop_rpc::{
+        Capabilities, DesktopMethod, DesktopSession, PROMPT_COMMAND, PermissionMode, SCHEMA,
+        WIDGET_KEY,
+    };
     use serde_json::{Value, json};
 
+    use super::desktop::permission::{self, Permission, Report as PermissionReport};
     use super::desktop::{self, Desktop, Report, Step};
     use super::{ExtensionUi, ModelInfo, TodoIsland};
     use gentle_core::tools::TodoTask;
@@ -1055,5 +1576,680 @@ mod tests {
                 text: Some("x".into()),
             },
         }));
+    }
+
+    // Gentle Desktop's permission slice: capabilities, responses and events
+    // are built directly, so no process runs and no file is written.
+
+    fn permission_capabilities(methods: &[&str], events: &[&str]) -> Capabilities {
+        Capabilities {
+            methods: methods.iter().map(|name| (*name).to_string()).collect(),
+            events: events.iter().map(|name| (*name).to_string()).collect(),
+            schema: Some(SCHEMA.into()),
+            command: Some(PROMPT_COMMAND.into()),
+            widget: Some(WIDGET_KEY.into()),
+        }
+    }
+
+    /// A slice whose peer offers both permission methods and `events`, and the
+    /// one session it borrows.
+    fn permission_ready(events: &[&str]) -> (Permission, DesktopSession) {
+        let mut permission = Permission::new();
+        permission.set_capabilities(permission_capabilities(
+            &["get_permission_mode", "set_permission_mode"],
+            events,
+        ));
+        (permission, DesktopSession::new())
+    }
+
+    fn get_mode_lines(request_id: &str, mode: &str, default_mode: &str) -> Vec<String> {
+        record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": request_id,
+            "ok": true,
+            "data": {"mode": mode, "default_mode": default_mode},
+        }))
+    }
+
+    fn set_mode_lines(request_id: &str, data: Value) -> Vec<String> {
+        record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": request_id,
+            "ok": true,
+            "data": data,
+        }))
+    }
+
+    fn error_lines(request_id: &str, code: &str, message: &str) -> Vec<String> {
+        record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": request_id,
+            "ok": false,
+            "error": {"code": code, "message": message},
+        }))
+    }
+
+    fn permission_event_lines(seq: u64, data: Value) -> Vec<String> {
+        record(json!({
+            "schema": SCHEMA,
+            "kind": "event",
+            "seq": seq,
+            "event": "permission_mode_changed",
+            "data": data,
+        }))
+    }
+
+    fn set_result(mode: &str, default_mode: &str, persisted: bool, changed: bool) -> Value {
+        json!({
+            "mode": mode,
+            "default_mode": default_mode,
+            "persisted": persisted,
+            "changed": changed,
+        })
+    }
+
+    fn permission_change(
+        mode: &str,
+        previous_mode: &str,
+        default_mode: &str,
+        persisted: bool,
+    ) -> Value {
+        json!({
+            "mode": mode,
+            "previous_mode": previous_mode,
+            "default_mode": default_mode,
+            "persisted": persisted,
+            "source": "desktop",
+        })
+    }
+
+    #[test]
+    fn permission_request_encodes_every_mode_and_persist() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+
+        for mode in PermissionMode::ALL {
+            let applied = permission.set_permission_mode(&mut session, mode, Some(true));
+            assert_eq!(applied.sends.len(), 1);
+            assert_eq!(
+                applied.sends[0].request.method(),
+                DesktopMethod::SetPermissionMode
+            );
+            let payload: Value = serde_json::from_str(applied.sends[0].request.payload()).unwrap();
+            assert_eq!(payload["method"], "set_permission_mode");
+            assert_eq!(payload["params"]["mode"], mode.as_str());
+            assert_eq!(payload["params"]["persist"], true);
+
+            // Answer it so the next mode's request is not refused as in-flight.
+            let id = applied.sends[0].request.request_id().to_string();
+            let applied = permission.apply(
+                &mut session,
+                &desktop_widget(set_mode_lines(
+                    &id,
+                    set_result(mode.as_str(), mode.as_str(), true, true),
+                )),
+            );
+            assert!(applied.report.is_none());
+        }
+
+        // A `persist: None` request omits the flag so the server default applies.
+        let applied = permission.set_permission_mode(&mut session, PermissionMode::Normal, None);
+        let payload: Value = serde_json::from_str(applied.sends[0].request.payload()).unwrap();
+        assert!(payload["params"].get("persist").is_none());
+    }
+
+    #[test]
+    fn permission_request_tracks_the_pending_intent() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+
+        let applied =
+            permission.set_permission_mode(&mut session, PermissionMode::SuperYolo, Some(false));
+        assert_eq!(applied.sends.len(), 1);
+        assert_eq!(
+            permission.requested(),
+            Some(permission::Requested {
+                mode: PermissionMode::SuperYolo,
+                persist: Some(false),
+            })
+        );
+        // Nothing is confirmed until the server answers.
+        assert_eq!(permission.confirmed(), permission::Confirmed::default());
+    }
+
+    #[test]
+    fn permission_get_reads_the_server_state() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+
+        let applied = permission.get_permission_mode(&mut session);
+        assert_eq!(applied.sends.len(), 1);
+        assert_eq!(
+            applied.sends[0].request.method(),
+            DesktopMethod::GetPermissionMode
+        );
+        let id = applied.sends[0].request.request_id().to_string();
+
+        let applied = permission.apply(
+            &mut session,
+            &desktop_widget(get_mode_lines(&id, "auto", "yolo")),
+        );
+        assert!(applied.report.is_none());
+        assert_eq!(permission.confirmed().mode, Some(PermissionMode::Auto));
+        assert_eq!(
+            permission.confirmed().default_mode,
+            Some(PermissionMode::Yolo)
+        );
+        assert_eq!(
+            permission.confirmed().persisted,
+            None,
+            "get does not report whether the default is saved"
+        );
+    }
+
+    #[test]
+    fn permission_set_success_confirms_server_state() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+
+        let applied =
+            permission.set_permission_mode(&mut session, PermissionMode::Yolo, Some(true));
+        let id = applied.sends[0].request.request_id().to_string();
+
+        let applied = permission.apply(
+            &mut session,
+            &desktop_widget(set_mode_lines(&id, set_result("yolo", "yolo", true, true))),
+        );
+        assert!(applied.report.is_none());
+        assert_eq!(permission.confirmed().mode, Some(PermissionMode::Yolo));
+        assert_eq!(
+            permission.confirmed().default_mode,
+            Some(PermissionMode::Yolo)
+        );
+        assert_eq!(permission.confirmed().persisted, Some(true));
+        assert_eq!(
+            permission.requested(),
+            None,
+            "the answered intent is consumed"
+        );
+    }
+
+    #[test]
+    fn permission_response_mode_is_server_truth_not_the_request() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+
+        let applied = permission.set_permission_mode(&mut session, PermissionMode::Normal, None);
+        let id = applied.sends[0].request.request_id().to_string();
+
+        // The server applied a different mode than the request asked for: its
+        // answer wins, the request is never echoed back.
+        let applied = permission.apply(
+            &mut session,
+            &desktop_widget(set_mode_lines(
+                &id,
+                set_result("super-yolo", "yolo", false, true),
+            )),
+        );
+        assert!(applied.report.is_none());
+        assert_eq!(permission.confirmed().mode, Some(PermissionMode::SuperYolo));
+        assert_eq!(
+            permission.confirmed().default_mode,
+            Some(PermissionMode::Yolo)
+        );
+        assert_eq!(permission.confirmed().persisted, Some(false));
+    }
+
+    #[test]
+    fn permission_unchanged_set_is_a_no_op() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+
+        let applied =
+            permission.set_permission_mode(&mut session, PermissionMode::Yolo, Some(true));
+        let id = applied.sends[0].request.request_id().to_string();
+
+        let applied = permission.apply(
+            &mut session,
+            &desktop_widget(set_mode_lines(&id, set_result("yolo", "yolo", true, false))),
+        );
+        assert!(applied.report.is_none());
+        assert_eq!(permission.confirmed(), permission::Confirmed::default());
+        assert_eq!(permission.requested(), None);
+    }
+
+    #[test]
+    fn permission_persist_error_is_live_success_with_a_warning() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+
+        let applied =
+            permission.set_permission_mode(&mut session, PermissionMode::Yolo, Some(true));
+        let id = applied.sends[0].request.request_id().to_string();
+
+        let mut data = set_result("yolo", "yolo", false, true);
+        data["persist_error"] = json!({"code": "readonly", "message": "config is read-only"});
+
+        let applied = permission.apply(&mut session, &desktop_widget(set_mode_lines(&id, data)));
+        // Live success: the mode moved even though the default was not saved.
+        assert_eq!(permission.confirmed().mode, Some(PermissionMode::Yolo));
+        assert_eq!(
+            permission.confirmed().default_mode,
+            Some(PermissionMode::Yolo)
+        );
+        assert_eq!(permission.confirmed().persisted, Some(false));
+        match applied.report.as_ref() {
+            Some(PermissionReport::PersistError(error)) => {
+                assert_eq!(error.code, "readonly");
+            }
+            other => panic!("expected a persist warning, got {other:?}"),
+        }
+        assert!(
+            applied
+                .report
+                .as_ref()
+                .unwrap()
+                .message()
+                .contains("not saved")
+        );
+    }
+
+    #[test]
+    fn permission_advertised_event_moves_state() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+
+        let applied = permission.apply(
+            &mut session,
+            &desktop_widget(permission_event_lines(
+                1,
+                permission_change("yolo", "normal", "yolo", true),
+            )),
+        );
+        assert!(applied.report.is_none());
+        assert_eq!(permission.confirmed().mode, Some(PermissionMode::Yolo));
+        assert_eq!(
+            permission.confirmed().default_mode,
+            Some(PermissionMode::Yolo)
+        );
+        assert_eq!(permission.confirmed().persisted, Some(true));
+    }
+
+    #[test]
+    fn permission_foreign_and_unadvertised_events_do_not_move_state() {
+        // A foreign event name is never applied, even when the slice could.
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+        let applied = permission.apply(&mut session, &desktop_widget(event_lines(1)));
+        assert!(applied.report.is_none());
+        assert_eq!(permission.confirmed(), permission::Confirmed::default());
+
+        // A permission event the peer never advertised is ignored too.
+        let (mut unadvertised, mut unadvertised_session) = permission_ready(&["state_changed"]);
+        let applied = unadvertised.apply(
+            &mut unadvertised_session,
+            &desktop_widget(permission_event_lines(
+                1,
+                permission_change("yolo", "normal", "yolo", true),
+            )),
+        );
+        assert!(applied.report.is_none());
+        assert_eq!(unadvertised.confirmed(), permission::Confirmed::default());
+    }
+
+    #[test]
+    fn permission_unsupported_is_distinct_from_other_failures() {
+        // Missing capability: nothing is sent, and the report says legacy.
+        let mut missing = Permission::new();
+        missing.set_capabilities(permission_capabilities(&["get_permission_mode"], &[]));
+        let mut missing_session = DesktopSession::new();
+        let applied = missing.set_permission_mode(&mut missing_session, PermissionMode::Yolo, None);
+        assert!(applied.sends.is_empty());
+        assert_eq!(applied.report, Some(PermissionReport::Unsupported));
+
+        // The server answers unsupported_method: also legacy, but from the wire.
+        let (mut claimed, mut claimed_session) = permission_ready(&["permission_mode_changed"]);
+        let applied = claimed.set_permission_mode(&mut claimed_session, PermissionMode::Yolo, None);
+        let id = applied.sends[0].request.request_id().to_string();
+        let applied = claimed.apply(
+            &mut claimed_session,
+            &desktop_widget(error_lines(&id, "unsupported_method", "nope")),
+        );
+        assert!(applied.sends.is_empty());
+        assert_eq!(applied.report, Some(PermissionReport::UnsupportedMethod));
+        assert_eq!(claimed.confirmed(), permission::Confirmed::default());
+
+        // Any other failure is neither legacy signal, and state stays unchanged.
+        let (mut failed, mut failed_session) = permission_ready(&["permission_mode_changed"]);
+        let applied = failed.set_permission_mode(&mut failed_session, PermissionMode::Yolo, None);
+        let id = applied.sends[0].request.request_id().to_string();
+        let applied = failed.apply(
+            &mut failed_session,
+            &desktop_widget(error_lines(&id, "readonly", "nope")),
+        );
+        assert!(matches!(applied.report, Some(PermissionReport::Failure(_))));
+        assert_eq!(failed.confirmed(), permission::Confirmed::default());
+    }
+
+    #[test]
+    fn permission_timeout_rolls_back_the_intent() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+        let applied =
+            permission.set_permission_mode(&mut session, PermissionMode::Yolo, Some(true));
+        let generation = applied.sends[0].generation;
+
+        // A timer from before this request is stale.
+        assert!(
+            permission
+                .expire(&mut session, generation.wrapping_sub(1))
+                .sends
+                .is_empty()
+        );
+        assert!(permission.requested().is_some());
+
+        // Its own timer rolls the intent back and leaves the state untouched.
+        // Its own timer rolls the intent back, reports the timeout, and
+        // leaves the confirmed state untouched.
+        let applied = permission.expire(&mut session, generation);
+        assert!(applied.sends.is_empty());
+        assert_eq!(applied.report, Some(PermissionReport::Timeout));
+        assert!(!applied.report.as_ref().unwrap().message().is_empty());
+        assert_eq!(permission.requested(), None);
+        assert_eq!(permission.confirmed(), permission::Confirmed::default());
+    }
+
+    #[test]
+    fn permission_abandon_rolls_back_without_a_timeout() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+        let applied =
+            permission.set_permission_mode(&mut session, PermissionMode::Yolo, Some(true));
+        assert_eq!(applied.sends.len(), 1);
+
+        // A cancelled picker gives up the intent without a timeout, and never
+        // claims the server applied anything.
+        let applied = permission.abandon(&mut session);
+        assert!(applied.sends.is_empty() && applied.report.is_none());
+        assert_eq!(permission.requested(), None);
+        assert_eq!(permission.confirmed(), permission::Confirmed::default());
+    }
+
+    #[test]
+    fn permission_reset_forgets_answers_and_a_late_response_is_benign() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+        let applied =
+            permission.set_permission_mode(&mut session, PermissionMode::Yolo, Some(true));
+        let id = applied.sends[0].request.request_id().to_string();
+
+        permission.reset(&mut session);
+        assert_eq!(permission.confirmed(), permission::Confirmed::default());
+        assert_eq!(permission.requested(), None);
+        assert!(permission.capabilities().is_none());
+
+        // The old answer arrives late: not applied, and never reported.
+        let applied = permission.apply(
+            &mut session,
+            &desktop_widget(set_mode_lines(&id, set_result("yolo", "yolo", true, true))),
+        );
+        assert!(applied.sends.is_empty() && applied.report.is_none());
+        assert_eq!(permission.confirmed(), permission::Confirmed::default());
+
+        // A fresh request gets a new id, so old answers cannot match it.
+        permission.set_capabilities(permission_capabilities(
+            &["get_permission_mode", "set_permission_mode"],
+            &["permission_mode_changed"],
+        ));
+        let applied = permission.set_permission_mode(&mut session, PermissionMode::Auto, None);
+        assert_eq!(applied.sends[0].request.request_id(), "desktop-2");
+    }
+
+    #[test]
+    fn permission_refuses_a_second_request_while_one_is_in_flight() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+
+        let first = permission.set_permission_mode(&mut session, PermissionMode::Yolo, None);
+        assert_eq!(first.sends.len(), 1);
+
+        let second = permission.set_permission_mode(&mut session, PermissionMode::Normal, None);
+        assert!(second.sends.is_empty());
+        assert!(matches!(second.report, Some(PermissionReport::Failure(_))));
+        // The first intent is intact and still pending.
+        assert_eq!(
+            permission.requested(),
+            Some(permission::Requested {
+                mode: PermissionMode::Yolo,
+                persist: None,
+            })
+        );
+    }
+
+    #[test]
+    fn permission_outer_handled_keeps_the_request_and_unhandled_rolls_back() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+        let applied =
+            permission.set_permission_mode(&mut session, PermissionMode::Yolo, Some(true));
+        let generation = applied.sends[0].generation;
+
+        // Accepted: the request keeps waiting for its widget record.
+        let applied = permission.outer(&mut session, generation, true);
+        assert!(applied.sends.is_empty() && applied.report.is_none());
+        assert!(permission.requested().is_some());
+
+        // A later rejection rolls it back and reports a transport failure.
+        let applied = permission.outer(&mut session, generation, false);
+        assert!(applied.sends.is_empty());
+        assert!(matches!(applied.report, Some(PermissionReport::Failure(_))));
+        assert_eq!(permission.requested(), None);
+        assert_eq!(permission.confirmed(), permission::Confirmed::default());
+
+        // A stale rejection cannot drop a newer request.
+        let applied = permission.set_permission_mode(&mut session, PermissionMode::Auto, None);
+        assert_eq!(applied.sends.len(), 1);
+        let applied = permission.outer(&mut session, generation, false);
+        assert!(applied.sends.is_empty() && applied.report.is_none());
+        assert!(permission.requested().is_some());
+    }
+
+    #[test]
+    fn permission_shares_the_probe_session_id_space_and_survives_reset() {
+        let mut desktop = Desktop::new();
+        // The probe uses desktop-1 through the one shared session.
+        let probe = desktop.ready(true);
+        assert_eq!(probe.sends[0].request.request_id(), "desktop-1");
+        desktop.expire(probe.sends[0].generation);
+
+        let mut permission = Permission::new();
+        permission.set_capabilities(permission_capabilities(
+            &["get_permission_mode", "set_permission_mode"],
+            &["permission_mode_changed"],
+        ));
+
+        // The permission request continues the shared id space instead of
+        // restarting at desktop-1.
+        let applied =
+            permission.set_permission_mode(desktop.session(), PermissionMode::Yolo, Some(true));
+        assert_eq!(applied.sends[0].request.request_id(), "desktop-2");
+        let id = applied.sends[0].request.request_id().to_string();
+
+        // Reset the shared session: the old answer must not be applied.
+        permission.reset(desktop.session());
+        assert_eq!(permission.confirmed(), permission::Confirmed::default());
+        let applied = permission.apply(
+            desktop.session(),
+            &desktop_widget(set_mode_lines(&id, set_result("yolo", "yolo", true, true))),
+        );
+        assert!(applied.sends.is_empty() && applied.report.is_none());
+        assert_eq!(permission.confirmed(), permission::Confirmed::default());
+    }
+
+    #[test]
+    fn permission_event_gap_signals_one_resync_and_a_later_snapshot_recovers() {
+        // The channel is ready at sequence 4, and the permission slice shares
+        // its session.
+        let mut desktop = probed(4);
+        let mut permission = Permission::new();
+        permission.set_capabilities(permission_capabilities(
+            &["get_permission_mode", "set_permission_mode"],
+            &["permission_mode_changed"],
+        ));
+
+        // A permission event that skipped a sequence surfaces the gap instead
+        // of applying it; the slice accepted the record exactly once.
+        let applied = permission.apply(
+            desktop.session(),
+            &desktop_widget(permission_event_lines(
+                6,
+                permission_change("yolo", "normal", "yolo", true),
+            )),
+        );
+        assert!(applied.sends.is_empty());
+        assert_eq!(applied.report, Some(PermissionReport::OutOfOrderSequence));
+        assert_eq!(permission.confirmed(), permission::Confirmed::default());
+
+        // The channel owns the recovery: exactly one get_snapshot, and a
+        // second resync while it is in flight sends nothing (no duplicate).
+        let sends = desktop.resync();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].request.method(), DesktopMethod::GetSnapshot);
+        let resync_id = sends[0].request.request_id().to_string();
+        assert!(desktop.resync().is_empty());
+
+        // The snapshot answers and adopts the sequence, so later events line
+        // up again.
+        let applied = desktop.ui(&desktop_widget(snapshot_lines(&resync_id, 6)));
+        assert!(applied.sends.is_empty());
+        assert_eq!(desktop.covered(), Some(6));
+        assert_eq!(desktop.session().last_sequence(), Some(6));
+    }
+
+    #[test]
+    fn permission_event_gap_during_a_pending_request_defers_resync_until_settle() {
+        let mut desktop = probed(4);
+        let mut permission = Permission::new();
+        permission.set_capabilities(permission_capabilities(
+            &["get_permission_mode", "set_permission_mode"],
+            &["permission_mode_changed"],
+        ));
+
+        // A set request is in flight on the shared session.
+        let set =
+            permission.set_permission_mode(desktop.session(), PermissionMode::Yolo, Some(true));
+        assert_eq!(set.sends.len(), 1);
+        let set_id = set.sends[0].request.request_id().to_string();
+
+        // A permission event gap arrives while the set is pending: no
+        // get_snapshot is sent now, and the gap is remembered.
+        let gap = permission.apply(
+            desktop.session(),
+            &desktop_widget(permission_event_lines(
+                6,
+                permission_change("auto", "yolo", "auto", false),
+            )),
+        );
+        assert_eq!(gap.report, Some(PermissionReport::OutOfOrderSequence));
+        assert!(gap.sends.is_empty());
+        assert_eq!(desktop.session().last_sequence(), Some(4));
+        assert!(
+            desktop.resync().is_empty(),
+            "no resync while a request is pending"
+        );
+
+        // The set settles: exactly one get_snapshot is now issued.
+        let settled = permission.apply(
+            desktop.session(),
+            &desktop_widget(set_mode_lines(
+                &set_id,
+                set_result("yolo", "yolo", true, true),
+            )),
+        );
+        assert!(settled.report.is_none());
+        let sends = desktop.flush_resync();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].request.method(), DesktopMethod::GetSnapshot);
+        assert!(desktop.flush_resync().is_empty(), "one resync only");
+    }
+
+    #[test]
+    fn permission_event_gap_during_a_pending_request_defers_resync_until_timeout() {
+        let mut desktop = probed(4);
+        let mut permission = Permission::new();
+        permission.set_capabilities(permission_capabilities(
+            &["get_permission_mode", "set_permission_mode"],
+            &["permission_mode_changed"],
+        ));
+
+        let set =
+            permission.set_permission_mode(desktop.session(), PermissionMode::Yolo, Some(true));
+        let generation = set.sends[0].generation;
+
+        let gap = permission.apply(
+            desktop.session(),
+            &desktop_widget(permission_event_lines(
+                6,
+                permission_change("auto", "yolo", "auto", false),
+            )),
+        );
+        assert_eq!(gap.report, Some(PermissionReport::OutOfOrderSequence));
+        assert!(desktop.resync().is_empty());
+
+        // The pending request times out (rolls back); the deferred resync is
+        // due, and the timeout is reported instead of vanishing.
+        let timed_out = permission.expire(desktop.session(), generation);
+        assert_eq!(timed_out.report, Some(PermissionReport::Timeout));
+        let sends = desktop.flush_resync();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].request.method(), DesktopMethod::GetSnapshot);
+        assert!(desktop.flush_resync().is_empty());
+    }
+
+    #[test]
+    fn permission_set_without_capabilities_is_not_ready_not_unsupported() {
+        let mut permission = Permission::new();
+        let mut session = DesktopSession::new();
+        // Capabilities not known yet: this is "try again", never the legacy
+        // fallback signal.
+        let applied =
+            permission.set_permission_mode(&mut session, PermissionMode::Yolo, Some(true));
+        assert!(applied.sends.is_empty());
+        assert_eq!(applied.report, Some(PermissionReport::NotReady));
+
+        // Once capabilities are known to omit the method, it is Unsupported.
+        permission.set_capabilities(permission_capabilities(&["get_permission_mode"], &[]));
+        let applied =
+            permission.set_permission_mode(&mut session, PermissionMode::Yolo, Some(true));
+        assert_eq!(applied.report, Some(PermissionReport::Unsupported));
+    }
+
+    #[test]
+    fn permission_seed_fetches_once_and_waits_for_a_pending_request() {
+        let (mut permission, mut session) = permission_ready(&["permission_mode_changed"]);
+
+        // A request is in flight (the probe's snapshot, say): seed defers.
+        let probe = session.issue(DesktopMethod::GetSnapshot).unwrap();
+        let seeded = permission.seed(&mut session);
+        assert!(seeded.sends.is_empty() && seeded.report.is_none());
+
+        // The probe settles; seed now issues exactly one get_permission_mode.
+        session
+            .accept(&desktop_widget(snapshot_lines(probe.request_id(), 4)))
+            .unwrap();
+        let seeded = permission.seed(&mut session);
+        assert_eq!(seeded.sends.len(), 1);
+        assert_eq!(
+            seeded.sends[0].request.method(),
+            DesktopMethod::GetPermissionMode
+        );
+        assert!(permission.seed(&mut session).sends.is_empty());
+
+        // The answer seeds the confirmed state.
+        let id = seeded.sends[0].request.request_id().to_string();
+        let applied = permission.apply(
+            &mut session,
+            &desktop_widget(get_mode_lines(&id, "auto", "yolo")),
+        );
+        assert!(applied.report.is_none());
+        assert_eq!(permission.confirmed().mode, Some(PermissionMode::Auto));
+        assert_eq!(
+            permission.confirmed().default_mode,
+            Some(PermissionMode::Yolo)
+        );
+
+        // Without get_permission_mode in the capabilities, seed does nothing.
+        let mut missing = Permission::new();
+        missing.set_capabilities(permission_capabilities(&["set_permission_mode"], &[]));
+        assert!(missing.seed(&mut DesktopSession::new()).sends.is_empty());
     }
 }

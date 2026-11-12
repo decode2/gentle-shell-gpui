@@ -9,8 +9,10 @@ use anyhow::Result;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 use pi_rpc::PiProcess;
+use pi_rpc::desktop_rpc::DesktopMethod;
 use serde_json::{Value, json};
 
+use super::state::desktop::permission::Applied as PermissionApplied;
 use super::state::desktop::{self, Applied as DesktopApplied, Send as DesktopSend};
 use super::state::{BackendStatus, ModelInfo};
 use super::{SessionView, attachments, builtins};
@@ -105,6 +107,46 @@ impl SessionView {
         self.send_desktop(applied.sends, cx);
     }
 
+    /// Act on a permission decision: say what failed or warn about a default
+    /// that could not be saved, then send whatever the permission slice asked
+    /// for and reflect the server-confirmed mode into the picker.
+    pub(super) fn apply_permission(&mut self, applied: PermissionApplied, cx: &mut Context<Self>) {
+        if let Some(report) = applied.report {
+            self.transcript
+                .notice(NoticeLevel::Warning, report.message());
+            cx.notify();
+        }
+        self.send_desktop(applied.sends, cx);
+        // A gap seen while this request was in flight is due now that it
+        // settled or rolled back: ask the channel for a fresh snapshot once.
+        let resync = self.desktop.flush_resync();
+        self.send_desktop(resync, cx);
+        self.sync_permission_ui(cx);
+    }
+
+    /// The server's confirmed permission state is truth: move the picker's
+    /// live and default modes only from it, never optimistically from the
+    /// request the user just picked.
+    fn sync_permission_ui(&mut self, cx: &mut Context<Self>) {
+        let confirmed = self.permission.confirmed();
+        let mut changed = false;
+        if let Some(mode) = confirmed.mode.map(super::from_desktop_mode)
+            && self.mode != Some(mode)
+        {
+            self.mode = Some(mode);
+            changed = true;
+        }
+        if let Some(default_mode) = confirmed.default_mode.map(super::from_desktop_mode)
+            && self.default_mode != Some(default_mode)
+        {
+            self.default_mode = Some(default_mode);
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
     /// Hand Gentle Desktop requests to the backend. Each one is a `prompt` the
     /// transport answers with a disposition, and the domain answer arrives
     /// later as the Desktop widget; a guarded timer drops one that never comes.
@@ -115,18 +157,19 @@ impl SessionView {
     }
 
     fn send_one_desktop(&mut self, send: DesktopSend, cx: &mut Context<Self>) {
+        let generation = send.generation;
+        let method = send.request.method();
         if self.process().is_none() {
-            // No backend to answer: drop it like a timeout, silently.
-            let _ = self.desktop.expire(send.generation);
+            // No backend to answer: drop it like a timeout, silently, in the
+            // slice that owns the request.
+            self.expire_desktop(generation, method, cx);
             return;
         }
-        let generation = send.generation;
         cx.spawn(async move |this, cx| {
             cx.background_executor().timer(DESKTOP_TIMEOUT).await;
             let _ = this.update(cx, |this, cx| {
                 // Only its own request: a newer one has another generation.
-                let sends = this.desktop.expire(generation);
-                this.send_desktop(sends, cx);
+                this.expire_desktop(generation, method, cx);
             });
         })
         .detach();
@@ -137,10 +180,47 @@ impl SessionView {
                 // `handled` only means the prompt was accepted; nothing but that
                 // keeps the request waiting for its widget record.
                 let handled = result.is_ok_and(|data| data["disposition"] == "handled");
-                let applied = this.desktop.outer(generation, handled);
-                this.apply_desktop(applied, cx);
+                this.outer_desktop(generation, method, handled, cx);
             },
         );
+    }
+
+    /// A pending timeout fired: hand it to the slice that issued the request,
+    /// so a probe timer never abandons a permission request and vice versa.
+    fn expire_desktop(&mut self, generation: u64, method: DesktopMethod, cx: &mut Context<Self>) {
+        match method {
+            DesktopMethod::Capabilities | DesktopMethod::GetSnapshot => {
+                let sends = self.desktop.expire(generation);
+                self.send_desktop(sends, cx);
+            }
+            DesktopMethod::GetPermissionMode | DesktopMethod::SetPermissionMode => {
+                let applied = self.permission.expire(self.desktop.session(), generation);
+                self.apply_permission(applied, cx);
+            }
+        }
+    }
+
+    /// Pi answered the outer prompt: hand the disposition to the slice that
+    /// issued the request.
+    fn outer_desktop(
+        &mut self,
+        generation: u64,
+        method: DesktopMethod,
+        handled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match method {
+            DesktopMethod::Capabilities | DesktopMethod::GetSnapshot => {
+                let applied = self.desktop.outer(generation, handled);
+                self.apply_desktop(applied, cx);
+            }
+            DesktopMethod::GetPermissionMode | DesktopMethod::SetPermissionMode => {
+                let applied = self
+                    .permission
+                    .outer(self.desktop.session(), generation, handled);
+                self.apply_permission(applied, cx);
+            }
+        }
     }
 
     /// Pi's command list: what the `/` menu offers, and the discovery that

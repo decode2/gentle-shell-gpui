@@ -142,6 +142,17 @@ When stdout closes, pending requests are flushed (their callers get the error "g
 - `restart_when_idle` / `backend.restart_pending`: restarts in the middle of a turn (or with a dialog open) wait for it to finish. Used by `reload` (`/reload`), `reload_models` (after signing in or out of a provider), `restart_for_update` (after `gentle-shell upgrade`) and `choose_mode` (permission change).
 - `retry_start` retries tabs whose backend never started (after onboarding).
 
+### Permission mode (`state::desktop::permission`)
+
+The picker's selection is the consent. When the backend's `capabilities` advertise `set_permission_mode`, the app sends `set_permission_mode` with `persist: true` over the Gentle Desktop RPC channel and switches the live session without writing `permission-mode.json` or restarting. The server's answer is the truth: `changed: false` is a no-op, a `persist_error` is live success plus a "default not saved" warning, and a timeout/transport/server failure reverts and reports. Events move the confirmed state only for the exact `permission_mode_changed` name that the capabilities `emits`; a sequence gap resyncs once through the channel's `get_snapshot`.
+
+Two cases keep the legacy path (save `permission-mode.json` and restart the backend on the same conversation, exactly once):
+
+- the capabilities are known and do not list `set_permission_mode`;
+- the server answers `unsupported_method` for the `set_permission_mode` it advertised.
+
+While capabilities are still loading, a picker click reports "try again" and never writes the default file or restarts. `choose_mode` in `lifecycle.rs` is the only caller of either path; every other restart caller is unchanged.
+
 ### Commands the app sends
 
 | `type` | Fields | Where | Use |
@@ -369,7 +380,7 @@ The canvas is detected from the `gentle_design` result (`details.url`, `refreshe
 - Claude subscription windows only arrive as response headers inside the TUI; the app sees the limit notices (`notify`) but not the full windows.
 - Only the agent can stop helpers and background jobs ("Ask to stop" asks it to run `subagent_cancel`).
 - Auto mode may reject actions: input over RPC does not count as a live human decision.
-- The permission mode of a live session can only change from the TUI: the app saves `permission-mode.json` and restarts the backend on the same conversation.
+- The permission mode of a live session changes over the Gentle Desktop RPC channel when the backend advertises `set_permission_mode`; a backend without that method keeps the legacy path (save `permission-mode.json` and restart). See “Permission mode” under RPC protocol.
 - Gentle Shell does not play sounds for RPC hosts (`notificationContextAllowed`): `features/alerts/` plays them.
 - `ctx.ui.custom()` screens do not arrive: they are rebuilt natively or hidden.
 - New credentials are only read when the backend starts.
