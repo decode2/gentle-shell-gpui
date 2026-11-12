@@ -3,12 +3,13 @@
 //! adapter only builds the outer prompt and decodes the widget records.
 
 use pi_rpc::desktop_rpc::{
-    DesktopAgent, DesktopAgentStep, DesktopAgentUsage, DesktopEvent, DesktopJob, DesktopMethod,
-    DesktopRecord, DesktopRequest, DesktopResponse, DesktopRpcError, DesktopSession, Handoff,
-    JobExitCode, MAX_REQUEST_BYTES, PROMPT_COMMAND, PermissionMode, PermissionModeChanged,
-    PermissionModeState, ProviderUsage, RateLimitEvent, RateLimitSource, SCHEMA,
-    SetPermissionModeResult, UsageLimit, UsageLimitScope, UsageRefresh, UsageResetAt, UsageStatus,
-    UsageWindow, WIDGET_KEY, decode_payload, decode_widget,
+    DesignCanvas, DesignCanvasEvent, DesignEntry, DesignTransition, DesktopAgent, DesktopAgentStep,
+    DesktopAgentUsage, DesktopEvent, DesktopJob, DesktopMethod, DesktopRecord, DesktopRequest,
+    DesktopResponse, DesktopRpcError, DesktopSession, Handoff, JobExitCode, MAX_REQUEST_BYTES,
+    PROMPT_COMMAND, PermissionMode, PermissionModeChanged, PermissionModeState, ProviderUsage,
+    RateLimitEvent, RateLimitSource, SCHEMA, SetPermissionModeResult, UsageLimit, UsageLimitScope,
+    UsageRefresh, UsageResetAt, UsageStatus, UsageWindow, WIDGET_KEY, decode_payload,
+    decode_widget,
 };
 use pi_rpc::{Response, UiMethod, UiRequest};
 use serde_json::{Value, json};
@@ -2372,4 +2373,486 @@ fn capabilities_expose_subscription_usage_methods_and_event() {
     assert!(capabilities.supports(DesktopMethod::RefreshSubscriptionUsage));
     assert!(capabilities.emits("rate_limit"));
     assert!(!capabilities.emits("usage_changed"));
+}
+
+// --- design canvas method and event -------------------------------------
+
+fn design_entry() -> DesignEntry {
+    DesignEntry {
+        slug: "hero-onboarding".into(),
+        title: "Hero onboarding".into(),
+        mtime: 1788600000000.0,
+    }
+}
+
+fn design_entry_data() -> Value {
+    json!({
+        "slug": "hero-onboarding",
+        "title": "Hero onboarding",
+        "mtime": 1788600000000u64,
+    })
+}
+
+fn design_canvas_event(
+    seq: u64,
+    transition: &str,
+    mut state: Value,
+    url: Option<&str>,
+) -> DesktopEvent {
+    state["transition"] = json!(transition);
+    if let Some(url) = url {
+        state["url"] = json!(url);
+    }
+    record_event(
+        decode_widget(&widget(&event_line(seq, "design_canvas", state)))
+            .unwrap()
+            .unwrap(),
+    )
+}
+
+#[test]
+fn get_design_canvas_uses_the_exact_wire_name_and_params() {
+    assert_eq!(DesktopMethod::GetDesignCanvas.as_str(), "get_design_canvas");
+    assert_eq!(
+        DesktopMethod::parse("get_design_canvas").unwrap(),
+        DesktopMethod::GetDesignCanvas
+    );
+    assert_eq!(
+        "get_design_canvas".parse::<DesktopMethod>().unwrap(),
+        DesktopMethod::GetDesignCanvas
+    );
+
+    // `includeUrl: None` omits the key, so the server's documented default
+    // (no URL) applies.
+    let omitted = DesktopRequest::get_design_canvas("desktop-1", None).unwrap();
+    assert_eq!(omitted.method(), DesktopMethod::GetDesignCanvas);
+    assert_eq!(
+        omitted.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-1","method":"get_design_canvas","params":{{}}}}"#
+        )
+    );
+
+    let with_url = DesktopRequest::get_design_canvas("desktop-2", Some(true)).unwrap();
+    assert_eq!(
+        with_url.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-2","method":"get_design_canvas","params":{{"includeUrl":true}}}}"#
+        )
+    );
+
+    // `false` is accepted and sent explicitly, never defaulted to omission.
+    let without_url = DesktopRequest::get_design_canvas("desktop-3", Some(false)).unwrap();
+    assert_eq!(
+        without_url.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-3","method":"get_design_canvas","params":{{"includeUrl":false}}}}"#
+        )
+    );
+
+    // The shared zero-param issue path also fits this method with `{}`.
+    let mut session = DesktopSession::new();
+    assert_eq!(
+        session
+            .issue(DesktopMethod::GetDesignCanvas)
+            .unwrap()
+            .payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-1","method":"get_design_canvas","params":{{}}}}"#
+        )
+    );
+}
+
+#[test]
+fn design_canvas_response_decodes_running_and_stopped_states() {
+    let running = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({
+                "running": true,
+                "slug": "hero-onboarding",
+                "connectedClients": 3,
+                "designs": [design_entry_data()],
+                "url": "http://127.0.0.1:3210/?token=abc",
+            }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .design_canvas()
+    .unwrap();
+    assert_eq!(
+        running,
+        DesignCanvas {
+            running: true,
+            slug: Some("hero-onboarding".into()),
+            connected_clients: 3,
+            designs: vec![design_entry()],
+            url: Some("http://127.0.0.1:3210/?token=abc".into()),
+        }
+    );
+
+    // A stopped canvas reports no slug, no clients, no designs and no URL.
+    let stopped = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-2",
+            json!({
+                "running": false,
+                "slug": null,
+                "connectedClients": 0,
+                "designs": [],
+            }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .design_canvas()
+    .unwrap();
+    assert_eq!(
+        stopped,
+        DesignCanvas {
+            running: false,
+            slug: None,
+            connected_clients: 0,
+            designs: vec![],
+            url: None,
+        }
+    );
+}
+
+#[test]
+fn design_entries_decode_slug_title_and_fractional_mtime() {
+    // `mtime` is a finite non-negative number, not required to be an integer.
+    let response = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({
+                "running": true,
+                "slug": null,
+                "connectedClients": 0,
+                "designs": [
+                    { "slug": "a", "title": "A", "mtime": 1788600000000.5 },
+                    { "slug": "b", "title": "", "mtime": 0 },
+                ],
+            }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .design_canvas()
+    .unwrap();
+    assert_eq!(response.designs[0].mtime, 1788600000000.5);
+    assert_eq!(
+        response.designs[1],
+        DesignEntry {
+            slug: "b".into(),
+            title: "".into(),
+            mtime: 0.0,
+        }
+    );
+}
+
+#[test]
+fn design_canvas_events_decode_open_refresh_and_stop_transitions() {
+    for transition in DesignTransition::ALL {
+        assert_eq!(transition.to_string(), transition.as_str());
+        assert_eq!(
+            transition.as_str().parse::<DesignTransition>().unwrap(),
+            transition
+        );
+    }
+    assert!(matches!(
+        "pause".parse::<DesignTransition>(),
+        Err(DesktopRpcError::InvalidDesignTransition(_))
+    ));
+
+    let running = json!({
+        "running": true,
+        "slug": "hero-onboarding",
+        "connectedClients": 1,
+        "designs": [design_entry_data()],
+    });
+
+    let open = design_canvas_event(
+        1,
+        "open",
+        running.clone(),
+        Some("http://127.0.0.1:3210/?token=abc"),
+    );
+    assert_eq!(
+        open.design_canvas().unwrap(),
+        DesignCanvasEvent {
+            transition: DesignTransition::Open,
+            state: DesignCanvas {
+                running: true,
+                slug: Some("hero-onboarding".into()),
+                connected_clients: 1,
+                designs: vec![design_entry()],
+                url: Some("http://127.0.0.1:3210/?token=abc".into()),
+            },
+        }
+    );
+
+    let refresh = design_canvas_event(2, "refresh", running.clone(), None);
+    let refreshed = refresh.design_canvas().unwrap();
+    assert_eq!(refreshed.transition, DesignTransition::Refresh);
+    assert_eq!(refreshed.state.url, None);
+
+    // `stop` carries the stopped state and no URL.
+    let stopped = json!({
+        "running": false,
+        "slug": null,
+        "connectedClients": 0,
+        "designs": [],
+    });
+    let stop = design_canvas_event(3, "stop", stopped, None);
+    assert_eq!(
+        stop.design_canvas().unwrap(),
+        DesignCanvasEvent {
+            transition: DesignTransition::Stop,
+            state: DesignCanvas {
+                running: false,
+                slug: None,
+                connected_clients: 0,
+                designs: vec![],
+                url: None,
+            },
+        }
+    );
+}
+
+#[test]
+fn design_canvas_url_is_optional_and_never_a_separate_token() {
+    // No `url` field -> None, matching the default and stopped states.
+    let without = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "running": false, "slug": null, "connectedClients": 0, "designs": [] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .design_canvas()
+    .unwrap();
+    assert_eq!(without.url, None);
+
+    // A token lives inside the URL string; there is no separate `token` field
+    // and this projection never reads one.
+    let with_url = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({
+                "running": true,
+                "slug": "a",
+                "connectedClients": 1,
+                "designs": [],
+                "url": "http://127.0.0.1:3210/#t=abc",
+                "token": "should-be-ignored",
+            }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .design_canvas()
+    .unwrap();
+    assert_eq!(
+        with_url.url.as_deref(),
+        Some("http://127.0.0.1:3210/#t=abc")
+    );
+
+    // An explicit `url: null` decodes like absence.
+    let null_url = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({
+                "running": true,
+                "slug": "a",
+                "connectedClients": 1,
+                "designs": [],
+                "url": null,
+            }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .design_canvas()
+    .unwrap();
+    assert_eq!(null_url.url, None);
+}
+
+#[test]
+fn design_canvas_rejects_malformed_shapes_and_non_finite_values() {
+    let state_cases: &[Value] = &[
+        json!({ "slug": null, "connectedClients": 0, "designs": [] }),
+        json!({ "running": "yes", "slug": null, "connectedClients": 0, "designs": [] }),
+        json!({ "running": true, "slug": 7, "connectedClients": 0, "designs": [] }),
+        json!({ "running": true, "slug": null, "designs": [] }),
+        json!({ "running": true, "slug": null, "connectedClients": -1, "designs": [] }),
+        json!({ "running": true, "slug": null, "connectedClients": 1.5, "designs": [] }),
+        json!({ "running": true, "slug": null, "connectedClients": "one", "designs": [] }),
+        json!({ "running": true, "slug": null, "connectedClients": 0 }),
+        json!({ "running": true, "slug": null, "connectedClients": 0, "designs": "nope" }),
+        json!({ "running": true, "slug": null, "connectedClients": 0, "designs": [7] }),
+    ];
+    for data in state_cases {
+        let response = record_response(
+            decode_widget(&widget(&response_line("desktop-1", data.clone())))
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(
+            response.design_canvas().is_err(),
+            "{data} should not decode as design canvas state"
+        );
+    }
+
+    let entry_cases: &[Value] = &[
+        json!({ "title": "x", "mtime": 1 }),
+        json!({ "slug": "", "title": "x", "mtime": 1 }),
+        json!({ "slug": "s", "title": "x" }),
+        json!({ "slug": "s", "title": "x", "mtime": "soon" }),
+        json!({ "slug": "s", "title": "x", "mtime": -1 }),
+        json!({ "slug": "s", "title": 7, "mtime": 1 }),
+        json!({ "slug": 7, "title": "x", "mtime": 1 }),
+    ];
+    for data in entry_cases {
+        let response = record_response(
+            decode_widget(&widget(&response_line(
+                "desktop-1",
+                json!({
+                    "running": true,
+                    "slug": null,
+                    "connectedClients": 0,
+                    "designs": [data.clone()],
+                }),
+            )))
+            .unwrap()
+            .unwrap(),
+        );
+        assert!(
+            response.design_canvas().is_err(),
+            "{data} should not decode as a design entry"
+        );
+    }
+
+    // A non-finite `mtime` overflows JSON parsing and fails the whole record
+    // closed rather than decoding an entry.
+    let payload = format!(
+        r#"{{"schema":"{SCHEMA}","kind":"response","requestId":"desktop-1","ok":true,"data":{{"running":true,"slug":null,"connectedClients":0,"designs":[{{"slug":"s","title":"x","mtime":1e400}}]}}}}"#
+    );
+    assert!(matches!(
+        decode_payload(&payload),
+        Err(DesktopRpcError::MalformedPayload(_))
+    ));
+
+    let event_cases: &[Value] = &[
+        json!({ "running": true, "slug": null, "connectedClients": 0, "designs": [] }),
+        json!({ "transition": "pause", "running": true, "slug": null, "connectedClients": 0, "designs": [] }),
+        json!({ "transition": 7, "running": true, "slug": null, "connectedClients": 0, "designs": [] }),
+        json!({ "transition": "open", "slug": null, "connectedClients": 0, "designs": [] }),
+    ];
+    for data in event_cases {
+        let event = record_event(
+            decode_widget(&widget(&event_line(1, "design_canvas", data.clone())))
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(
+            event.design_canvas().is_err(),
+            "{data} should not decode as a design_canvas event"
+        );
+    }
+}
+
+#[test]
+fn design_canvas_event_verifies_the_exact_event_name() {
+    // A foreign event that happens to fit the shape is refused, not misread.
+    let foreign = record_event(
+        decode_widget(&widget(&event_line(
+            1,
+            "agents_update",
+            json!({
+                "transition": "open",
+                "running": true,
+                "slug": null,
+                "connectedClients": 0,
+                "designs": [],
+            }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    assert!(matches!(
+        foreign.design_canvas(),
+        Err(DesktopRpcError::UnexpectedEvent { expected: "design_canvas", got })
+            if got == "agents_update"
+    ));
+
+    // The right name with the wrong shape is still a shape error.
+    let wrong_shape = record_event(
+        decode_widget(&widget(&event_line(
+            2,
+            "design_canvas",
+            json!({ "transition": "open", "running": true }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    assert!(matches!(
+        wrong_shape.design_canvas(),
+        Err(DesktopRpcError::MalformedPayload(_))
+    ));
+}
+
+#[test]
+fn design_canvas_requests_flow_through_session_correlation() {
+    let mut session = DesktopSession::new();
+
+    let read = session.issue_get_design_canvas(None).unwrap();
+    assert_eq!(read.request_id(), "desktop-1");
+    assert_eq!(read.method(), DesktopMethod::GetDesignCanvas);
+    assert_eq!(
+        session.pending(),
+        Some(("desktop-1", DesktopMethod::GetDesignCanvas))
+    );
+
+    // One request in flight, whatever the method.
+    assert!(matches!(
+        session.issue_get_design_canvas(Some(true)),
+        Err(DesktopRpcError::RequestInFlight { .. })
+    ));
+
+    session
+        .accept(&widget(&response_line(
+            "desktop-1",
+            json!({ "running": true, "slug": null, "connectedClients": 0, "designs": [] }),
+        )))
+        .unwrap();
+    assert!(session.pending().is_none());
+
+    let with_url = session.issue_get_design_canvas(Some(true)).unwrap();
+    assert_eq!(with_url.request_id(), "desktop-2");
+    assert_eq!(with_url.method(), DesktopMethod::GetDesignCanvas);
+    assert_eq!(
+        with_url.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-2","method":"get_design_canvas","params":{{"includeUrl":true}}}}"#
+        )
+    );
+}
+
+#[test]
+fn capabilities_expose_design_canvas_method_and_event() {
+    let response = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            capabilities_data(&["capabilities", "get_design_canvas"], &["design_canvas"]),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    let capabilities = response.capabilities().unwrap();
+    assert!(capabilities.supports(DesktopMethod::GetDesignCanvas));
+    assert!(capabilities.emits("design_canvas"));
+    assert!(!capabilities.emits("design_canvas_token"));
 }

@@ -51,6 +51,7 @@ pub enum DesktopMethod {
     CancelJob,
     GetSubscriptionUsage,
     RefreshSubscriptionUsage,
+    GetDesignCanvas,
 }
 
 impl DesktopMethod {
@@ -67,6 +68,7 @@ impl DesktopMethod {
             Self::CancelJob => "cancel_job",
             Self::GetSubscriptionUsage => "get_subscription_usage",
             Self::RefreshSubscriptionUsage => "refresh_subscription_usage",
+            Self::GetDesignCanvas => "get_design_canvas",
         }
     }
 
@@ -83,6 +85,7 @@ impl DesktopMethod {
             "cancel_job" => Ok(Self::CancelJob),
             "get_subscription_usage" => Ok(Self::GetSubscriptionUsage),
             "refresh_subscription_usage" => Ok(Self::RefreshSubscriptionUsage),
+            "get_design_canvas" => Ok(Self::GetDesignCanvas),
             other => Err(DesktopRpcError::UnsupportedMethod(other.to_string())),
         }
     }
@@ -308,6 +311,16 @@ fn subscription_usage_params(provider: Option<&str>) -> Result<Value, DesktopRpc
     }
 }
 
+/// The wire `params` object for `get_design_canvas`: `{}` when `include_url`
+/// is `None`, or exactly `{ includeUrl }` with the explicit boolean. No other
+/// key is ever sent.
+fn get_design_canvas_params(include_url: Option<bool>) -> Value {
+    match include_url {
+        None => json!({}),
+        Some(include_url) => json!({ "includeUrl": include_url }),
+    }
+}
+
 impl DesktopRequest {
     /// The `capabilities` request. It takes no params.
     pub fn capabilities(request_id: impl Into<String>) -> Result<Self, DesktopRpcError> {
@@ -397,6 +410,20 @@ impl DesktopRequest {
             request_id,
             DesktopMethod::RefreshSubscriptionUsage,
             subscription_usage_params(provider)?,
+        )
+    }
+
+    /// The `get_design_canvas` request. `include_url` is `None` to omit the
+    /// param so the server's documented default (no URL) applies, or `Some` to
+    /// send an explicit `includeUrl` flag (`true` or `false`).
+    pub fn get_design_canvas(
+        request_id: impl Into<String>,
+        include_url: Option<bool>,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::new(
+            request_id,
+            DesktopMethod::GetDesignCanvas,
+            get_design_canvas_params(include_url),
         )
     }
 
@@ -541,6 +568,11 @@ impl DesktopResponse {
         SubscriptionUsage::from_data(self.data()?)
     }
 
+    /// The response to `get_design_canvas`.
+    pub fn design_canvas(&self) -> Result<DesignCanvas, DesktopRpcError> {
+        DesignCanvas::from_data(self.data()?)
+    }
+
     fn data(&self) -> Result<&Value, DesktopRpcError> {
         self.result
             .as_ref()
@@ -584,6 +616,13 @@ impl DesktopEvent {
     pub fn rate_limit(&self) -> Result<RateLimitEvent, DesktopRpcError> {
         expect_event(self, "rate_limit")?;
         RateLimitEvent::from_data(&self.data)
+    }
+
+    /// Decode the data of a `design_canvas` event, verifying the exact event
+    /// name before the shape, exactly like [`Self::agents_update`].
+    pub fn design_canvas(&self) -> Result<DesignCanvasEvent, DesktopRpcError> {
+        expect_event(self, "design_canvas")?;
+        DesignCanvasEvent::from_data(&self.data)
     }
 }
 
@@ -1577,6 +1616,140 @@ impl RateLimitEvent {
     }
 }
 
+/// The closed `transition` vocabulary of a `design_canvas` event. Anything
+/// else is a server change and is refused rather than read as a transition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DesignTransition {
+    Open,
+    Refresh,
+    Stop,
+}
+
+impl DesignTransition {
+    /// Every transition the protocol speaks, in wire order.
+    pub const ALL: [Self; 3] = [Self::Open, Self::Refresh, Self::Stop];
+
+    /// The wire name of the transition.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::Refresh => "refresh",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+impl std::str::FromStr for DesignTransition {
+    type Err = DesktopRpcError;
+
+    fn from_str(transition: &str) -> Result<Self, Self::Err> {
+        match transition {
+            "open" => Ok(Self::Open),
+            "refresh" => Ok(Self::Refresh),
+            "stop" => Ok(Self::Stop),
+            other => Err(DesktopRpcError::InvalidDesignTransition(other.to_string())),
+        }
+    }
+}
+
+impl fmt::Display for DesignTransition {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A required `transition` field of a `design_canvas` event.
+fn design_transition_field(
+    data: &Value,
+    field: &'static str,
+) -> Result<DesignTransition, DesktopRpcError> {
+    data.get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            DesktopRpcError::MalformedPayload(format!("{field} must be a transition string"))
+        })?
+        .parse()
+}
+
+/// A required array of projected design entries.
+fn design_entries(data: &Value) -> Result<Vec<DesignEntry>, DesktopRpcError> {
+    let items = data
+        .get("designs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            DesktopRpcError::MalformedPayload("design canvas data has no designs array".into())
+        })?;
+    items.iter().map(DesignEntry::from_data).collect()
+}
+
+/// One projected design entry: identity by slug, the human title, and the
+/// owner-reported modification time as a non-negative finite number.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DesignEntry {
+    pub slug: String,
+    pub title: String,
+    pub mtime: f64,
+}
+
+impl DesignEntry {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        let slug = string_field(data, "slug")?;
+        if slug.is_empty() {
+            return Err(DesktopRpcError::MalformedPayload(
+                "design entry has no slug".into(),
+            ));
+        }
+        Ok(Self {
+            slug,
+            title: string_field(data, "title")?,
+            mtime: cost_field(data, "mtime")?,
+        })
+    }
+}
+
+/// The decoded `get_design_canvas` data, and the same state every
+/// `design_canvas` event carries alongside its `transition`. `slug` is `null`
+/// when no design is open; `url` is absent unless an `includeUrl` request (or
+/// an `open`/`refresh` transition) chose to carry it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DesignCanvas {
+    pub running: bool,
+    pub slug: Option<String>,
+    pub connected_clients: u64,
+    pub designs: Vec<DesignEntry>,
+    pub url: Option<String>,
+}
+
+impl DesignCanvas {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            running: bool_field(data, "running")?,
+            slug: text_field(data, "slug")?,
+            connected_clients: u64_field(data, "connectedClients")?,
+            designs: design_entries(data)?,
+            url: text_field(data, "url")?,
+        })
+    }
+}
+
+/// The decoded `design_canvas` event: the transition that happened plus the
+/// same canvas state as `get_design_canvas`. A `stop` transition carries no
+/// URL; the projection keeps whatever the wire actually supplied.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DesignCanvasEvent {
+    pub transition: DesignTransition,
+    pub state: DesignCanvas,
+}
+
+impl DesignCanvasEvent {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            transition: design_transition_field(data, "transition")?,
+            state: DesignCanvas::from_data(data)?,
+        })
+    }
+}
+
 /// Pi's answer to the outer prompt: `disposition: "handled"` means accepted.
 /// The domain result is never here, it arrives as a widget record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1727,6 +1900,17 @@ impl DesktopSession {
         self.issue_with(
             DesktopMethod::RefreshSubscriptionUsage,
             subscription_usage_params(provider)?,
+        )
+    }
+
+    /// Issue `get_design_canvas` with `{}` or exactly `{ includeUrl }`.
+    pub fn issue_get_design_canvas(
+        &mut self,
+        include_url: Option<bool>,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_with(
+            DesktopMethod::GetDesignCanvas,
+            get_design_canvas_params(include_url),
         )
     }
 
@@ -1982,6 +2166,8 @@ pub enum DesktopRpcError {
     InvalidRateLimitSource(String),
     /// A subagent `lastStep` label outside the closed vocabulary.
     InvalidLastStep(String),
+    /// A design canvas `transition` outside the closed vocabulary.
+    InvalidDesignTransition(String),
     /// An event was decoded through an accessor for another event name.
     UnexpectedEvent { expected: &'static str, got: String },
     /// `params` is not a JSON object.
@@ -2059,6 +2245,12 @@ impl fmt::Display for DesktopRpcError {
             }
             Self::InvalidLastStep(step) => {
                 write!(formatter, "unknown desktop subagent last step: {step}")
+            }
+            Self::InvalidDesignTransition(transition) => {
+                write!(
+                    formatter,
+                    "unknown desktop design canvas transition: {transition}"
+                )
             }
             Self::UnexpectedEvent { expected, got } => {
                 write!(formatter, "desktop event {got} is not {expected}")
