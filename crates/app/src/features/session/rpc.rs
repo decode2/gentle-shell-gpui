@@ -13,6 +13,7 @@ use pi_rpc::desktop_rpc::DesktopMethod;
 use serde_json::{Value, json};
 
 use super::state::desktop::permission::Applied as PermissionApplied;
+use super::state::desktop::supervision::Applied as SupervisionApplied;
 use super::state::desktop::{self, Applied as DesktopApplied, Send as DesktopSend};
 use super::state::{BackendStatus, ModelInfo};
 use super::{SessionView, attachments, builtins};
@@ -107,6 +108,40 @@ impl SessionView {
         self.send_desktop(applied.sends, cx);
     }
 
+    /// Act on a supervision decision: say what failed through the tab's report
+    /// path, then send whatever the subagent/job channel asked for.
+    pub(super) fn apply_supervision(
+        &mut self,
+        applied: SupervisionApplied,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(report) = applied.report {
+            self.transcript
+                .notice(NoticeLevel::Warning, report.message());
+            cx.notify();
+        }
+        self.send_desktop(applied.sends, cx);
+    }
+
+    /// Reset the Gentle Desktop channel when the conversation changes on the
+    /// same backend (new/open session). It forgets the old session's pending
+    /// request and event baseline (without rewinding request ids) and returns
+    /// the channel to Idle, so the `refresh_state` that follows re-probes
+    /// capabilities and the supervision lists re-seed exactly once behind it.
+    /// The permission slice keeps its confirmed mode; its capabilities are
+    /// refreshed by the same re-probe.
+    fn reset_desktop_channel(&mut self) {
+        self.desktop.reset();
+    }
+
+    /// Cancel one running background job over `cancel_job`. There is no job
+    /// start method and no restart: only the running job the user picked is
+    /// affected, and the server's answer is the truth.
+    pub(super) fn cancel_running_job(&mut self, id: String, cx: &mut Context<Self>) {
+        let applied = self.desktop.cancel_job(id);
+        self.apply_supervision(applied, cx);
+    }
+
     /// Act on a permission decision: say what failed or warn about a default
     /// that could not be saved, then send whatever the permission slice asked
     /// for and reflect the server-confirmed mode into the picker.
@@ -197,6 +232,13 @@ impl SessionView {
                 let applied = self.permission.expire(self.desktop.session(), generation);
                 self.apply_permission(applied, cx);
             }
+            DesktopMethod::ListSubagents
+            | DesktopMethod::ListJobs
+            | DesktopMethod::CancelSubagent
+            | DesktopMethod::CancelJob => {
+                let applied = self.desktop.supervision_expire(generation);
+                self.apply_supervision(applied, cx);
+            }
         }
     }
 
@@ -219,6 +261,13 @@ impl SessionView {
                     .permission
                     .outer(self.desktop.session(), generation, handled);
                 self.apply_permission(applied, cx);
+            }
+            DesktopMethod::ListSubagents
+            | DesktopMethod::ListJobs
+            | DesktopMethod::CancelSubagent
+            | DesktopMethod::CancelJob => {
+                let applied = self.desktop.supervision_outer(generation, handled);
+                self.apply_supervision(applied, cx);
             }
         }
     }
@@ -375,6 +424,7 @@ impl SessionView {
                 && data["cancelled"] != true
             {
                 this.reset_conversation();
+                this.reset_desktop_channel();
                 this.refresh_state(cx);
                 this.refresh_git(cx);
             }
@@ -394,6 +444,7 @@ impl SessionView {
             if switched {
                 this.reset_conversation();
                 this.session_file = Some(path);
+                this.reset_desktop_channel();
                 this.refresh_state(cx);
             }
         });

@@ -153,6 +153,18 @@ Two cases keep the legacy path (save `permission-mode.json` and restart the back
 
 While capabilities are still loading, a picker click reports "try again" and never writes the default file or restarts. `choose_mode` in `lifecycle.rs` is the only caller of either path; every other restart caller is unchanged.
 
+### Agents and jobs (`state::desktop::supervision`)
+
+When the backend's `capabilities` advertise `list_subagents` and/or `list_jobs`, the app seeds a full list once the probe (capabilities → snapshot) and the permission seed have settled, then reconciles `agents_update`/`jobs_update` events by id. The structured lists are the primary source once seeded; the legacy `gentle-agents` widget and `details.gentleJobs` stay as the fallback for older Shells, and the panel/jobs chip never shows both, so the two sources cannot double a helper or a job.
+
+- `list_subagents` / `list_jobs`: empty params, answered with the typed `agents`/`jobs` arrays. Only these full-list responses mark a list as seeded. A list that cannot be decoded leaves the legacy fallback in place and is never retried in a loop; a malformed record never fabricates an empty list.
+- `agents_update` / `jobs_update`: full bounded projections, so the event replaces the list (ids absent from the projection drop rather than growing forever). They never mark a list as seeded, so a pre-seed event is replaced by the real seed. A sequence gap forgets the seeded markers so the lists re-seed behind the channel's `get_snapshot` resync.
+- `cancel_subagent` / `cancel_job`: params `{ id }`. One cancel in flight at a time, with the same timeout/rollback discipline as permission changes. The server's post-action projection is the truth: `cancel_subagent` answers `requested`/`changed` only when supplied (never defaulted, so an async cancel is not read as unchanged), and `cancel_job` answers `changed`. There is no job start method and no restart.
+
+A new/open session (`new_session`/`switch_session`) resets the Desktop channel: it forgets the pending request and the event baseline without rewinding request ids and returns to Idle, so the following `refresh_state` re-probes capabilities and the supervision lists re-seed exactly once behind it. Late answers from the previous session are uncorrelated and benign.
+
+The Agents panel's Stop button uses `cancel_subagent` when the peer offers it; a peer without the method (or a server `unsupported_method` answer) keeps the legacy "ask the agent to run `subagent_cancel`" prompt exactly once. Jobs cancel over `cancel_job` with no legacy prompt. Model, tokens and cost are shown per helper from the typed `usage` window, with an honest "unavailable" marker where the input/output/cache/reasoning breakdown is not recorded; prompt, tool output, paths and error text never cross the wire.
+
 ### Commands the app sends
 
 | `type` | Fields | Where | Use |
@@ -253,7 +265,7 @@ Only `http://` and `https://` are accepted by `--open-url` and `/web`. The gener
 | `select`, `confirm`, `input`, `editor` | `extension.dialogs` queue; the first one is drawn (`session/view/dialogs.rs`) and answered with `answer_dialog` → `respond_ui`. Triggers the `NeedsYou` alert. If it has a `timeout`, it is removed from the queue when it expires (the agent already resolved it). Esc answers `Cancelled`. |
 | `notify` | `notifyType` → `NoticeLevel` (`error`, `warning`, everything else `Info`). "Design canvas…" text → `browser::canvas_notice` → canvas. Usage limit notices (`parse_rate_limit`, "`N% used (window)`") → chip in `extension.rate_limits`. Everything else: capture for the running `/` command (`builtins::Capture`), toast only for warning/error (no repeats, `first_toast`) and `SessionEvent::Notice` to the notification center (`features/notices/`). |
 | `setStatus` | `extension.statuses[key] = text`; empty or missing text removes the key. |
-| `setWidget` | `gentle-agents` → `gentle_core::activity::parse` + `retain_finished` (agents panel, Helpers chip). Any other key → `extension.widgets` (one chip per widget with its lines). `widgetPlacement` is ignored. |
+| `setWidget` | `gentle-agents` → `gentle_core::activity::parse` + `retain_finished` (the legacy helper source, used only until `list_subagents` seeds; see “Agents and jobs”). Any other key → `extension.widgets` (one chip per widget with its lines). `widgetPlacement` is ignored. |
 | `setTitle` | Tab title. |
 | `set_editor_text` | Replaces the composer text. |
 
@@ -376,9 +388,9 @@ The canvas is detected from the `gentle_design` result (`details.url`, `refreshe
 
 ## Limits of an RPC host
 
-- Gentle Shell does not publish the model, tokens or cost of live helpers.
+- Helpers' model, tokens and cost arrive only from backends whose `capabilities` offer `list_subagents`; the token breakdown is unavailable while a helper is in flight. Older Shells keep the legacy `gentle-agents` widget without model/usage/cost.
 - Claude subscription windows only arrive as response headers inside the TUI; the app sees the limit notices (`notify`) but not the full windows.
-- Only the agent can stop helpers and background jobs ("Ask to stop" asks it to run `subagent_cancel`).
+- Helpers and background jobs stop directly only when the backend offers `cancel_subagent`/`cancel_job`; without them the Agents panel keeps the legacy "ask the agent to run `subagent_cancel`" prompt, and jobs have no cancel.
 - Auto mode may reject actions: input over RPC does not count as a live human decision.
 - The permission mode of a live session changes over the Gentle Desktop RPC channel when the backend advertises `set_permission_mode`; a backend without that method keeps the legacy path (save `permission-mode.json` and restart). See “Permission mode” under RPC protocol.
 - Gentle Shell does not play sounds for RPC hosts (`notificationContextAllowed`): `features/alerts/` plays them.

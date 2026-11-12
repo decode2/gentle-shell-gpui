@@ -299,6 +299,7 @@ impl SessionView {
                     .requested()
                     .map(|requested| super::from_desktop_mode(requested.mode));
                 let applied = self.permission.apply(self.desktop.session(), request);
+                let mut legacy_fallback = false;
                 match applied.report.as_ref() {
                     // Events were lost: the channel owns the get_snapshot
                     // resync. The record was already accepted by the permission
@@ -310,19 +311,94 @@ impl SessionView {
                     Some(desktop::permission::Report::UnsupportedMethod) => {
                         if let Some(mode) = requested_mode {
                             self.legacy_choose_mode_deferred(mode, cx);
-                            return;
+                            legacy_fallback = true;
+                        } else {
+                            self.apply_permission(applied, cx);
                         }
-                        self.apply_permission(applied, cx);
                     }
                     _ => self.apply_permission(applied, cx),
                 }
+                if !legacy_fallback {
+                    self.sync_supervision(cx);
+                }
+            }
+            DesktopRoute::Supervision => {
+                let applied = self.desktop.supervision_apply(request);
+                match applied.report.as_ref() {
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync, and the lists re-seed once it lands.
+                    Some(desktop::supervision::Report::OutOfOrderSequence) => {
+                        let sends = self.desktop.resync();
+                        self.send_desktop(sends, cx);
+                    }
+                    Some(desktop::supervision::Report::UnsupportedMethod) => {
+                        // The server refused a cancel it advertised: keep the
+                        // legacy prompt path once, with the exact id.
+                        if let Some(target) = self.desktop.take_cancel_target() {
+                            self.legacy_cancel(target, cx);
+                        } else {
+                            self.apply_supervision(applied, cx);
+                        }
+                    }
+                    _ => self.apply_supervision(applied, cx),
+                }
+                self.sync_supervision(cx);
             }
             DesktopRoute::Channel => {
                 let applied = self.desktop.ui(request);
                 self.apply_desktop(applied, cx);
                 self.sync_permission_capabilities(cx);
+                self.sync_supervision(cx);
             }
         }
+    }
+
+    /// Seed the subagent and job lists once the probe and any in-flight
+    /// request settle. Called after every channel and supervision record, so
+    /// the two lists chain behind the snapshot and permission seeds without
+    /// blocking the initial probe.
+    fn sync_supervision(&mut self, cx: &mut Context<Self>) {
+        let applied = self.desktop.supervision_seed();
+        self.apply_supervision(applied, cx);
+    }
+
+    /// A server that advertised `cancel_subagent` answered `unsupported_method`:
+    /// keep the legacy "ask the agent to run subagent_cancel" prompt exactly
+    /// once. Jobs have no legacy prompt, so their failure is reported instead.
+    fn legacy_cancel(
+        &mut self,
+        target: desktop::supervision::CancelTarget,
+        cx: &mut Context<Self>,
+    ) {
+        if !target.is_subagent() {
+            self.transcript.notice(
+                NoticeLevel::Warning,
+                desktop::supervision::Report::UnsupportedMethod.message(),
+            );
+            cx.notify();
+            return;
+        }
+        let id = target.id().to_string();
+        let agent = self
+            .desktop
+            .subagents()
+            .iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.agent.clone())
+            .or_else(|| {
+                self.activity.agents.as_ref().and_then(|activity| {
+                    activity
+                        .tasks
+                        .iter()
+                        .find(|task| task.summary.id == id)
+                        .map(|task| task.summary.agent.clone())
+                })
+            })
+            .unwrap_or_default();
+        let text = format!(
+            "Stop the subagent task {id} ({agent}) now with subagent_cancel, then tell me what it had done."
+        );
+        self.send_prompt(text, cx);
     }
 
     /// Keep the permission slice's view of the peer's capabilities in step with
@@ -431,6 +507,7 @@ impl SessionView {
 /// record exactly once, in the slice that owns it.
 enum DesktopRoute {
     Permission,
+    Supervision,
     Channel,
 }
 
@@ -445,6 +522,14 @@ fn route_desktop_widget(
                 Some(DesktopMethod::GetPermissionMode) | Some(DesktopMethod::SetPermissionMode)
             ) {
                 DesktopRoute::Permission
+            } else if matches!(
+                pending,
+                Some(DesktopMethod::ListSubagents)
+                    | Some(DesktopMethod::ListJobs)
+                    | Some(DesktopMethod::CancelSubagent)
+                    | Some(DesktopMethod::CancelJob)
+            ) {
+                DesktopRoute::Supervision
             } else {
                 DesktopRoute::Channel
             }
@@ -453,6 +538,12 @@ fn route_desktop_widget(
             if event.event == desktop::permission::PERMISSION_MODE_CHANGED =>
         {
             DesktopRoute::Permission
+        }
+        Ok(Some(DesktopRecord::Event(event)))
+            if event.event == desktop::supervision::AGENTS_UPDATE
+                || event.event == desktop::supervision::JOBS_UPDATE =>
+        {
+            DesktopRoute::Supervision
         }
         _ => DesktopRoute::Channel,
     }
