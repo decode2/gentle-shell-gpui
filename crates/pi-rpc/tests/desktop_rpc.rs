@@ -816,6 +816,16 @@ fn capabilities_retain_events_and_check_the_described_wire_values() {
     assert!(described.emits("snapshot_changed"));
     assert!(!described.emits("other"));
 
+    let actual_server = capabilities(json!({
+        "schema": SCHEMA,
+        "command": "gentle:desktop",
+        "widget": WIDGET_KEY,
+        "methods": ["capabilities", "get_snapshot"],
+        "events": [],
+    }))
+    .unwrap();
+    assert_eq!(actual_server.command.as_deref(), Some("gentle:desktop"));
+
     for (data, field) in [
         (
             json!({ "methods": ["capabilities"], "events": [], "widget": "other" }),

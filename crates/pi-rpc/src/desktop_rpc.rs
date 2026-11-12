@@ -565,7 +565,14 @@ impl Capabilities {
         let schema = text_field(data, "schema")?;
         expect_field("schema", SCHEMA, &schema)?;
         let command = text_field(data, "command")?;
-        expect_field("command", PROMPT_COMMAND, &command)?;
+        let command_name = command
+            .as_ref()
+            .map(|value| value.strip_prefix('/').unwrap_or(value).to_string());
+        expect_field(
+            "command",
+            PROMPT_COMMAND.trim_start_matches('/'),
+            &command_name,
+        )?;
         let widget = text_field(data, "widget")?;
         expect_field("widget", WIDGET_KEY, &widget)?;
         Ok(Self {
