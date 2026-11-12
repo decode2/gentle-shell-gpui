@@ -3,10 +3,11 @@
 //! adapter only builds the outer prompt and decodes the widget records.
 
 use pi_rpc::desktop_rpc::{
-    DesktopEvent, DesktopMethod, DesktopRecord, DesktopRequest, DesktopResponse, DesktopRpcError,
-    DesktopSession, Handoff, MAX_REQUEST_BYTES, PROMPT_COMMAND, PermissionMode,
-    PermissionModeChanged, PermissionModeState, SCHEMA, SetPermissionModeResult, WIDGET_KEY,
-    decode_payload, decode_widget,
+    DesktopAgent, DesktopAgentStep, DesktopAgentUsage, DesktopEvent, DesktopJob, DesktopMethod,
+    DesktopRecord, DesktopRequest, DesktopResponse, DesktopRpcError, DesktopSession, Handoff,
+    JobExitCode, MAX_REQUEST_BYTES, PROMPT_COMMAND, PermissionMode, PermissionModeChanged,
+    PermissionModeState, SCHEMA, SetPermissionModeResult, WIDGET_KEY, decode_payload,
+    decode_widget,
 };
 use pi_rpc::{Response, UiMethod, UiRequest};
 use serde_json::{Value, json};
@@ -1171,4 +1172,653 @@ fn the_session_issues_permission_requests_with_typed_params() {
         session.pending(),
         Some(("desktop-2", DesktopMethod::SetPermissionMode))
     );
+}
+
+// --- subagent and job methods --------------------------------------------
+
+fn agent_data() -> Value {
+    json!({
+        "id": "m3a1-worker",
+        "agent": "worker",
+        "status": "completed",
+        "model": "anthropic/claude-sonnet-4",
+        "modelSource": "binding",
+        "fallbackFrom": "anthropic/claude-opus-4",
+        "thinking": "high",
+        "lastStep": "answered",
+        "usage": {
+            "total": 15234,
+            "cost": 0.0421,
+            "input": 12000,
+            "output": 3234,
+            "cache": 5000,
+            "reasoning": 4000,
+        },
+    })
+}
+
+fn full_agent() -> DesktopAgent {
+    DesktopAgent {
+        id: "m3a1-worker".into(),
+        agent: "worker".into(),
+        status: "completed".into(),
+        model: Some("anthropic/claude-sonnet-4".into()),
+        model_source: Some("binding".into()),
+        fallback_from: Some("anthropic/claude-opus-4".into()),
+        thinking: Some("high".into()),
+        last_step: DesktopAgentStep::Answered,
+        usage: DesktopAgentUsage {
+            total: 15234,
+            cost: 0.0421,
+            input: Some(12000),
+            output: Some(3234),
+            cache: Some(5000),
+            reasoning: Some(4000),
+        },
+    }
+}
+
+fn job_data() -> Value {
+    json!({
+        "id": "job-2",
+        "label": "Deploy staging",
+        "status": "exited",
+        "startedAt": 1788599000000u64,
+        "endedAt": 1788599500000u64,
+        "exitCode": 0,
+    })
+}
+
+fn single_agent(data: Value) -> DesktopAgent {
+    let list = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "agents": [data] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .list_subagents()
+    .unwrap();
+    assert_eq!(list.agents.len(), 1);
+    list.agents.into_iter().next().unwrap()
+}
+
+fn single_job(data: Value) -> DesktopJob {
+    let list = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "jobs": [data] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .list_jobs()
+    .unwrap();
+    assert_eq!(list.jobs.len(), 1);
+    list.jobs.into_iter().next().unwrap()
+}
+
+#[test]
+fn subagent_and_job_methods_use_the_exact_wire_names_and_shapes() {
+    let list_agents = DesktopRequest::list_subagents("desktop-1").unwrap();
+    assert_eq!(list_agents.method(), DesktopMethod::ListSubagents);
+    assert_eq!(
+        list_agents.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-1","method":"list_subagents","params":{{}}}}"#
+        )
+    );
+
+    let list_jobs = DesktopRequest::list_jobs("desktop-2").unwrap();
+    assert_eq!(list_jobs.method(), DesktopMethod::ListJobs);
+    assert_eq!(
+        list_jobs.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-2","method":"list_jobs","params":{{}}}}"#
+        )
+    );
+
+    let cancel_agent = DesktopRequest::cancel_subagent("desktop-3", "m3a1-worker").unwrap();
+    assert_eq!(cancel_agent.method(), DesktopMethod::CancelSubagent);
+    assert_eq!(
+        cancel_agent.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-3","method":"cancel_subagent","params":{{"id":"m3a1-worker"}}}}"#
+        )
+    );
+
+    let cancel_job = DesktopRequest::cancel_job("desktop-4", "job-1").unwrap();
+    assert_eq!(cancel_job.method(), DesktopMethod::CancelJob);
+    assert_eq!(
+        cancel_job.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-4","method":"cancel_job","params":{{"id":"job-1"}}}}"#
+        )
+    );
+
+    for (wire, method) in [
+        ("list_subagents", DesktopMethod::ListSubagents),
+        ("cancel_subagent", DesktopMethod::CancelSubagent),
+        ("list_jobs", DesktopMethod::ListJobs),
+        ("cancel_job", DesktopMethod::CancelJob),
+    ] {
+        assert_eq!(DesktopMethod::parse(wire).unwrap(), method);
+        assert_eq!(wire.parse::<DesktopMethod>().unwrap(), method);
+        assert_eq!(method.as_str(), wire);
+    }
+}
+
+#[test]
+fn subagent_and_job_methods_are_advertised_and_checked_by_capabilities() {
+    let response = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            capabilities_data(
+                &[
+                    "capabilities",
+                    "list_subagents",
+                    "cancel_subagent",
+                    "list_jobs",
+                    "cancel_job",
+                ],
+                &["agents_update", "jobs_update"],
+            ),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    let capabilities = response.capabilities().unwrap();
+    assert!(capabilities.supports(DesktopMethod::ListSubagents));
+    assert!(capabilities.supports(DesktopMethod::CancelSubagent));
+    assert!(capabilities.supports(DesktopMethod::ListJobs));
+    assert!(capabilities.supports(DesktopMethod::CancelJob));
+    assert!(capabilities.emits("agents_update"));
+    assert!(capabilities.emits("jobs_update"));
+}
+
+#[test]
+fn cancel_params_reject_an_empty_id_before_anything_is_sent() {
+    assert!(matches!(
+        DesktopRequest::cancel_subagent("desktop-1", ""),
+        Err(DesktopRpcError::InvalidCancelId)
+    ));
+    assert!(matches!(
+        DesktopRequest::cancel_job("desktop-1", ""),
+        Err(DesktopRpcError::InvalidCancelId)
+    ));
+
+    let mut session = DesktopSession::new();
+    assert!(matches!(
+        session.issue_cancel_subagent(""),
+        Err(DesktopRpcError::InvalidCancelId)
+    ));
+    assert!(matches!(
+        session.issue_cancel_job(""),
+        Err(DesktopRpcError::InvalidCancelId)
+    ));
+    // A rejected request never consumes an id or leaves one pending.
+    assert!(session.pending().is_none());
+    assert_eq!(
+        session.issue_list_subagents().unwrap().request_id(),
+        "desktop-1"
+    );
+}
+
+#[test]
+fn agent_entries_decode_model_usage_cost_and_breakdown() {
+    let agent = single_agent(agent_data());
+    assert_eq!(agent, full_agent());
+
+    // The optional launch-context and breakdown fields are absent rather than
+    // invented when the owner did not record them.
+    let minimal = single_agent(json!({
+        "id": "a1",
+        "agent": "explore",
+        "status": "running",
+        "model": "anthropic/claude-sonnet-4",
+        "lastStep": "writing",
+        "usage": { "total": 100, "cost": 0.0 },
+    }));
+    assert_eq!(minimal.model_source, None);
+    assert_eq!(minimal.fallback_from, None);
+    assert_eq!(minimal.thinking, None);
+    assert_eq!(minimal.usage.input, None);
+    assert_eq!(minimal.usage.output, None);
+    assert_eq!(minimal.usage.cache, None);
+    assert_eq!(minimal.usage.reasoning, None);
+
+    // `model` is optional on this projection: an entry without one decodes.
+    let no_model = single_agent(json!({
+        "id": "a2",
+        "agent": "explore",
+        "status": "queued",
+        "lastStep": "queued",
+        "usage": { "total": 0, "cost": 0.0 },
+    }));
+    assert_eq!(no_model.model, None);
+}
+
+#[test]
+fn agent_last_step_is_a_closed_vocabulary() {
+    for step in DesktopAgentStep::ALL {
+        assert_eq!(step.as_str().parse::<DesktopAgentStep>().unwrap(), step);
+        assert_eq!(step.to_string(), step.as_str());
+
+        let agent = single_agent(json!({
+            "id": "a1",
+            "agent": "explore",
+            "status": "running",
+            "model": "anthropic/claude-sonnet-4",
+            "lastStep": step.as_str(),
+            "usage": { "total": 1, "cost": 0.0 },
+        }));
+        assert_eq!(agent.last_step, step);
+    }
+
+    // Raw owner step text (an error, a path, a provider body) never crosses:
+    // it is not in the vocabulary, so it is refused, not forwarded.
+    for bogus in ["responded", "error: timeout", "reading lib/auth.ts", ""] {
+        let response = record_response(
+            decode_widget(&widget(&response_line(
+                "desktop-1",
+                json!({ "agents": [{
+                    "id": "a1",
+                    "agent": "explore",
+                    "status": "running",
+                    "model": "anthropic/claude-sonnet-4",
+                    "lastStep": bogus,
+                    "usage": { "total": 1, "cost": 0.0 },
+                }] }),
+            )))
+            .unwrap()
+            .unwrap(),
+        );
+        assert!(matches!(
+            response.list_subagents(),
+            Err(DesktopRpcError::InvalidLastStep(_))
+        ));
+    }
+}
+
+#[test]
+fn job_entries_decode_timestamps_and_preserve_null_vs_absent_exit_code() {
+    assert_eq!(
+        single_job(job_data()),
+        DesktopJob {
+            id: "job-2".into(),
+            label: "Deploy staging".into(),
+            status: "exited".into(),
+            started_at: 1788599000000,
+            ended_at: Some(1788599500000),
+            exit_code: Some(JobExitCode::Code(0)),
+        }
+    );
+
+    // A running job has no end and no recorded exit code: both are absent.
+    let running = single_job(json!({
+        "id": "job-1",
+        "label": "CI for PR 42",
+        "status": "running",
+        "startedAt": 1788600000000u64,
+    }));
+    assert_eq!(running.ended_at, None);
+    assert_eq!(running.exit_code, None);
+
+    // A job that ended without a code records `null`, which is not absence.
+    let no_code = single_job(json!({
+        "id": "job-3",
+        "label": "killed",
+        "status": "failed",
+        "startedAt": 1788600000000u64,
+        "endedAt": 1788601000000u64,
+        "exitCode": null,
+    }));
+    assert_eq!(no_code.exit_code, Some(JobExitCode::Null));
+}
+
+#[test]
+fn list_responses_decode_their_typed_lists() {
+    let agents = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "agents": [agent_data(), agent_data()] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .list_subagents()
+    .unwrap();
+    assert_eq!(agents.agents, vec![full_agent(), full_agent()]);
+
+    let jobs = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "jobs": [job_data()] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .list_jobs()
+    .unwrap();
+    assert_eq!(jobs.jobs.len(), 1);
+    assert_eq!(jobs.jobs[0].id, "job-2");
+}
+
+#[test]
+fn cancel_responses_carry_requested_and_changed_only_when_supplied() {
+    // The current server answers the post-action projection alone; the flags
+    // are future-facing and must not be invented as defaults.
+    let plain = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "agent": agent_data() }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .cancel_subagent()
+    .unwrap();
+    assert_eq!(plain.agent, full_agent());
+    assert_eq!(plain.requested, None);
+    assert_eq!(plain.changed, None);
+
+    // A synchronous cancel (queued -> cancelled) reports both flags.
+    let queued = json!({
+        "id": "m3a1-worker",
+        "agent": "worker",
+        "status": "cancelled",
+        "model": "anthropic/claude-sonnet-4",
+        "lastStep": "cancelled",
+        "usage": { "total": 15234, "cost": 0.0421 },
+    });
+    let sync = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "agent": queued, "requested": true, "changed": true }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .cancel_subagent()
+    .unwrap();
+    assert_eq!(sync.requested, Some(true));
+    assert_eq!(sync.changed, Some(true));
+    assert_eq!(sync.agent.status, "cancelled");
+
+    // A running task is cancelled asynchronously: requested but not changed.
+    // The projection must keep both, never default `changed` to false.
+    let async_cancel = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "agent": agent_data(), "requested": true }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .cancel_subagent()
+    .unwrap();
+    assert_eq!(async_cancel.requested, Some(true));
+    assert_eq!(async_cancel.changed, None);
+
+    // Jobs report only `changed`.
+    let job = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "job": job_data() }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .cancel_job()
+    .unwrap();
+    assert_eq!(job.job.id, "job-2");
+    assert_eq!(job.changed, None);
+
+    let changed_job = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "job": job_data(), "changed": true }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .cancel_job()
+    .unwrap();
+    assert_eq!(changed_job.changed, Some(true));
+}
+
+#[test]
+fn agents_update_and_jobs_update_verify_the_exact_event_name() {
+    let agents = record_event(
+        decode_widget(&widget(&event_line(
+            1,
+            "agents_update",
+            json!({ "agents": [agent_data()] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    assert_eq!(agents.agents_update().unwrap().agents, vec![full_agent()]);
+
+    let jobs = record_event(
+        decode_widget(&widget(&event_line(
+            2,
+            "jobs_update",
+            json!({ "jobs": [job_data()] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    assert_eq!(jobs.jobs_update().unwrap().jobs.len(), 1);
+
+    // The exact event name is checked first: a foreign event that happens to
+    // fit the shape is refused, not misread.
+    let foreign_name = record_event(
+        decode_widget(&widget(&event_line(
+            3,
+            "permission_mode_changed",
+            json!({ "agents": [agent_data()] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    assert!(matches!(
+        foreign_name.agents_update(),
+        Err(DesktopRpcError::UnexpectedEvent { expected: "agents_update", got })
+            if got == "permission_mode_changed"
+    ));
+
+    // The right name with the wrong shape is a shape error, and the other
+    // domain's shape is refused too.
+    let wrong_shape = record_event(
+        decode_widget(&widget(&event_line(
+            4,
+            "agents_update",
+            json!({ "jobs": [job_data()] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    assert!(matches!(
+        wrong_shape.agents_update(),
+        Err(DesktopRpcError::MalformedPayload(_))
+    ));
+
+    let wrong_shape_jobs = record_event(
+        decode_widget(&widget(&event_line(
+            5,
+            "jobs_update",
+            json!({ "agents": [agent_data()] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    assert!(matches!(
+        wrong_shape_jobs.jobs_update(),
+        Err(DesktopRpcError::MalformedPayload(_))
+    ));
+}
+
+#[test]
+fn malformed_agent_and_job_payloads_are_rejected() {
+    let agent_cases: &[Value] = &[
+        json!({ "agent": "explore", "status": "running", "model": "m", "lastStep": "running", "usage": { "total": 1, "cost": 0.0 } }),
+        json!({ "id": "", "agent": "explore", "status": "running", "model": "m", "lastStep": "running", "usage": { "total": 1, "cost": 0.0 } }),
+        json!({ "id": "a1", "agent": "explore", "status": "running", "model": "m", "usage": { "total": 1, "cost": 0.0 } }),
+        json!({ "id": "a1", "agent": "explore", "status": "running", "model": "m", "lastStep": "running" }),
+        json!({ "id": "a1", "agent": "explore", "status": "running", "model": "m", "lastStep": "running", "usage": { "cost": 0.0 } }),
+        json!({ "id": "a1", "agent": "explore", "status": "running", "model": "m", "lastStep": "running", "usage": { "total": -1, "cost": 0.0 } }),
+        json!({ "id": "a1", "agent": "explore", "status": "running", "model": "m", "lastStep": "running", "usage": { "total": 1, "cost": "cheap" } }),
+        json!({ "id": "a1", "agent": "explore", "status": "running", "model": 7, "lastStep": "running", "usage": { "total": 1, "cost": 0.0 } }),
+    ];
+    for data in agent_cases {
+        let response = record_response(
+            decode_widget(&widget(&response_line(
+                "desktop-1",
+                json!({ "agents": [data.clone()] }),
+            )))
+            .unwrap()
+            .unwrap(),
+        );
+        assert!(
+            response.list_subagents().is_err(),
+            "{data} should not decode as a subagent list"
+        );
+    }
+
+    let job_cases: &[Value] = &[
+        json!({ "label": "x", "status": "running", "startedAt": 1 }),
+        json!({ "id": "j1", "status": "running", "startedAt": 1 }),
+        json!({ "id": "j1", "label": "x", "startedAt": 1 }),
+        json!({ "id": "j1", "label": "x", "status": "running" }),
+        json!({ "id": "j1", "label": "x", "status": "running", "startedAt": -1 }),
+        json!({ "id": "j1", "label": "x", "status": "running", "startedAt": 1, "endedAt": "soon" }),
+        json!({ "id": "j1", "label": "x", "status": "exited", "startedAt": 1, "exitCode": 1.5 }),
+        json!({ "id": "j1", "label": "x", "status": "exited", "startedAt": 1, "exitCode": "0" }),
+    ];
+    for data in job_cases {
+        let response = record_response(
+            decode_widget(&widget(&response_line(
+                "desktop-1",
+                json!({ "jobs": [data.clone()] }),
+            )))
+            .unwrap()
+            .unwrap(),
+        );
+        assert!(
+            response.list_jobs().is_err(),
+            "{data} should not decode as a job list"
+        );
+    }
+}
+
+#[test]
+fn malformed_cancel_payloads_are_rejected() {
+    for data in [
+        json!({}),
+        json!({ "requested": true }),
+        json!({ "agent": "nope" }),
+        json!({ "agent": agent_data(), "requested": "yes" }),
+        json!({ "agent": agent_data(), "changed": 1 }),
+    ] {
+        let response = record_response(
+            decode_widget(&widget(&response_line("desktop-1", data.clone())))
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(
+            response.cancel_subagent().is_err(),
+            "{data} should not decode as a cancel_subagent result"
+        );
+    }
+
+    for data in [
+        json!({}),
+        json!({ "job": "nope" }),
+        json!({ "job": job_data(), "changed": "yes" }),
+    ] {
+        let response = record_response(
+            decode_widget(&widget(&response_line("desktop-1", data.clone())))
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(
+            response.cancel_job().is_err(),
+            "{data} should not decode as a cancel_job result"
+        );
+    }
+}
+
+#[test]
+fn subagent_and_job_requests_flow_through_session_correlation() {
+    let mut session = DesktopSession::new();
+
+    let list = session.issue_list_subagents().unwrap();
+    assert_eq!(list.request_id(), "desktop-1");
+    assert_eq!(
+        session.pending(),
+        Some(("desktop-1", DesktopMethod::ListSubagents))
+    );
+
+    // One request in flight, whatever the method.
+    assert!(matches!(
+        session.issue_list_jobs(),
+        Err(DesktopRpcError::RequestInFlight { .. })
+    ));
+    assert!(matches!(
+        session.issue_cancel_job("job-1"),
+        Err(DesktopRpcError::RequestInFlight { .. })
+    ));
+
+    session
+        .accept(&widget(&response_line(
+            "desktop-1",
+            json!({ "agents": [agent_data()] }),
+        )))
+        .unwrap();
+    assert!(session.pending().is_none());
+
+    let cancel = session.issue_cancel_job("job-1").unwrap();
+    assert_eq!(cancel.request_id(), "desktop-2");
+    assert_eq!(cancel.method(), DesktopMethod::CancelJob);
+    assert_eq!(
+        session.pending(),
+        Some(("desktop-2", DesktopMethod::CancelJob))
+    );
+}
+
+#[test]
+fn subagent_and_job_events_keep_the_sequence_rules() {
+    let mut session = DesktopSession::new();
+
+    // The first event of the new names sets the baseline like any other.
+    session
+        .accept(&widget(&event_line(
+            7,
+            "jobs_update",
+            json!({ "jobs": [job_data()] }),
+        )))
+        .unwrap();
+    assert_eq!(session.last_sequence(), Some(7));
+
+    session
+        .accept(&widget(&event_line(
+            8,
+            "agents_update",
+            json!({ "agents": [agent_data()] }),
+        )))
+        .unwrap();
+    assert_eq!(session.last_sequence(), Some(8));
+
+    // Gaps are still gaps, and the last good sequence is preserved.
+    let skipped = widget(&event_line(12, "jobs_update", json!({ "jobs": [] })));
+    assert!(matches!(
+        session.accept(&skipped),
+        Err(DesktopRpcError::OutOfOrderSequence {
+            expected: 9,
+            got: 12
+        })
+    ));
+    assert_eq!(session.last_sequence(), Some(8));
 }

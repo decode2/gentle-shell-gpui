@@ -45,6 +45,10 @@ pub enum DesktopMethod {
     GetSnapshot,
     GetPermissionMode,
     SetPermissionMode,
+    ListSubagents,
+    CancelSubagent,
+    ListJobs,
+    CancelJob,
 }
 
 impl DesktopMethod {
@@ -55,6 +59,10 @@ impl DesktopMethod {
             Self::GetSnapshot => "get_snapshot",
             Self::GetPermissionMode => "get_permission_mode",
             Self::SetPermissionMode => "set_permission_mode",
+            Self::ListSubagents => "list_subagents",
+            Self::CancelSubagent => "cancel_subagent",
+            Self::ListJobs => "list_jobs",
+            Self::CancelJob => "cancel_job",
         }
     }
 
@@ -65,6 +73,10 @@ impl DesktopMethod {
             "get_snapshot" => Ok(Self::GetSnapshot),
             "get_permission_mode" => Ok(Self::GetPermissionMode),
             "set_permission_mode" => Ok(Self::SetPermissionMode),
+            "list_subagents" => Ok(Self::ListSubagents),
+            "cancel_subagent" => Ok(Self::CancelSubagent),
+            "list_jobs" => Ok(Self::ListJobs),
+            "cancel_job" => Ok(Self::CancelJob),
             other => Err(DesktopRpcError::UnsupportedMethod(other.to_string())),
         }
     }
@@ -138,6 +150,99 @@ impl fmt::Display for PermissionMode {
     }
 }
 
+/// The closed `lastStep` vocabulary of a subagent entry. The server derives
+/// this label from the task status and a fixed set of safe active steps; raw
+/// `TaskRecord.lastStep` text (an error, a stderr tail, a provider body) is
+/// never forwarded, so any value outside this set is refused rather than
+/// passed through.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DesktopAgentStep {
+    Queued,
+    Running,
+    Waiting,
+    Starting,
+    Writing,
+    CleaningUp,
+    GeneratingToolArguments,
+    QuestionDismissed,
+    Answered,
+    Interrupted,
+    Completed,
+    Failed,
+    Cancelled,
+    TimedOut,
+}
+
+impl DesktopAgentStep {
+    /// Every step label the protocol speaks, in wire order.
+    pub const ALL: [Self; 14] = [
+        Self::Queued,
+        Self::Running,
+        Self::Waiting,
+        Self::Starting,
+        Self::Writing,
+        Self::CleaningUp,
+        Self::GeneratingToolArguments,
+        Self::QuestionDismissed,
+        Self::Answered,
+        Self::Interrupted,
+        Self::Completed,
+        Self::Failed,
+        Self::Cancelled,
+        Self::TimedOut,
+    ];
+
+    /// The wire name of the step label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "queued",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Starting => "starting",
+            Self::Writing => "writing",
+            Self::CleaningUp => "cleaning up",
+            Self::GeneratingToolArguments => "generating tool arguments",
+            Self::QuestionDismissed => "question dismissed",
+            Self::Answered => "answered",
+            Self::Interrupted => "interrupted",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::TimedOut => "timed_out",
+        }
+    }
+}
+
+impl std::str::FromStr for DesktopAgentStep {
+    type Err = DesktopRpcError;
+
+    fn from_str(step: &str) -> Result<Self, Self::Err> {
+        match step {
+            "queued" => Ok(Self::Queued),
+            "running" => Ok(Self::Running),
+            "waiting" => Ok(Self::Waiting),
+            "starting" => Ok(Self::Starting),
+            "writing" => Ok(Self::Writing),
+            "cleaning up" => Ok(Self::CleaningUp),
+            "generating tool arguments" => Ok(Self::GeneratingToolArguments),
+            "question dismissed" => Ok(Self::QuestionDismissed),
+            "answered" => Ok(Self::Answered),
+            "interrupted" => Ok(Self::Interrupted),
+            "completed" => Ok(Self::Completed),
+            "failed" => Ok(Self::Failed),
+            "cancelled" => Ok(Self::Cancelled),
+            "timed_out" => Ok(Self::TimedOut),
+            other => Err(DesktopRpcError::InvalidLastStep(other.to_string())),
+        }
+    }
+}
+
+impl fmt::Display for DesktopAgentStep {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// One validated inner request, ready to be sent as a prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DesktopRequest {
@@ -173,6 +278,15 @@ fn set_permission_mode_params(
         .map_err(|error| DesktopRpcError::MalformedPayload(error.to_string()))
 }
 
+/// The wire `params` object for `cancel_subagent` and `cancel_job`: exactly
+/// `{ id }` with a non-empty string id, nothing else.
+fn cancel_params(id: String) -> Result<Value, DesktopRpcError> {
+    if id.is_empty() {
+        return Err(DesktopRpcError::InvalidCancelId);
+    }
+    Ok(json!({ "id": id }))
+}
+
 impl DesktopRequest {
     /// The `capabilities` request. It takes no params.
     pub fn capabilities(request_id: impl Into<String>) -> Result<Self, DesktopRpcError> {
@@ -200,6 +314,42 @@ impl DesktopRequest {
             request_id,
             DesktopMethod::SetPermissionMode,
             set_permission_mode_params(mode, persist)?,
+        )
+    }
+
+    /// The `list_subagents` request. It takes no params.
+    pub fn list_subagents(request_id: impl Into<String>) -> Result<Self, DesktopRpcError> {
+        Self::new(request_id, DesktopMethod::ListSubagents, json!({}))
+    }
+
+    /// The `list_jobs` request. It takes no params.
+    pub fn list_jobs(request_id: impl Into<String>) -> Result<Self, DesktopRpcError> {
+        Self::new(request_id, DesktopMethod::ListJobs, json!({}))
+    }
+
+    /// The `cancel_subagent` request. Params are exactly `{ id }` with a
+    /// non-empty id, as reported by `list_subagents`.
+    pub fn cancel_subagent(
+        request_id: impl Into<String>,
+        id: impl Into<String>,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::new(
+            request_id,
+            DesktopMethod::CancelSubagent,
+            cancel_params(id.into())?,
+        )
+    }
+
+    /// The `cancel_job` request. Params are exactly `{ id }` with a
+    /// non-empty id, as reported by `list_jobs`.
+    pub fn cancel_job(
+        request_id: impl Into<String>,
+        id: impl Into<String>,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::new(
+            request_id,
+            DesktopMethod::CancelJob,
+            cancel_params(id.into())?,
         )
     }
 
@@ -318,6 +468,26 @@ impl DesktopResponse {
         SetPermissionModeResult::from_data(self.data()?)
     }
 
+    /// The response to `list_subagents`.
+    pub fn list_subagents(&self) -> Result<SubagentList, DesktopRpcError> {
+        SubagentList::from_data(self.data()?)
+    }
+
+    /// The response to `cancel_subagent`.
+    pub fn cancel_subagent(&self) -> Result<CancelSubagentResult, DesktopRpcError> {
+        CancelSubagentResult::from_data(self.data()?)
+    }
+
+    /// The response to `list_jobs`.
+    pub fn list_jobs(&self) -> Result<JobList, DesktopRpcError> {
+        JobList::from_data(self.data()?)
+    }
+
+    /// The response to `cancel_job`.
+    pub fn cancel_job(&self) -> Result<CancelJobResult, DesktopRpcError> {
+        CancelJobResult::from_data(self.data()?)
+    }
+
     fn data(&self) -> Result<&Value, DesktopRpcError> {
         self.result
             .as_ref()
@@ -339,6 +509,21 @@ impl DesktopEvent {
     /// simply fails to fit the shape.
     pub fn permission_mode_changed(&self) -> Result<PermissionModeChanged, DesktopRpcError> {
         PermissionModeChanged::from_data(&self.data)
+    }
+
+    /// Decode the data of an `agents_update` event. Unlike the shape-only
+    /// accessor above, this verifies the exact event name first, so a foreign
+    /// payload that happens to fit the shape is refused instead of misread.
+    pub fn agents_update(&self) -> Result<SubagentList, DesktopRpcError> {
+        expect_event(self, "agents_update")?;
+        SubagentList::from_data(&self.data)
+    }
+
+    /// Decode the data of a `jobs_update` event, verifying the exact event
+    /// name before the shape, exactly like [`Self::agents_update`].
+    pub fn jobs_update(&self) -> Result<JobList, DesktopRpcError> {
+        expect_event(self, "jobs_update")?;
+        JobList::from_data(&self.data)
     }
 }
 
@@ -490,6 +675,127 @@ fn optional_error_field(
     }
 }
 
+/// A required non-negative integer field of a data document (token counts,
+/// millisecond timestamps).
+fn u64_field(data: &Value, field: &'static str) -> Result<u64, DesktopRpcError> {
+    data.get(field).and_then(Value::as_u64).ok_or_else(|| {
+        DesktopRpcError::MalformedPayload(format!("{field} must be a non-negative integer"))
+    })
+}
+
+/// An optional non-negative integer field: absent and `null` both decode to
+/// `None`, matching the other optional field helpers.
+fn optional_u64_field(data: &Value, field: &'static str) -> Result<Option<u64>, DesktopRpcError> {
+    match data.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => number.as_u64().map(Some).ok_or_else(|| {
+            DesktopRpcError::MalformedPayload(format!("{field} must be a non-negative integer"))
+        }),
+        Some(_) => Err(DesktopRpcError::MalformedPayload(format!(
+            "{field} must be a non-negative integer"
+        ))),
+    }
+}
+
+/// A required cost field: a finite, non-negative number (it may be fractional).
+fn cost_field(data: &Value, field: &'static str) -> Result<f64, DesktopRpcError> {
+    let value = data
+        .get(field)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| DesktopRpcError::MalformedPayload(format!("{field} must be a number")))?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(DesktopRpcError::MalformedPayload(format!(
+            "{field} must be a finite non-negative number"
+        )));
+    }
+    Ok(value)
+}
+
+/// An optional boolean field: absent and `null` both decode to `None`.
+fn optional_bool_field(data: &Value, field: &'static str) -> Result<Option<bool>, DesktopRpcError> {
+    match data.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(_) => Err(DesktopRpcError::MalformedPayload(format!(
+            "{field} must be a boolean"
+        ))),
+    }
+}
+
+/// A job exit code field. Absent is `None` (no code recorded); a recorded
+/// `null` (an exit without a code) is `Some(JobExitCode::Null)`, so the two
+/// are never conflated.
+fn exit_code_field(
+    data: &Value,
+    field: &'static str,
+) -> Result<Option<JobExitCode>, DesktopRpcError> {
+    match data.get(field) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(JobExitCode::Null)),
+        Some(Value::Number(number)) => {
+            let code = number
+                .as_i64()
+                .filter(|code| *code >= i32::MIN as i64 && *code <= i32::MAX as i64)
+                .ok_or_else(|| {
+                    DesktopRpcError::MalformedPayload(format!(
+                        "{field} must be an integer exit code"
+                    ))
+                })?;
+            Ok(Some(JobExitCode::Code(code as i32)))
+        }
+        Some(_) => Err(DesktopRpcError::MalformedPayload(format!(
+            "{field} must be an integer or null"
+        ))),
+    }
+}
+
+/// A required `lastStep` field, restricted to the closed [`DesktopAgentStep`]
+/// vocabulary.
+fn last_step_field(data: &Value, field: &'static str) -> Result<DesktopAgentStep, DesktopRpcError> {
+    data.get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| DesktopRpcError::MalformedPayload(format!("{field} must be a step string")))?
+        .parse()
+}
+
+/// A required nested object field of a data document.
+fn field_object<'a>(data: &'a Value, field: &'static str) -> Result<&'a Value, DesktopRpcError> {
+    data.get(field)
+        .filter(|value| value.is_object())
+        .ok_or_else(|| DesktopRpcError::MalformedPayload(format!("{field} must be an object")))
+}
+
+/// A required array of projected subagent entries.
+fn agent_entries(data: &Value) -> Result<Vec<DesktopAgent>, DesktopRpcError> {
+    let items = data
+        .get("agents")
+        .and_then(Value::as_array)
+        .ok_or_else(|| DesktopRpcError::MalformedPayload("list has no agents array".into()))?;
+    items.iter().map(DesktopAgent::from_data).collect()
+}
+
+/// A required array of projected job entries.
+fn job_entries(data: &Value) -> Result<Vec<DesktopJob>, DesktopRpcError> {
+    let items = data
+        .get("jobs")
+        .and_then(Value::as_array)
+        .ok_or_else(|| DesktopRpcError::MalformedPayload("list has no jobs array".into()))?;
+    items.iter().map(DesktopJob::from_data).collect()
+}
+
+/// Require an event to carry the exact name before its data is decoded, so a
+/// foreign payload that happens to fit the shape is refused instead of read.
+fn expect_event(event: &DesktopEvent, expected: &'static str) -> Result<(), DesktopRpcError> {
+    if event.event == expected {
+        Ok(())
+    } else {
+        Err(DesktopRpcError::UnexpectedEvent {
+            expected,
+            got: event.event.clone(),
+        })
+    }
+}
+
 /// The decoded `get_snapshot` data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
@@ -580,6 +886,178 @@ impl PermissionModeChanged {
             default_mode: permission_mode_field(data, "default_mode")?,
             persisted: bool_field(data, "persisted")?,
             source: string_field(data, "source")?,
+        })
+    }
+}
+
+/// A subagent's accumulated usage: the billed total and cost the store tracks,
+/// plus the final-assistant input/output/cache/reasoning token breakdown once
+/// the run settled. The breakdown fields are absent for an in-flight task
+/// whose breakdown is not recorded yet, and for a restored task whose run
+/// never recorded one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DesktopAgentUsage {
+    pub total: u64,
+    pub cost: f64,
+    pub input: Option<u64>,
+    pub output: Option<u64>,
+    pub cache: Option<u64>,
+    pub reasoning: Option<u64>,
+}
+
+impl DesktopAgentUsage {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            total: u64_field(data, "total")?,
+            cost: cost_field(data, "cost")?,
+            input: optional_u64_field(data, "input")?,
+            output: optional_u64_field(data, "output")?,
+            cache: optional_u64_field(data, "cache")?,
+            reasoning: optional_u64_field(data, "reasoning")?,
+        })
+    }
+}
+
+/// One projected subagent entry. Only these fields exist on the wire: identity,
+/// the agent name, the status word, the routed model plus its launch-layer
+/// source and the fallback it moved away from, the thinking level, the closed
+/// step label, and the bounded usage window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DesktopAgent {
+    pub id: String,
+    pub agent: String,
+    pub status: String,
+    pub model: Option<String>,
+    pub model_source: Option<String>,
+    pub fallback_from: Option<String>,
+    pub thinking: Option<String>,
+    pub last_step: DesktopAgentStep,
+    pub usage: DesktopAgentUsage,
+}
+
+impl DesktopAgent {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        let id = string_field(data, "id")?;
+        if id.is_empty() {
+            return Err(DesktopRpcError::MalformedPayload(
+                "subagent has no id".into(),
+            ));
+        }
+        Ok(Self {
+            id,
+            agent: string_field(data, "agent")?,
+            status: string_field(data, "status")?,
+            model: text_field(data, "model")?,
+            model_source: text_field(data, "modelSource")?,
+            fallback_from: text_field(data, "fallbackFrom")?,
+            thinking: text_field(data, "thinking")?,
+            last_step: last_step_field(data, "lastStep")?,
+            usage: DesktopAgentUsage::from_data(field_object(data, "usage")?)?,
+        })
+    }
+}
+
+/// A job's recorded exit code. The outer `Option` is `None` when the field is
+/// absent (no code recorded yet); `Some(Null)` preserves a recorded `null`,
+/// an exit without a code, distinct from absence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobExitCode {
+    Code(i32),
+    Null,
+}
+
+/// One projected background job entry. Only identity, the human label, the
+/// status word, the start/end timestamps, and the exit code cross the wire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesktopJob {
+    pub id: String,
+    pub label: String,
+    pub status: String,
+    pub started_at: u64,
+    pub ended_at: Option<u64>,
+    pub exit_code: Option<JobExitCode>,
+}
+
+impl DesktopJob {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        let id = string_field(data, "id")?;
+        if id.is_empty() {
+            return Err(DesktopRpcError::MalformedPayload("job has no id".into()));
+        }
+        Ok(Self {
+            id,
+            label: string_field(data, "label")?,
+            status: string_field(data, "status")?,
+            started_at: u64_field(data, "startedAt")?,
+            ended_at: optional_u64_field(data, "endedAt")?,
+            exit_code: exit_code_field(data, "exitCode")?,
+        })
+    }
+}
+
+/// The decoded `list_subagents` (and `agents_update`) data.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentList {
+    pub agents: Vec<DesktopAgent>,
+}
+
+impl SubagentList {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            agents: agent_entries(data)?,
+        })
+    }
+}
+
+/// The decoded `list_jobs` (and `jobs_update`) data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobList {
+    pub jobs: Vec<DesktopJob>,
+}
+
+impl JobList {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            jobs: job_entries(data)?,
+        })
+    }
+}
+
+/// The actual state after `cancel_subagent`, re-read from the owner. `agent`
+/// is the post-action projection; `requested` and `changed` are present only
+/// when the server supplies them. They are never defaulted: a running task's
+/// cancellation is asynchronous, so a `requested: true` answer with no
+/// `changed` marker must not be read as `changed: false`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CancelSubagentResult {
+    pub agent: DesktopAgent,
+    pub requested: Option<bool>,
+    pub changed: Option<bool>,
+}
+
+impl CancelSubagentResult {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            agent: DesktopAgent::from_data(field_object(data, "agent")?)?,
+            requested: optional_bool_field(data, "requested")?,
+            changed: optional_bool_field(data, "changed")?,
+        })
+    }
+}
+
+/// The actual state after `cancel_job`, re-read from the owner. `changed` is
+/// present only when the server supplies it and is never defaulted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CancelJobResult {
+    pub job: DesktopJob,
+    pub changed: Option<bool>,
+}
+
+impl CancelJobResult {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            job: DesktopJob::from_data(field_object(data, "job")?)?,
+            changed: optional_bool_field(data, "changed")?,
         })
     }
 }
@@ -687,6 +1165,32 @@ impl DesktopSession {
             DesktopMethod::SetPermissionMode,
             set_permission_mode_params(mode, persist)?,
         )
+    }
+
+    /// Issue `list_subagents` with its empty params.
+    pub fn issue_list_subagents(&mut self) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_with(DesktopMethod::ListSubagents, json!({}))
+    }
+
+    /// Issue `list_jobs` with its empty params.
+    pub fn issue_list_jobs(&mut self) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_with(DesktopMethod::ListJobs, json!({}))
+    }
+
+    /// Issue `cancel_subagent` with exactly `{ id }`.
+    pub fn issue_cancel_subagent(
+        &mut self,
+        id: impl Into<String>,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_with(DesktopMethod::CancelSubagent, cancel_params(id.into())?)
+    }
+
+    /// Issue `cancel_job` with exactly `{ id }`.
+    pub fn issue_cancel_job(
+        &mut self,
+        id: impl Into<String>,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_with(DesktopMethod::CancelJob, cancel_params(id.into())?)
     }
 
     /// A new request with a fresh id; `params` is built by the typed callers
@@ -927,6 +1431,12 @@ pub enum DesktopRpcError {
     UnsupportedMethod(String),
     /// A permission mode the wire does not define.
     InvalidPermissionMode(String),
+    /// A cancel request named an empty id.
+    InvalidCancelId,
+    /// A subagent `lastStep` label outside the closed vocabulary.
+    InvalidLastStep(String),
+    /// An event was decoded through an accessor for another event name.
+    UnexpectedEvent { expected: &'static str, got: String },
     /// `params` is not a JSON object.
     ParamsNotObject,
     /// The encoded inner request exceeds [`MAX_REQUEST_BYTES`].
@@ -978,6 +1488,15 @@ impl fmt::Display for DesktopRpcError {
             }
             Self::InvalidPermissionMode(mode) => {
                 write!(formatter, "unknown desktop permission mode: {mode}")
+            }
+            Self::InvalidCancelId => {
+                formatter.write_str("desktop cancel id must be a non-empty string")
+            }
+            Self::InvalidLastStep(step) => {
+                write!(formatter, "unknown desktop subagent last step: {step}")
+            }
+            Self::UnexpectedEvent { expected, got } => {
+                write!(formatter, "desktop event {got} is not {expected}")
             }
             Self::ParamsNotObject => {
                 formatter.write_str("desktop request params must be an object")
