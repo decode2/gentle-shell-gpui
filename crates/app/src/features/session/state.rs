@@ -334,6 +334,8 @@ pub(in crate::features::session) mod desktop {
         supervision: supervision::Agents,
         /// Provider subscription usage over the same channel.
         subscription: subscription::Subscription,
+        /// The design canvas over the same channel.
+        design: design::Design,
     }
 
     impl Default for Desktop {
@@ -354,6 +356,7 @@ pub(in crate::features::session) mod desktop {
                 pending_resync: false,
                 supervision: supervision::Agents::default(),
                 subscription: subscription::Subscription::default(),
+                design: design::Design::new(),
             }
         }
 
@@ -370,6 +373,7 @@ pub(in crate::features::session) mod desktop {
             self.pending_resync = false;
             self.supervision.reset();
             self.subscription.reset(&mut self.session);
+            self.design.reset(&mut self.session);
         }
 
         /// The backend is ready and Pi listed (or did not list) the extension's
@@ -430,7 +434,8 @@ pub(in crate::features::session) mod desktop {
                         Ok(capabilities) => {
                             self.capabilities = Some(capabilities.clone());
                             self.supervision.set_capabilities(capabilities.clone());
-                            self.subscription.set_capabilities(capabilities);
+                            self.subscription.set_capabilities(capabilities.clone());
+                            self.design.set_capabilities(capabilities);
                             Applied {
                                 sends: self.issue(DesktopMethod::GetSnapshot, Step::Snapshot),
                                 report: None,
@@ -451,9 +456,9 @@ pub(in crate::features::session) mod desktop {
                         }
                         Err(error) => self.unavailable(Report::Snapshot(error)),
                     },
-                    // The permission, supervision and subscription methods are
-                    // served by their own slices; this channel only probes and
-                    // sequences.
+                    // The permission, supervision, subscription and design
+                    // methods are served by their own slices; this channel only
+                    // probes and sequences.
                     Some(DesktopMethod::GetPermissionMode)
                     | Some(DesktopMethod::SetPermissionMode)
                     | Some(DesktopMethod::ListSubagents)
@@ -461,7 +466,8 @@ pub(in crate::features::session) mod desktop {
                     | Some(DesktopMethod::CancelSubagent)
                     | Some(DesktopMethod::CancelJob)
                     | Some(DesktopMethod::GetSubscriptionUsage)
-                    | Some(DesktopMethod::RefreshSubscriptionUsage) => Applied::default(),
+                    | Some(DesktopMethod::RefreshSubscriptionUsage)
+                    | Some(DesktopMethod::GetDesignCanvas) => Applied::default(),
                     None => Applied::default(),
                 },
                 Ok(Some(DesktopRecord::Event(event))) => {
@@ -680,6 +686,49 @@ pub(in crate::features::session) mod desktop {
                 .outer(&mut self.session, generation, handled)
         }
 
+        /// Seed the design canvas once the probe has landed (the channel is
+        /// Ready) and no other request is in flight.
+        pub(in crate::features::session) fn design_seed(&mut self) -> design::Applied {
+            // A deferred resync is owed first: seeding ahead of its snapshot
+            // would only be repeated behind it.
+            if self.step != Step::Ready || self.pending_resync {
+                return design::Applied::default();
+            }
+            self.design.seed(&mut self.session)
+        }
+
+        /// Whether `design_canvas` events are the canvas source on this
+        /// backend: the channel is Ready and the peer advertised them. Then the
+        /// legacy `notify` text would only navigate twice.
+        pub(in crate::features::session) fn design_events_ready(&self) -> bool {
+            self.step == Step::Ready && self.design.emits_events()
+        }
+
+        /// One incoming UI request for the design slice.
+        pub(in crate::features::session) fn design_apply(
+            &mut self,
+            request: &UiRequest,
+        ) -> design::Applied {
+            self.design.apply(&mut self.session, request)
+        }
+
+        /// The pending timeout for a design request.
+        pub(in crate::features::session) fn design_expire(
+            &mut self,
+            generation: u64,
+        ) -> design::Applied {
+            self.design.expire(&mut self.session, generation)
+        }
+
+        /// Pi answered the outer prompt of a design request.
+        pub(in crate::features::session) fn design_outer(
+            &mut self,
+            generation: u64,
+            handled: bool,
+        ) -> design::Applied {
+            self.design.outer(&mut self.session, generation, handled)
+        }
+
         /// Stop asking this backend and say why once: the channel is unusable
         /// here until the backend is replaced.
         fn unavailable(&mut self, report: Report) -> Applied {
@@ -693,6 +742,10 @@ pub(in crate::features::session) mod desktop {
 
         /// Ask for the state again after a gap in the events.
         pub(in crate::features::session) fn resync(&mut self) -> Vec<Send> {
+            // Whichever record showed the gap, a `design_canvas` transition may
+            // be among the lost events: the canvas re-seeds behind the
+            // snapshot.
+            self.design.rearm();
             if self.session.pending().is_some() {
                 // A request is in flight. A channel probe or resync already
                 // covers the gap; a permission request owes one resync once it
@@ -2301,6 +2354,345 @@ pub(in crate::features::session) mod desktop {
             }
         }
     }
+
+    /// Gentle Desktop's design canvas in one tab.
+    ///
+    /// When the backend's `capabilities` advertise `get_design_canvas`, the
+    /// tab seeds the canvas state once after the probe and follows the
+    /// `design_canvas` events. Both become the same browser notice the legacy
+    /// `notify` text and `gentle_design` result produce, so the browser flow
+    /// is unchanged. There is no open or stop method: the agent owns the
+    /// canvas, the app only shows it.
+    ///
+    /// The canvas URL carries a token. It only ever reaches the browser notice
+    /// for a loopback URL; reports never carry it and this slice keeps no copy.
+    pub(in crate::features::session) mod design {
+        use pi_rpc::UiRequest;
+        use pi_rpc::desktop_rpc::{
+            Capabilities, DesignCanvas, DesignTransition, DesktopEvent, DesktopMethod,
+            DesktopRecord, DesktopResponse, DesktopRpcError, DesktopSession,
+        };
+
+        use super::Send;
+        use crate::features::browser::CanvasNotice;
+
+        /// The wire name of the only event this slice applies.
+        pub(in crate::features::session) const DESIGN_CANVAS: &str = "design_canvas";
+
+        /// What one decision produced. No `Debug`: `notice` carries the
+        /// tokenized URL, which must never reach a log line.
+        #[derive(Default)]
+        pub(in crate::features::session) struct Applied {
+            pub(in crate::features::session) sends: Vec<Send>,
+            pub(in crate::features::session) report: Option<Report>,
+            pub(in crate::features::session) notice: Option<CanvasNotice>,
+        }
+
+        /// Why a design request stopped or what it refused. None carries the
+        /// canvas URL.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub(in crate::features::session) enum Report {
+            /// The extension does not advertise `get_design_canvas`.
+            Unsupported,
+            /// The server answered `unsupported_method` for it anyway.
+            UnsupportedMethod,
+            /// Capabilities are not known yet.
+            NotReady,
+            /// The request timed out before the server answered.
+            Timeout,
+            /// A transport, server or decoding failure.
+            Failure(DesktopRpcError),
+            /// A gap in the event sequence: the record was already accepted,
+            /// so the wiring resyncs instead of accepting it again.
+            OutOfOrderSequence,
+            /// The canvas URL is not on this machine: nothing is opened.
+            NotLoopback,
+        }
+
+        impl Report {
+            /// What the conversation says about it. Never the canvas URL.
+            pub(in crate::features::session) fn message(&self) -> String {
+                match self {
+                    Self::Unsupported | Self::UnsupportedMethod => {
+                        "This Gentle Shell does not report its design canvas to Desktop."
+                            .to_string()
+                    }
+                    Self::NotReady => {
+                        "Gentle Desktop is still loading; try again in a moment.".to_string()
+                    }
+                    Self::Timeout => "The design canvas request timed out.".to_string(),
+                    Self::Failure(error) => {
+                        format!("The design canvas could not be read ({error}).")
+                    }
+                    Self::OutOfOrderSequence => {
+                        "Gentle Desktop events were lost; resyncing the design canvas.".to_string()
+                    }
+                    Self::NotLoopback => {
+                        "Gentle Desktop did not open a design canvas outside this machine."
+                            .to_string()
+                    }
+                }
+            }
+
+            /// Whether the legacy canvas path stays in charge: the peer lacks
+            /// the method or the channel has not probed yet. Those are silent;
+            /// the `notify` text and `gentle_design` result keep working.
+            pub(in crate::features::session) fn is_legacy(&self) -> bool {
+                matches!(
+                    self,
+                    Self::Unsupported | Self::UnsupportedMethod | Self::NotReady
+                )
+            }
+        }
+
+        #[derive(Default)]
+        pub(in crate::features::session) struct Design {
+            capabilities: Option<Capabilities>,
+            /// The seed was spent for this backend (asked, or known
+            /// unsupported). A gap re-arms it.
+            seeded: bool,
+            /// Bumped per request, so an old timer cannot drop a newer one.
+            generation: u64,
+            /// The URL this slice last opened, so a re-seed or a repeated
+            /// `open` does not reload the page. Never printed; the struct has
+            /// no `Debug`.
+            shown: Option<String>,
+        }
+
+        impl Design {
+            pub(in crate::features::session) fn new() -> Self {
+                Self::default()
+            }
+
+            /// Adopt the peer's capabilities once the probe completes.
+            pub(in crate::features::session) fn set_capabilities(
+                &mut self,
+                capabilities: Capabilities,
+            ) {
+                self.capabilities = Some(capabilities);
+            }
+
+            /// Whether the peer advertised `design_canvas` events.
+            pub(in crate::features::session) fn emits_events(&self) -> bool {
+                self.capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.emits(DESIGN_CANVAS))
+            }
+
+            /// Ask for the canvas state once per backend, URL included: the
+            /// interactive host is the trusted client the server hands it to.
+            /// It waits for any in-flight request, so the probe and the other
+            /// slices never issue two requests at once.
+            pub(in crate::features::session) fn seed(
+                &mut self,
+                session: &mut DesktopSession,
+            ) -> Applied {
+                if self.seeded {
+                    return Applied::default();
+                }
+                let Some(capabilities) = &self.capabilities else {
+                    return report(Report::NotReady);
+                };
+                if !capabilities.supports(DesktopMethod::GetDesignCanvas) {
+                    // Said once; an old Shell keeps its legacy canvas path.
+                    self.seeded = true;
+                    return report(Report::Unsupported);
+                }
+                if session.pending().is_some() {
+                    return Applied::default();
+                }
+                let request = match session.issue_get_design_canvas(Some(true)) {
+                    Ok(request) => request,
+                    Err(error) => return report(Report::Failure(error)),
+                };
+                self.seeded = true;
+                self.generation += 1;
+                Applied {
+                    sends: vec![Send {
+                        request,
+                        generation: self.generation,
+                    }],
+                    ..Applied::default()
+                }
+            }
+
+            /// Events were lost somewhere on the shared channel: ask again
+            /// once the resync snapshot lands. A peer without the method stays
+            /// spent, so its silent `Unsupported` is not repeated.
+            pub(in crate::features::session) fn rearm(&mut self) {
+                if self.capabilities.as_ref().is_some_and(|capabilities| {
+                    capabilities.supports(DesktopMethod::GetDesignCanvas)
+                }) {
+                    self.seeded = false;
+                }
+            }
+
+            /// Pi answered the outer `prompt` of the design request.
+            pub(in crate::features::session) fn outer(
+                &mut self,
+                session: &mut DesktopSession,
+                generation: u64,
+                handled: bool,
+            ) -> Applied {
+                if handled || generation != self.generation || !owns_pending(session) {
+                    return Applied::default();
+                }
+                self.rollback(session);
+                report(Report::Failure(DesktopRpcError::UnexpectedDisposition {
+                    disposition: None,
+                }))
+            }
+
+            /// One incoming UI request; applies only the records this slice
+            /// owns (the `get_design_canvas` answer and `design_canvas`).
+            pub(in crate::features::session) fn apply(
+                &mut self,
+                session: &mut DesktopSession,
+                request: &UiRequest,
+            ) -> Applied {
+                // The session clears the pending request while correlating, so
+                // the method it answered is read first.
+                let awaiting = session.pending().map(|(_, method)| method);
+                match session.accept(request) {
+                    Ok(Some(DesktopRecord::Response(response))) => match awaiting {
+                        Some(DesktopMethod::GetDesignCanvas) => self.apply_response(response),
+                        _ => Applied::default(),
+                    },
+                    Ok(Some(DesktopRecord::Event(event))) => self.apply_event(event),
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync, and the lost transition is re-read once it lands.
+                    Err(DesktopRpcError::OutOfOrderSequence { .. }) => {
+                        self.seeded = false;
+                        report(Report::OutOfOrderSequence)
+                    }
+                    // Not this protocol's widget, or a late, repeated or
+                    // malformed record: never a navigation.
+                    _ => Applied::default(),
+                }
+            }
+
+            /// The pending timeout for `generation` fired.
+            pub(in crate::features::session) fn expire(
+                &mut self,
+                session: &mut DesktopSession,
+                generation: u64,
+            ) -> Applied {
+                if generation != self.generation || !owns_pending(session) {
+                    return Applied::default();
+                }
+                self.rollback(session);
+                report(Report::Timeout)
+            }
+
+            /// The backend was replaced or exited: nothing it said or numbered
+            /// applies, and the next probe re-arms one seed.
+            pub(in crate::features::session) fn reset(&mut self, session: &mut DesktopSession) {
+                session.reset();
+                self.capabilities = None;
+                self.seeded = false;
+                self.generation += 1;
+                self.shown = None;
+            }
+
+            /// Drop the request in flight. The generation moves, so a late
+            /// timer or disposition for it is stale.
+            fn rollback(&mut self, session: &mut DesktopSession) {
+                session.abandon();
+                self.generation += 1;
+            }
+
+            fn apply_response(&mut self, response: DesktopResponse) -> Applied {
+                match response.design_canvas() {
+                    Ok(canvas) => self.canvas_notice(None, &canvas),
+                    Err(DesktopRpcError::RemoteError(info))
+                        if info.code == "unsupported_method" =>
+                    {
+                        report(Report::UnsupportedMethod)
+                    }
+                    Err(error) => report(Report::Failure(error)),
+                }
+            }
+
+            /// A `design_canvas` event, applied only when the peer advertised
+            /// that exact name.
+            fn apply_event(&mut self, event: DesktopEvent) -> Applied {
+                if event.event != DESIGN_CANVAS || !self.emits_events() {
+                    return Applied::default();
+                }
+                match event.design_canvas() {
+                    Ok(event) => self.canvas_notice(Some(event.transition), &event.state),
+                    Err(error) => report(Report::Failure(error)),
+                }
+            }
+
+            /// The browser notice a canvas state means. `transition` is `None`
+            /// for the seed, which never closes anything: `Stopped` closes
+            /// design cards another tab may own, so only a `stop` event (or an
+            /// event with the canvas not running) does. A running canvas opens
+            /// its loopback URL, except the one already shown on a plain
+            /// `open` or seed; a `refresh` always reloads. A running canvas
+            /// without a URL navigates nowhere. Any other URL is refused, and
+            /// the report does not repeat it.
+            fn canvas_notice(
+                &mut self,
+                transition: Option<DesignTransition>,
+                canvas: &DesignCanvas,
+            ) -> Applied {
+                if transition == Some(DesignTransition::Stop) || !canvas.running {
+                    self.shown = None;
+                    if transition.is_none() {
+                        return Applied::default();
+                    }
+                    return Applied {
+                        notice: Some(CanvasNotice::Stopped),
+                        ..Applied::default()
+                    };
+                }
+                let Some(url) = canvas.url.as_deref() else {
+                    return Applied::default();
+                };
+                if !is_loopback(url) {
+                    return report(Report::NotLoopback);
+                }
+                let refreshed = transition == Some(DesignTransition::Refresh);
+                if !refreshed && self.shown.as_deref() == Some(url) {
+                    return Applied::default();
+                }
+                self.shown = Some(url.to_string());
+                Applied {
+                    notice: Some(CanvasNotice::Open {
+                        url: url.to_string(),
+                        refreshed,
+                    }),
+                    ..Applied::default()
+                }
+            }
+        }
+
+        fn report(report: Report) -> Applied {
+            Applied {
+                report: Some(report),
+                ..Applied::default()
+            }
+        }
+
+        /// The browser's canvas rule, read back exactly so nothing around the
+        /// URL (whitespace, a second URL) is taken instead; the loopback host
+        /// parser also refuses a userinfo host such as `localhost:@host`.
+        fn is_loopback(url: &str) -> bool {
+            let browser = matches!(
+                crate::features::browser::canvas_notice(&format!("Design canvas: {url}")),
+                Some(CanvasNotice::Open { url: shown, .. }) if shown == url
+            );
+            browser && gentle_core::web::loopback_url(url).as_deref() == Some(url)
+        }
+
+        /// Whether the pending request is this slice's: the other slices
+        /// share the session, so a stale design timer must not drop theirs.
+        fn owns_pending(session: &DesktopSession) -> bool {
+            session.pending().map(|(_, method)| method) == Some(DesktopMethod::GetDesignCanvas)
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -2312,11 +2704,13 @@ mod tests {
     };
     use serde_json::{Value, json};
 
+    use super::desktop::design::{Applied as DesignApplied, Design, Report as DesignReport};
     use super::desktop::permission::{self, Permission, Report as PermissionReport};
     use super::desktop::subscription::{Report as SubscriptionReport, Subscription};
     use super::desktop::supervision::{Agents, Report as SupervisionReport};
     use super::desktop::{self, Desktop, Report, Step};
     use super::{ExtensionUi, ModelInfo, TodoIsland};
+    use crate::features::browser::CanvasNotice;
     use gentle_core::tools::TodoTask;
 
     #[test]
@@ -4544,5 +4938,676 @@ mod tests {
         assert_eq!(sends.len(), 1);
         assert_eq!(sends[0].request.method(), DesktopMethod::GetSnapshot);
         assert!(desktop.resync().is_empty());
+    }
+
+    // Gentle Desktop's design canvas slice: the canvas state is hand-built, so
+    // no canvas server, browser or process runs.
+
+    /// A tokenized loopback canvas URL, as the server hands it out.
+    const CANVAS_URL: &str = "http://127.0.0.1:4100/tok-s3cret/d/landing/";
+
+    fn design_ready(events: &[&str]) -> (Design, DesktopSession) {
+        let mut design = Design::new();
+        design.set_capabilities(supervision_capabilities(&["get_design_canvas"], events));
+        (design, DesktopSession::new())
+    }
+
+    fn canvas_json(running: bool, url: Option<&str>) -> Value {
+        let mut data = json!({
+            "running": running,
+            "slug": if running { json!("landing") } else { Value::Null },
+            "connectedClients": 1,
+            "designs": [{"slug": "landing", "title": "Landing", "mtime": 1.5}],
+        });
+        if let Some(url) = url {
+            data["url"] = url.into();
+        }
+        data
+    }
+
+    fn design_response_lines(request_id: &str, data: Value) -> Vec<String> {
+        record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": request_id,
+            "ok": true,
+            "data": data,
+        }))
+    }
+
+    fn design_event_lines(seq: u64, transition: &str, mut data: Value) -> Vec<String> {
+        data["transition"] = transition.into();
+        record(json!({
+            "schema": SCHEMA,
+            "kind": "event",
+            "seq": seq,
+            "event": "design_canvas",
+            "data": data,
+        }))
+    }
+
+    /// Seed the slice and answer the seed with `data`.
+    fn seed_design(
+        design: &mut Design,
+        session: &mut DesktopSession,
+        data: Value,
+    ) -> DesignApplied {
+        let seeded = design.seed(session);
+        assert_eq!(seeded.sends.len(), 1);
+        let id = seeded.sends[0].request.request_id().to_string();
+        design.apply(session, &desktop_widget(design_response_lines(&id, data)))
+    }
+
+    /// Whether `notice` opens `url`. A predicate rather than `assert_eq!`, so
+    /// a failing test never prints the tokenized URL.
+    fn opens(notice: &Option<CanvasNotice>, url: &str, refreshed: bool) -> bool {
+        matches!(
+            notice,
+            Some(CanvasNotice::Open { url: shown, refreshed: shown_refreshed })
+                if shown == url && *shown_refreshed == refreshed
+        )
+    }
+
+    /// Whether `notice` closes the canvas, without printing it on failure.
+    fn stops(notice: &Option<CanvasNotice>) -> bool {
+        matches!(notice, Some(CanvasNotice::Stopped))
+    }
+
+    #[test]
+    fn design_seed_asks_once_with_the_url_and_waits_for_pending() {
+        let (mut design, mut session) = design_ready(&["design_canvas"]);
+
+        // Another request in flight defers the seed without spending it.
+        let probe = session.issue(DesktopMethod::GetSnapshot).unwrap();
+        assert!(design.seed(&mut session).sends.is_empty());
+        session
+            .accept(&desktop_widget(snapshot_lines(probe.request_id(), 4)))
+            .unwrap();
+
+        let seeded = design.seed(&mut session);
+        assert_eq!(seeded.sends.len(), 1);
+        assert_eq!(
+            seeded.sends[0].request.method(),
+            DesktopMethod::GetDesignCanvas
+        );
+        let payload: Value = serde_json::from_str(seeded.sends[0].request.payload()).unwrap();
+        assert_eq!(payload["method"], "get_design_canvas");
+        assert_eq!(payload["params"], json!({"includeUrl": true}));
+
+        // One in flight, and seeded exactly once per backend.
+        assert!(design.seed(&mut session).sends.is_empty());
+        let id = seeded.sends[0].request.request_id().to_string();
+        let applied = design.apply(
+            &mut session,
+            &desktop_widget(design_response_lines(
+                &id,
+                canvas_json(true, Some(CANVAS_URL)),
+            )),
+        );
+        assert!(applied.report.is_none());
+        assert!(design.seed(&mut session).sends.is_empty());
+    }
+
+    #[test]
+    fn design_seed_state_maps_to_the_browser_notice() {
+        // Running on loopback: open the canvas, not as a refresh.
+        let (mut design, mut session) = design_ready(&[]);
+        let applied = seed_design(
+            &mut design,
+            &mut session,
+            canvas_json(true, Some(CANVAS_URL)),
+        );
+        assert!(opens(&applied.notice, CANVAS_URL, false));
+        assert!(applied.report.is_none());
+
+        // Not running: a seed never closes the canvas, because `Stopped`
+        // closes design cards another tab may own. Only an event may stop it.
+        let (mut design, mut session) = design_ready(&[]);
+        let applied = seed_design(&mut design, &mut session, canvas_json(false, None));
+        assert!(applied.notice.is_none());
+        assert!(applied.report.is_none());
+
+        // Running without a URL: nothing to navigate to, nothing to report.
+        let (mut design, mut session) = design_ready(&[]);
+        let applied = seed_design(&mut design, &mut session, canvas_json(true, None));
+        assert!(applied.notice.is_none());
+        assert!(applied.report.is_none());
+    }
+
+    #[test]
+    fn design_events_open_refresh_and_stop_the_canvas() {
+        let (mut design, mut session) = design_ready(&["design_canvas"]);
+        assert!(design.emits_events());
+
+        let opened = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(
+                1,
+                "open",
+                canvas_json(true, Some(CANVAS_URL)),
+            )),
+        );
+        assert!(opens(&opened.notice, CANVAS_URL, false));
+        assert!(opened.report.is_none() && opened.sends.is_empty());
+
+        let refreshed = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(
+                2,
+                "refresh",
+                canvas_json(true, Some(CANVAS_URL)),
+            )),
+        );
+        assert!(opens(&refreshed.notice, CANVAS_URL, true));
+
+        let stopped = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(3, "stop", canvas_json(false, None))),
+        );
+        assert!(stops(&stopped.notice));
+
+        // A stop wins over a URL the state still carries.
+        let stale = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(
+                4,
+                "stop",
+                canvas_json(true, Some(CANVAS_URL)),
+            )),
+        );
+        assert!(stops(&stale.notice));
+
+        // An open without a URL navigates nowhere.
+        let bare = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(5, "open", canvas_json(true, None))),
+        );
+        assert!(bare.notice.is_none() && bare.report.is_none());
+    }
+
+    #[test]
+    fn design_events_need_the_exact_advertised_name() {
+        // Not advertised: accepted for sequencing, never shown.
+        let (mut design, mut session) = design_ready(&[]);
+        assert!(!design.emits_events());
+        let applied = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(
+                1,
+                "open",
+                canvas_json(true, Some(CANVAS_URL)),
+            )),
+        );
+        assert!(applied.notice.is_none() && applied.report.is_none());
+
+        // An unknown transition is a failure, not a navigation.
+        let (mut design, mut session) = design_ready(&["design_canvas"]);
+        let applied = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(
+                1,
+                "close",
+                canvas_json(true, Some(CANVAS_URL)),
+            )),
+        );
+        assert!(applied.notice.is_none());
+        assert!(matches!(applied.report, Some(DesignReport::Failure(_))));
+    }
+
+    #[test]
+    fn design_never_navigates_off_loopback() {
+        for (case, url) in [
+            "https://example.com/tok-s3cret/d/landing/",
+            "http://10.0.0.2:4100/tok-s3cret/",
+            "http://localhost:@example.com/tok-s3cret/",
+            "http://127.0.0.1:4100/tok s3cret/",
+            "file:///tmp/tok-s3cret",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (mut design, mut session) = design_ready(&["design_canvas"]);
+            let seeded = seed_design(&mut design, &mut session, canvas_json(true, Some(url)));
+            assert!(seeded.notice.is_none(), "case {case}");
+            assert_eq!(
+                seeded.report,
+                Some(DesignReport::NotLoopback),
+                "case {case}"
+            );
+
+            let event = design.apply(
+                &mut session,
+                &desktop_widget(design_event_lines(
+                    1,
+                    "refresh",
+                    canvas_json(true, Some(url)),
+                )),
+            );
+            assert!(event.notice.is_none(), "case {case}");
+            assert_eq!(event.report, Some(DesignReport::NotLoopback), "case {case}");
+        }
+    }
+
+    #[test]
+    fn design_reports_never_carry_the_canvas_url() {
+        let reports = [
+            DesignReport::Unsupported,
+            DesignReport::UnsupportedMethod,
+            DesignReport::NotReady,
+            DesignReport::Timeout,
+            DesignReport::Failure(pi_rpc::desktop_rpc::DesktopRpcError::MalformedPayload(
+                "url must be a string".into(),
+            )),
+            DesignReport::OutOfOrderSequence,
+            DesignReport::NotLoopback,
+        ];
+        for report in &reports {
+            let message = report.message();
+            assert!(!message.is_empty(), "{report:?}");
+            assert!(!message.contains("tok-s3cret"), "{message}");
+            assert!(!format!("{report:?}").contains("tok-s3cret"));
+        }
+
+        // What a refused or broken record actually reports omits it too.
+        let (mut design, mut session) = design_ready(&["design_canvas"]);
+        let refused = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(
+                1,
+                "open",
+                canvas_json(true, Some("https://example.com/tok-s3cret/")),
+            )),
+        );
+        let malformed = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(2, "open", json!({"url": CANVAS_URL}))),
+        );
+        for applied in [refused, malformed] {
+            let report = applied.report.expect("a report");
+            assert!(!report.message().contains("tok-s3cret"));
+            assert!(!format!("{report:?}").contains("tok-s3cret"));
+        }
+    }
+
+    #[test]
+    fn design_unsupported_and_not_ready_stay_legacy_signals() {
+        // Capabilities without the method: reported once, never asked.
+        let mut design = Design::new();
+        design.set_capabilities(supervision_capabilities(&["capabilities"], &[]));
+        let mut session = DesktopSession::new();
+        let applied = design.seed(&mut session);
+        assert!(applied.sends.is_empty());
+        assert_eq!(applied.report, Some(DesignReport::Unsupported));
+        assert!(design.seed(&mut session).report.is_none());
+        assert!(DesignReport::Unsupported.is_legacy());
+
+        // No capabilities yet: not ready, and the seed is not spent.
+        let mut early = Design::new();
+        let applied = early.seed(&mut session);
+        assert_eq!(applied.report, Some(DesignReport::NotReady));
+        assert!(DesignReport::NotReady.is_legacy());
+
+        // Advertised but refused by the server.
+        let (mut claimed, mut claimed_session) = design_ready(&[]);
+        let seeded = claimed.seed(&mut claimed_session);
+        let id = seeded.sends[0].request.request_id().to_string();
+        let applied = claimed.apply(
+            &mut claimed_session,
+            &desktop_widget(error_lines(&id, "unsupported_method", "nope")),
+        );
+        assert_eq!(applied.report, Some(DesignReport::UnsupportedMethod));
+        assert!(applied.notice.is_none());
+        assert!(DesignReport::UnsupportedMethod.is_legacy());
+        assert!(!DesignReport::Timeout.is_legacy());
+    }
+
+    #[test]
+    fn design_timeout_and_unhandled_outer_roll_back() {
+        let (mut design, mut session) = design_ready(&[]);
+        let seeded = design.seed(&mut session);
+        let generation = seeded.sends[0].generation;
+        let id = seeded.sends[0].request.request_id().to_string();
+
+        // A stale timer drops nothing.
+        let stale = design.expire(&mut session, generation.wrapping_sub(1));
+        assert!(stale.report.is_none());
+        assert!(session.pending().is_some());
+
+        let timed_out = design.expire(&mut session, generation);
+        assert_eq!(timed_out.report, Some(DesignReport::Timeout));
+        assert!(session.pending().is_none());
+
+        // The answer that arrives after the timeout navigates nowhere.
+        let late = design.apply(
+            &mut session,
+            &desktop_widget(design_response_lines(
+                &id,
+                canvas_json(true, Some(CANVAS_URL)),
+            )),
+        );
+        assert!(late.notice.is_none() && late.report.is_none());
+
+        // An unhandled outer prompt rolls back the same way.
+        let (mut design, mut session) = design_ready(&[]);
+        let seeded = design.seed(&mut session);
+        let applied = design.outer(&mut session, seeded.sends[0].generation, false);
+        assert!(matches!(applied.report, Some(DesignReport::Failure(_))));
+        assert!(session.pending().is_none());
+
+        // A design timer never drops another slice's request.
+        let (mut design, mut session) = design_ready(&[]);
+        let seeded = design.seed(&mut session);
+        let generation = seeded.sends[0].generation;
+        session.abandon();
+        let _other = session.issue(DesktopMethod::GetSnapshot).unwrap();
+        assert!(design.expire(&mut session, generation).report.is_none());
+        assert_eq!(
+            session.pending().map(|(_, method)| method),
+            Some(DesktopMethod::GetSnapshot)
+        );
+    }
+
+    #[test]
+    fn design_does_not_reopen_the_url_it_already_shows() {
+        let other = "http://127.0.0.1:4100/tok-s3cret/d/pricing/";
+        let (mut design, mut session) = design_ready(&["design_canvas"]);
+        let seeded = seed_design(
+            &mut design,
+            &mut session,
+            canvas_json(true, Some(CANVAS_URL)),
+        );
+        assert!(opens(&seeded.notice, CANVAS_URL, false));
+
+        // The same URL opened again would only reload the page.
+        let again = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(
+                1,
+                "open",
+                canvas_json(true, Some(CANVAS_URL)),
+            )),
+        );
+        assert!(again.notice.is_none() && again.report.is_none());
+
+        // A refresh is asked for: it still reloads.
+        let refreshed = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(
+                2,
+                "refresh",
+                canvas_json(true, Some(CANVAS_URL)),
+            )),
+        );
+        assert!(opens(&refreshed.notice, CANVAS_URL, true));
+
+        // Another design navigates.
+        let moved = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(
+                3,
+                "open",
+                canvas_json(true, Some(other)),
+            )),
+        );
+        assert!(opens(&moved.notice, other, false));
+
+        // After a stop, the same URL is a new open.
+        let stopped = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(4, "stop", canvas_json(false, None))),
+        );
+        assert!(stops(&stopped.notice));
+        let reopened = design.apply(
+            &mut session,
+            &desktop_widget(design_event_lines(
+                5,
+                "open",
+                canvas_json(true, Some(other)),
+            )),
+        );
+        assert!(opens(&reopened.notice, other, false));
+    }
+
+    #[test]
+    fn design_reseed_keeps_the_page_and_reset_forgets_it() {
+        let mut desktop = probed(4);
+        let mut design = Design::new();
+        let capabilities = supervision_capabilities(&["get_design_canvas"], &["design_canvas"]);
+        design.set_capabilities(capabilities.clone());
+        let seeded = seed_design(
+            &mut design,
+            desktop.session(),
+            canvas_json(true, Some(CANVAS_URL)),
+        );
+        assert!(opens(&seeded.notice, CANVAS_URL, false));
+
+        // A gap re-seeds; the same URL does not reload the page.
+        let gap = design.apply(
+            desktop.session(),
+            &desktop_widget(design_event_lines(
+                6,
+                "open",
+                canvas_json(true, Some(CANVAS_URL)),
+            )),
+        );
+        assert_eq!(gap.report, Some(DesignReport::OutOfOrderSequence));
+        let sends = desktop.resync();
+        let snapshot_id = sends[0].request.request_id().to_string();
+        desktop.ui(&desktop_widget(snapshot_lines(&snapshot_id, 6)));
+        let reseeded = seed_design(
+            &mut design,
+            desktop.session(),
+            canvas_json(true, Some(CANVAS_URL)),
+        );
+        assert!(reseeded.notice.is_none() && reseeded.report.is_none());
+
+        // A new backend forgets what was shown: the same URL opens again.
+        design.reset(desktop.session());
+        design.set_capabilities(capabilities);
+        let fresh = seed_design(
+            &mut design,
+            desktop.session(),
+            canvas_json(true, Some(CANVAS_URL)),
+        );
+        assert!(opens(&fresh.notice, CANVAS_URL, false));
+    }
+
+    #[test]
+    fn design_reset_reseeds_and_a_late_response_is_benign() {
+        let (mut design, mut session) = design_ready(&["design_canvas"]);
+        let seeded = design.seed(&mut session);
+        let id = seeded.sends[0].request.request_id().to_string();
+
+        design.reset(&mut session);
+        assert!(!design.emits_events());
+        let late = design.apply(
+            &mut session,
+            &desktop_widget(design_response_lines(
+                &id,
+                canvas_json(true, Some(CANVAS_URL)),
+            )),
+        );
+        assert!(late.notice.is_none() && late.report.is_none());
+
+        // The new backend's probe re-arms one seed.
+        design.set_capabilities(supervision_capabilities(
+            &["get_design_canvas"],
+            &["design_canvas"],
+        ));
+        assert_eq!(design.seed(&mut session).sends.len(), 1);
+    }
+
+    #[test]
+    fn design_gap_reports_out_of_order_and_reseeds_after_resync() {
+        let mut desktop = probed(4);
+        let mut design = Design::new();
+        design.set_capabilities(supervision_capabilities(
+            &["get_design_canvas"],
+            &["design_canvas"],
+        ));
+        let seeded = design.seed(desktop.session());
+        let id = seeded.sends[0].request.request_id().to_string();
+        design.apply(
+            desktop.session(),
+            &desktop_widget(design_response_lines(&id, canvas_json(false, None))),
+        );
+
+        // A skipped sequence surfaces the gap instead of navigating.
+        let applied = design.apply(
+            desktop.session(),
+            &desktop_widget(design_event_lines(
+                6,
+                "open",
+                canvas_json(true, Some(CANVAS_URL)),
+            )),
+        );
+        assert!(applied.notice.is_none() && applied.sends.is_empty());
+        assert_eq!(applied.report, Some(DesignReport::OutOfOrderSequence));
+
+        // The channel owns the get_snapshot; the lost transition is re-read
+        // once that lands.
+        let sends = desktop.resync();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].request.method(), DesktopMethod::GetSnapshot);
+        assert!(design.seed(desktop.session()).sends.is_empty());
+        let snapshot_id = sends[0].request.request_id().to_string();
+        desktop.ui(&desktop_widget(snapshot_lines(&snapshot_id, 6)));
+        let reseeded = design.seed(desktop.session());
+        assert_eq!(reseeded.sends.len(), 1);
+        assert_eq!(
+            reseeded.sends[0].request.method(),
+            DesktopMethod::GetDesignCanvas
+        );
+    }
+
+    /// A Ready channel whose peer offers the design canvas, with its seed
+    /// answered (not running), at sequence `sequence`.
+    fn design_probed(sequence: u64) -> Desktop {
+        let mut desktop = Desktop::new();
+        let probe = desktop.ready(true);
+        let _ = desktop.outer(probe.sends[0].generation, true);
+        let applied = desktop.ui(&desktop_widget(record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": probe.sends[0].request.request_id(),
+            "ok": true,
+            "data": {
+                "schema": SCHEMA,
+                "command": PROMPT_COMMAND,
+                "widget": WIDGET_KEY,
+                "methods": ["capabilities", "get_snapshot", "get_design_canvas"],
+                "events": ["state_changed", "design_canvas"],
+            },
+        }))));
+        let snapshot_id = applied.sends[0].request.request_id().to_string();
+        let _ = desktop.ui(&desktop_widget(snapshot_lines(&snapshot_id, sequence)));
+        answer_design_seed(&mut desktop);
+        assert!(desktop.design_seed().sends.is_empty());
+        desktop
+    }
+
+    /// Issue the design seed through the wrapper and answer it.
+    fn answer_design_seed(desktop: &mut Desktop) {
+        let seeded = desktop.design_seed();
+        assert_eq!(seeded.sends.len(), 1);
+        assert_eq!(
+            seeded.sends[0].request.method(),
+            DesktopMethod::GetDesignCanvas
+        );
+        let id = seeded.sends[0].request.request_id().to_string();
+        let _ = desktop.design_apply(&desktop_widget(design_response_lines(
+            &id,
+            canvas_json(false, None),
+        )));
+    }
+
+    /// Answer the channel's pending resync snapshot at `sequence`.
+    fn land_resync(desktop: &mut Desktop, sends: &[desktop::Send], sequence: u64) {
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].request.method(), DesktopMethod::GetSnapshot);
+        let id = sends[0].request.request_id().to_string();
+        let _ = desktop.ui(&desktop_widget(snapshot_lines(&id, sequence)));
+    }
+
+    #[test]
+    fn design_reseeds_once_after_a_gap_seen_by_another_record() {
+        // The gap shows on a channel event: the channel resyncs, and the
+        // design canvas re-seeds once behind the snapshot, not before.
+        let mut desktop = design_probed(4);
+        let gap = desktop.ui(&desktop_widget(event_lines(6)));
+        assert!(desktop.design_seed().sends.is_empty());
+        land_resync(&mut desktop, &gap.sends, 6);
+        answer_design_seed(&mut desktop);
+        assert!(desktop.design_seed().sends.is_empty());
+
+        // A gap another slice saw (supervision, subscription, permission)
+        // reaches the channel as `resync()`: the same single re-seed.
+        let mut desktop = design_probed(4);
+        let sends = desktop.resync();
+        assert!(desktop.design_seed().sends.is_empty());
+        land_resync(&mut desktop, &sends, 6);
+        answer_design_seed(&mut desktop);
+        assert!(desktop.design_seed().sends.is_empty());
+
+        // A gap while the design seed is in flight defers the resync; the
+        // design answer does not re-seed ahead of the snapshot.
+        let mut desktop = design_probed(4);
+        let sends = desktop.resync();
+        land_resync(&mut desktop, &sends, 4);
+        let seeded = desktop.design_seed();
+        assert_eq!(seeded.sends.len(), 1);
+        assert!(desktop.resync().is_empty());
+        let id = seeded.sends[0].request.request_id().to_string();
+        let _ = desktop.design_apply(&desktop_widget(design_response_lines(
+            &id,
+            canvas_json(false, None),
+        )));
+        assert!(desktop.design_seed().sends.is_empty());
+        let deferred = desktop.flush_resync();
+        land_resync(&mut desktop, &deferred, 4);
+        answer_design_seed(&mut desktop);
+        assert!(desktop.design_seed().sends.is_empty());
+    }
+
+    #[test]
+    fn desktop_seeds_design_only_after_the_probe() {
+        let mut desktop = Desktop::new();
+        assert!(desktop.design_seed().sends.is_empty());
+        let probe = desktop.ready(true);
+        let _ = desktop.outer(probe.sends[0].generation, true);
+        let applied = desktop.ui(&desktop_widget(record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": "desktop-1",
+            "ok": true,
+            "data": {
+                "schema": SCHEMA,
+                "command": PROMPT_COMMAND,
+                "widget": WIDGET_KEY,
+                "methods": ["capabilities", "get_snapshot", "get_design_canvas"],
+                "events": ["design_canvas"],
+            },
+        }))));
+        // Capabilities known, snapshot pending: neither seeded nor ready.
+        assert!(desktop.design_seed().sends.is_empty());
+        assert!(!desktop.design_events_ready());
+
+        let snapshot_id = applied.sends[0].request.request_id().to_string();
+        let _ = desktop.ui(&desktop_widget(snapshot_lines(&snapshot_id, 1)));
+        assert!(desktop.design_events_ready());
+        let seeded = desktop.design_seed();
+        assert_eq!(seeded.sends.len(), 1);
+        assert_eq!(
+            seeded.sends[0].request.method(),
+            DesktopMethod::GetDesignCanvas
+        );
+
+        // A backend reset forgets that design events were the source.
+        desktop.reset();
+        assert!(!desktop.design_events_ready());
+
+        // A peer that does not advertise the event keeps the legacy path.
+        let legacy = probed(1);
+        assert!(!legacy.design_events_ready());
     }
 }

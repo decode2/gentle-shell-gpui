@@ -19,7 +19,7 @@ How Gentle Shell GPUI connects to Gentle Shell (the `gentle-shell --mode rpc` ba
 | App update | `features/app_update/` | HTTPS (GitHub releases) |
 | First-run installers | `features/setup/`, `features/onboarding/` | Processes, HTTPS |
 | Git | `features/git/` | `git` process |
-| Gentle Design canvas | `features/browser/` | System web view |
+| Gentle Design canvas | `features/browser/`, `state::desktop::design` | Gentle Desktop RPC (`get_design_canvas`, `design_canvas`) when the backend advertises it; legacy `notify` text and `gentle_design` result; system web view |
 | Web apps (`gentle-open`, `/web`, dev-server URLs) | `features/browser/`, `gentle_core::web` | Single-instance request, system web view |
 | Devices (Android emulators, iOS simulators) | `features/devices/`, `features/settings/devices.rs`, `features/setup/devices.rs`, `gentle_core::devices` | Expo's device hub (Node child, loopback HTTP and its web viewer), `agent-device`, `gentle-device` |
 
@@ -175,6 +175,17 @@ When the backend's `capabilities` advertise `get_subscription_usage`, the Usage 
 - The legacy `auth.json` + provider API path runs only when the capabilities are known not to offer `get_subscription_usage`, or the server answers `unsupported_method` for a method it advertised. Any other RPC failure (timeout, transport, malformed, event gap) is shown honestly and never falls back to direct API calls. Without an agent tab, the screen keeps the legacy path.
 - Per-turn limit notices (`notify`, "`N% used (window)`") stay a separate legacy chip path and never overwrite the structured provider windows.
 
+### Design canvas (`state::desktop::design`)
+
+When the backend's `capabilities` advertise `get_design_canvas`, the tab reads the canvas state once after the probe and follows the `design_canvas` events. Both become the same `SessionEvent::DesignCanvas(CanvasNotice)` the legacy paths produce, so the browser card and the stage list are unchanged. There is no open or stop method: the agent owns the canvas, the app only shows it.
+
+- `get_design_canvas` is sent as `{ includeUrl: true }`: the interactive host is the client the server trusts with the tokenized URL. It answers `running`, `slug`, `connectedClients`, `designs` and, when asked, `url`. The seed goes out once per backend, after the channel is Ready and no other request is in flight; a backend reset or any event gap re-arms it. Every gap reaches the channel's `resync()`, whichever record showed it (channel, permission, supervision, subscription or design), so the canvas re-seeds exactly once behind the resync snapshot; while a deferred resync is owed, the seed waits for it, and settling the design request flushes that resync.
+- `design_canvas`: `{ transition: "open" | "refresh" | "stop", ...state }`, applied only when the capabilities `emits` the exact name.
+- Mapping: only an event closes the canvas: a `stop` event, or an event with `running: false`, → `Stopped`. The seed (and any re-seed after a gap or reset) never emits `Stopped`, because `Stopped` closes design cards another tab may own; a seed with `running: false` emits nothing. A running canvas with a loopback URL → `Open { url, refreshed }` (`refreshed` only for `refresh`; the seed is never a refresh). The slice remembers the URL it last opened (never printed; cleared by a stop or a backend reset): a seed or `open` with that same URL emits nothing, so a re-seed does not reload the page, while `refresh` always reloads. A running canvas without a URL navigates nowhere. The loopback check is the browser's canvas rule, read back exactly, plus `gentle_core::web::loopback_url` (which refuses a userinfo host such as `localhost:@host`). Any other URL is refused with a warning and nothing opens.
+- The tokenized URL only travels inside the notice to the browser. Report messages, transcript notices and toasts from this slice never carry it, and its `Applied` type has no `Debug`.
+- One request in flight, with the same timeout/rollback and generation discipline as the other slices; a late answer after a timeout or reset navigates nowhere. A peer without the method (or an `unsupported_method` answer) is silent and keeps the legacy path.
+- Legacy paths stay for older Shells: the `notify` "Design canvas…" text and the `gentle_design` tool result. While the channel is Ready and the peer emits `design_canvas`, both are dropped so the canvas does not navigate twice: the `notify` text neither moves the canvas nor falls through to the loopback web opener, and the tool result emits no canvas notice. Otherwise both keep working as before.
+
 ### Commands the app sends
 
 | `type` | Fields | Where | Use |
@@ -213,7 +224,7 @@ Window screens that need another command use `SessionView::send_command(Value)`,
 | `thinking_level_changed` | Effort level |
 | `bash_execution_update` | Live output of the active `!cmd` |
 | `tool_execution_start` | ODD phase (`gentle_state::infer_phase`); job label for `bash_background` / `monitor`; device launches and device commands of `bash` / `bash_background` → `SessionEvent::Device` / `DeviceCommand` |
-| `tool_execution_end` | Task list (`todo`), jobs (`details.gentleJobs`), `gentle_design` canvas → `SessionEvent::DesignCanvas` |
+| `tool_execution_end` | Task list (`todo`), jobs (`details.gentleJobs`), `gentle_design` canvas → `SessionEvent::DesignCanvas` (unless `design_canvas` events are the source, see Design canvas) |
 | `message_end` with `role: "custom"` | Updates jobs from `gentle-jobs.notice` |
 | Settled turn (`effects.settled`) | Refreshes stats and Git; `TurnEnded` alert unless `aborted` |
 
@@ -273,7 +284,7 @@ Only `http://` and `https://` are accepted by `--open-url` and `/web`. The gener
 | Method | Mapping in the app (`session/events.rs` `handle_ui`) |
 | --- | --- |
 | `select`, `confirm`, `input`, `editor` | `extension.dialogs` queue; the first one is drawn (`session/view/dialogs.rs`) and answered with `answer_dialog` → `respond_ui`. Triggers the `NeedsYou` alert. If it has a `timeout`, it is removed from the queue when it expires (the agent already resolved it). Esc answers `Cancelled`. |
-| `notify` | `notifyType` → `NoticeLevel` (`error`, `warning`, everything else `Info`). "Design canvas…" text → `browser::canvas_notice` → canvas. Usage limit notices (`parse_rate_limit`, "`N% used (window)`") → chip in `extension.rate_limits`. Everything else: capture for the running `/` command (`builtins::Capture`), toast only for warning/error (no repeats, `first_toast`) and `SessionEvent::Notice` to the notification center (`features/notices/`). |
+| `notify` | `notifyType` → `NoticeLevel` (`error`, `warning`, everything else `Info`). "Design canvas…" text → `browser::canvas_notice` → canvas, unless `design_canvas` events are the source (see Design canvas). Usage limit notices (`parse_rate_limit`, "`N% used (window)`") → chip in `extension.rate_limits`. Everything else: capture for the running `/` command (`builtins::Capture`), toast only for warning/error (no repeats, `first_toast`) and `SessionEvent::Notice` to the notification center (`features/notices/`). |
 | `setStatus` | `extension.statuses[key] = text`; empty or missing text removes the key. |
 | `setWidget` | `gentle-agents` → `gentle_core::activity::parse` + `retain_finished` (the legacy helper source, used only until `list_subagents` seeds; see “Agents and jobs”). Any other key → `extension.widgets` (one chip per widget with its lines). `widgetPlacement` is ignored. |
 | `setTitle` | Tab title. |
@@ -396,7 +407,7 @@ These are gentle-stream internals, not a public CLI (its CLI only has `ctl play|
 
 ### Browser for Gentle Design (`features/browser/`)
 
-The canvas is detected from the `gentle_design` result (`details.url`, `refreshed`, `stopped`) or from a `notify` "Design canvas: <url>" / "Design canvas refreshed: <url>" / "Design canvas stopped."; only loopback URLs are accepted (`http://127.0.0.1:` or `http://localhost:`). The window shows it in `BrowserPanel`. Implementation per OS: `macos.rs` (WKWebView as a subview), `windows.rs` (WebView2 in its own popup that follows the window), `linux.rs` (WebKitGTK as a child of the X11 window; on Wayland the canvas stays in the browser that Gentle Shell opened).
+The canvas is detected from the Gentle Desktop `design_canvas` events and seed (see Design canvas under RPC protocol), from the `gentle_design` result (`details.url`, `refreshed`, `stopped`) or from a `notify` "Design canvas: <url>" / "Design canvas refreshed: <url>" / "Design canvas stopped."; only loopback URLs are accepted (`http://127.0.0.1:` or `http://localhost:`). The window shows it in `BrowserPanel`. Implementation per OS: `macos.rs` (WKWebView as a subview), `windows.rs` (WebView2 in its own popup that follows the window), `linux.rs` (WebKitGTK as a child of the X11 window; on Wayland the canvas stays in the browser that Gentle Shell opened).
 
 ## Limits of an RPC host
 

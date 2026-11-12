@@ -12,12 +12,13 @@ use pi_rpc::PiProcess;
 use pi_rpc::desktop_rpc::DesktopMethod;
 use serde_json::{Value, json};
 
+use super::state::desktop::design::Applied as DesignApplied;
 use super::state::desktop::permission::Applied as PermissionApplied;
 use super::state::desktop::subscription::Applied as SubscriptionApplied;
 use super::state::desktop::supervision::Applied as SupervisionApplied;
 use super::state::desktop::{self, Applied as DesktopApplied, Send as DesktopSend};
 use super::state::{BackendStatus, ModelInfo};
-use super::{SessionView, attachments, builtins};
+use super::{SessionEvent, SessionView, attachments, builtins};
 use gentle_core::transcript::NoticeLevel;
 
 /// How long a Desktop request may stay unanswered before the tab drops it.
@@ -142,6 +143,28 @@ impl SessionView {
         self.send_desktop(applied.sends, cx);
     }
 
+    /// Act on a design decision: say what failed (old Shells without the
+    /// method stay silent, their legacy canvas path still works), send what
+    /// the slice asked for, and hand the canvas notice to the browser flow.
+    /// The report never carries the canvas URL; only the notice does.
+    pub(super) fn apply_design(&mut self, applied: DesignApplied, cx: &mut Context<Self>) {
+        if let Some(report) = &applied.report
+            && !report.is_legacy()
+        {
+            self.transcript
+                .notice(NoticeLevel::Warning, report.message());
+            cx.notify();
+        }
+        self.send_desktop(applied.sends, cx);
+        // A gap seen while the design request was in flight is due now that it
+        // settled or rolled back: one snapshot, and the canvas re-seeds behind.
+        let resync = self.desktop.flush_resync();
+        self.send_desktop(resync, cx);
+        if let Some(canvas) = applied.notice {
+            cx.emit(SessionEvent::DesignCanvas(canvas));
+        }
+    }
+
     /// The Usage screen's snapshot of this session's subscription usage. Pure
     /// read: the screen decides how to render, never this session.
     pub(crate) fn subscription_snapshot(&self) -> super::state::desktop::subscription::Snapshot {
@@ -168,8 +191,9 @@ impl SessionView {
     /// the channel to Idle, so the `refresh_state` that follows re-probes
     /// capabilities and the supervision lists re-seed exactly once behind it.
     /// The permission slice keeps its confirmed mode; its capabilities are
-    /// refreshed by the same re-probe. The subscription slice is reset with
-    /// the channel.
+    /// refreshed by the same re-probe. The subscription and design slices are
+    /// reset with the channel; the design canvas re-seeds once behind the new
+    /// probe.
     fn reset_desktop_channel(&mut self) {
         self.desktop.reset();
     }
@@ -283,6 +307,10 @@ impl SessionView {
                 let applied = self.desktop.subscription_expire(generation);
                 self.apply_subscription(applied, cx);
             }
+            DesktopMethod::GetDesignCanvas => {
+                let applied = self.desktop.design_expire(generation);
+                self.apply_design(applied, cx);
+            }
         }
     }
 
@@ -316,6 +344,10 @@ impl SessionView {
             DesktopMethod::GetSubscriptionUsage | DesktopMethod::RefreshSubscriptionUsage => {
                 let applied = self.desktop.subscription_outer(generation, handled);
                 self.apply_subscription(applied, cx);
+            }
+            DesktopMethod::GetDesignCanvas => {
+                let applied = self.desktop.design_outer(generation, handled);
+                self.apply_design(applied, cx);
             }
         }
     }

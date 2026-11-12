@@ -125,7 +125,8 @@ impl SessionView {
                 }
                 self.activity.tool_ended(event);
                 if event["toolName"] == "gentle_design"
-                    && let Some(canvas) = design_canvas(details)
+                    && let Some(canvas) =
+                        tool_design_canvas(details, self.desktop.design_events_ready())
                 {
                     cx.emit(SessionEvent::DesignCanvas(canvas));
                 }
@@ -207,13 +208,12 @@ impl SessionView {
                 notify_type,
             } => {
                 let level = notice_level(notify_type.as_deref());
-                match crate::features::browser::canvas_notice(&message) {
-                    Some(canvas) => cx.emit(SessionEvent::DesignCanvas(canvas)),
-                    None => {
-                        if let Some(url) = web::loopback_url(&message) {
-                            cx.emit(SessionEvent::AgentWeb(url));
-                        }
+                match notify_target(&message, self.desktop.design_events_ready()) {
+                    Some(NotifyTarget::Canvas(canvas)) => {
+                        cx.emit(SessionEvent::DesignCanvas(canvas))
                     }
+                    Some(NotifyTarget::Web(url)) => cx.emit(SessionEvent::AgentWeb(url)),
+                    None => {}
                 }
                 let error = level == NoticeLevel::Error;
                 // Usage warnings repeat every turn: keep them as a composer chip.
@@ -320,6 +320,7 @@ impl SessionView {
                 }
                 if !legacy_fallback {
                     self.sync_supervision(cx);
+                    self.sync_design(cx);
                 }
             }
             DesktopRoute::Supervision => {
@@ -343,6 +344,7 @@ impl SessionView {
                     _ => self.apply_supervision(applied, cx),
                 }
                 self.sync_supervision(cx);
+                self.sync_design(cx);
             }
             DesktopRoute::Subscription => {
                 let applied = self.desktop.subscription_apply(request);
@@ -356,14 +358,37 @@ impl SessionView {
                     }
                     _ => self.apply_subscription(applied, cx),
                 }
+                self.sync_design(cx);
+            }
+            DesktopRoute::Design => {
+                let applied = self.desktop.design_apply(request);
+                match applied.report.as_ref() {
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync, and the canvas re-seeds once it lands.
+                    Some(desktop::design::Report::OutOfOrderSequence) => {
+                        let sends = self.desktop.resync();
+                        self.send_desktop(sends, cx);
+                    }
+                    _ => self.apply_design(applied, cx),
+                }
+                self.sync_supervision(cx);
+                self.sync_design(cx);
             }
             DesktopRoute::Channel => {
                 let applied = self.desktop.ui(request);
                 self.apply_desktop(applied, cx);
                 self.sync_permission_capabilities(cx);
                 self.sync_supervision(cx);
+                self.sync_design(cx);
             }
         }
+    }
+
+    /// Seed the design canvas once the probe and any in-flight request
+    /// settle; it chains behind the other seeds the same way supervision does.
+    fn sync_design(&mut self, cx: &mut Context<Self>) {
+        let applied = self.desktop.design_seed();
+        self.apply_design(applied, cx);
     }
 
     /// Seed the subagent and job lists once the probe and any in-flight
@@ -516,14 +541,36 @@ impl SessionView {
 /// Which slice owns one incoming Desktop record. A record is routed to the
 /// permission slice only when it is a permission response or the advertised
 /// permission event; supervision owns its responses and events; subscription
-/// owns its responses and `rate_limit`; everything else belongs to the channel
+/// owns its responses and `rate_limit`; design owns `get_design_canvas` and
+/// `design_canvas`; everything else belongs to the channel
 /// (probe, resync, and every benign foreign/late record). The shared session
 /// then accepts the record exactly once, in the slice that owns it.
 enum DesktopRoute {
     Permission,
     Supervision,
     Subscription,
+    Design,
     Channel,
+}
+
+/// Where a `notify` message's URL goes.
+#[derive(Debug, PartialEq, Eq)]
+enum NotifyTarget {
+    Canvas(CanvasNotice),
+    Web(String),
+}
+
+/// The legacy "Design canvas…" text drives the canvas only while the
+/// structured `design_canvas` events are not its source; once they are, the
+/// text would navigate a second time, so it is dropped (and never falls
+/// through to the generic loopback opener). Any other loopback URL still
+/// opens as a web app.
+fn notify_target(message: &str, design_events_ready: bool) -> Option<NotifyTarget> {
+    match crate::features::browser::canvas_notice(message) {
+        Some(_) if design_events_ready => None,
+        Some(canvas) => Some(NotifyTarget::Canvas(canvas)),
+        None => web::loopback_url(message).map(NotifyTarget::Web),
+    }
 }
 
 fn route_desktop_widget(
@@ -551,6 +598,8 @@ fn route_desktop_widget(
                     | Some(DesktopMethod::RefreshSubscriptionUsage)
             ) {
                 DesktopRoute::Subscription
+            } else if pending == Some(DesktopMethod::GetDesignCanvas) {
+                DesktopRoute::Design
             } else {
                 DesktopRoute::Channel
             }
@@ -570,6 +619,9 @@ fn route_desktop_widget(
             if event.event == desktop::subscription::RATE_LIMIT =>
         {
             DesktopRoute::Subscription
+        }
+        Ok(Some(DesktopRecord::Event(event))) if event.event == desktop::design::DESIGN_CANVAS => {
+            DesktopRoute::Design
         }
         _ => DesktopRoute::Channel,
     }
@@ -655,6 +707,16 @@ fn design_canvas(details: &Value) -> Option<CanvasNotice> {
     }
 }
 
+/// A `gentle_design` result drives the canvas only while the structured
+/// `design_canvas` events are not its source; once they are, it would
+/// navigate a second time.
+fn tool_design_canvas(details: &Value, design_events_ready: bool) -> Option<CanvasNotice> {
+    if design_events_ready {
+        return None;
+    }
+    design_canvas(details)
+}
+
 /// An extension `notify` type as a notice level; unknown types are info.
 fn notice_level(notify_type: Option<&str>) -> NoticeLevel {
     match notify_type {
@@ -680,8 +742,9 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::{
-        DesktopRoute, GIT_REFRESH_INTERVAL, design_canvas, git_refresh_wait, notice_level,
-        queued_count, route_desktop_widget, tool_output,
+        DesktopRoute, GIT_REFRESH_INTERVAL, NotifyTarget, design_canvas, git_refresh_wait,
+        notice_level, notify_target, queued_count, route_desktop_widget, tool_design_canvas,
+        tool_output,
     };
     use crate::features::browser::CanvasNotice;
     use crate::features::session::state::TurnActivity;
@@ -740,6 +803,60 @@ mod tests {
             Some(CanvasNotice::Stopped)
         );
         assert_eq!(design_canvas(&json!({})), None);
+    }
+
+    #[test]
+    fn design_results_yield_to_design_events() {
+        let opened = json!({"url": "http://127.0.0.1:4100/tok/d/landing/"});
+        let stopped = json!({"stopped": true});
+
+        // An old Shell, or a channel not ready yet: the result drives the
+        // canvas. Predicates, so a failure never prints the canvas URL.
+        assert!(matches!(
+            tool_design_canvas(&opened, false),
+            Some(CanvasNotice::Open { url, refreshed: false })
+                if url == "http://127.0.0.1:4100/tok/d/landing/"
+        ));
+        assert!(matches!(
+            tool_design_canvas(&stopped, false),
+            Some(CanvasNotice::Stopped)
+        ));
+
+        // Design events are the source: the result would navigate twice.
+        assert!(tool_design_canvas(&opened, true).is_none());
+        assert!(tool_design_canvas(&stopped, true).is_none());
+    }
+
+    #[test]
+    fn legacy_canvas_notices_yield_to_design_events() {
+        let url = "http://127.0.0.1:4100/tok/d/landing/";
+        let opened = format!("Design canvas: {url}");
+
+        // An old Shell, or a channel not ready yet: the legacy text navigates.
+        // Predicates, so a failure never prints the canvas URL.
+        assert!(matches!(
+            notify_target(&opened, false),
+            Some(NotifyTarget::Canvas(CanvasNotice::Open { url: shown, refreshed: false }))
+                if shown == url
+        ));
+        assert!(matches!(
+            notify_target("Design canvas stopped.", false),
+            Some(NotifyTarget::Canvas(CanvasNotice::Stopped))
+        ));
+
+        // Design events are the source: the text neither navigates the canvas
+        // nor falls through to the generic loopback opener.
+        assert!(notify_target(&opened, true).is_none());
+        assert!(notify_target("Design canvas stopped.", true).is_none());
+
+        // Other loopback URLs keep opening as web apps either way.
+        for ready in [false, true] {
+            assert_eq!(
+                notify_target("Dev server on http://localhost:5173/", ready),
+                Some(NotifyTarget::Web("http://localhost:5173/".into()))
+            );
+            assert_eq!(notify_target("All done", ready), None);
+        }
     }
 
     #[test]
@@ -890,6 +1007,33 @@ mod tests {
         assert!(matches!(
             route_desktop_widget(&decoded, None),
             DesktopRoute::Subscription
+        ));
+
+        // The design canvas response and its advertised event go to the
+        // design slice.
+        let canvas_response = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": "desktop-1",
+            "ok": true,
+            "data": {"running": false, "slug": null, "connectedClients": 0, "designs": []},
+        }))));
+        let decoded = decode_widget(&canvas_response);
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::GetDesignCanvas)),
+            DesktopRoute::Design
+        ));
+        let canvas_event = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "event",
+            "seq": 1,
+            "event": "design_canvas",
+            "data": {"transition": "stop", "running": false, "slug": null, "connectedClients": 0, "designs": []},
+        }))));
+        let decoded = decode_widget(&canvas_event);
+        assert!(matches!(
+            route_desktop_widget(&decoded, None),
+            DesktopRoute::Design
         ));
 
         // A cleared widget and a broken record are not this protocol's answer:
