@@ -25,8 +25,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow, ensure};
 use pi_rpc::desktop_rpc::{
-    Capabilities, DesktopMethod, DesktopRecord, DesktopRequest, DesktopResponse, DesktopSession,
-    PROMPT_COMMAND, PermissionMode, SCHEMA, Snapshot, UsageRefresh, WIDGET_KEY,
+    Capabilities, ConfigStatus, ConfigStore, ConfigWrite, ConfigWriteTarget, DesktopMethod,
+    DesktopRecord, DesktopRequest, DesktopResponse, DesktopSession, PROMPT_COMMAND, PermissionMode,
+    ProfilesData, SCHEMA, Snapshot, UsageRefresh, WIDGET_KEY,
 };
 use pi_rpc::{Incoming, LaunchSpec, PiProcess, UiMethod, UiRequest};
 use serde_json::{Value, json};
@@ -375,6 +376,26 @@ impl Probe {
         self.typed_roundtrip(request)
     }
 
+    fn typed_get_config(&mut self, store: ConfigStore) -> Result<DesktopResponse> {
+        let request = self
+            .session
+            .issue_get_config(store)
+            .map_err(|e| anyhow!("issue get_config: {e}"))?;
+        self.typed_roundtrip(request)
+    }
+
+    fn typed_set_config(
+        &mut self,
+        write: ConfigWrite,
+        expected_revision: &str,
+    ) -> Result<DesktopResponse> {
+        let request = self
+            .session
+            .issue_set_config(write, expected_revision)
+            .map_err(|e| anyhow!("issue set_config: {e}"))?;
+        self.typed_roundtrip(request)
+    }
+
     /// Issue `refresh_subscription_usage` for one provider and wait for its
     /// correlated response, failing if a `rate_limit` event appears either
     /// before or shortly after the answer. The child environment is fully
@@ -496,30 +517,6 @@ impl Probe {
         }
     }
 
-    /// Wait for a Desktop event by name (used after a raw request whose event
-    /// follows its response).
-    fn raw_wait_event(&mut self, event_name: &str) -> Result<Value> {
-        let deadline = Instant::now() + STEP_TIMEOUT;
-        loop {
-            match self.next_live_record(deadline)? {
-                LiveRecord::Ui(ui) => {
-                    let Some(line) = desktop_widget_line(&ui) else {
-                        continue;
-                    };
-                    let value: Value = serde_json::from_str(line)
-                        .map_err(|e| anyhow!("malformed Desktop widget JSON: {e}"))?;
-                    if value.get("kind").and_then(Value::as_str) != Some("event") {
-                        continue;
-                    }
-                    if value.get("event").and_then(Value::as_str) == Some(event_name) {
-                        return Ok(value);
-                    }
-                }
-                LiveRecord::Event => continue,
-            }
-        }
-    }
-
     /// A plain RPC command (`get_commands`, `get_messages`): the future
     /// resolves to its `data`.
     fn rpc_command(&mut self, command: Value) -> Result<Value> {
@@ -632,82 +629,90 @@ impl Probe {
         );
 
         // 7. Profiles read: capture the write revision from the missing store.
-        let read = self.raw_roundtrip("get_config", json!({"store": "profiles"}))?;
-        let read = read.ensure_ok()?.clone();
+        let read = self
+            .typed_get_config(ConfigStore::Profiles)?
+            .config()
+            .map_err(|e| anyhow!("get_config decode: {e}"))?;
         ensure!(
-            read["store"].as_str() == Some("profiles"),
-            "unexpected read: {read}"
+            read.store == ConfigStore::Profiles,
+            "unexpected read: {read:?}"
         );
+        ensure!(!read.read_only, "profiles must be writable: {read:?}");
         ensure!(
-            read["readOnly"].as_bool() == Some(false),
-            "profiles must be writable: {read}"
+            read.status == ConfigStatus::Missing,
+            "fresh profiles store: {read:?}"
         );
-        ensure!(
-            read["status"].as_str() == Some("missing"),
-            "fresh profiles store: {read}"
-        );
-        let write_targets = read["writeTargets"]
-            .as_array()
-            .ok_or_else(|| anyhow!("profiles read has no writeTargets: {read}"))?;
+        let write_targets = read
+            .write_targets
+            .as_deref()
+            .ok_or_else(|| anyhow!("profiles read has no writeTargets: {read:?}"))?;
         ensure!(
             write_targets.len() == 1,
-            "one profiles write target: {read}"
+            "one profiles write target: {read:?}"
         );
-        let expected_revision = write_targets[0]["writeRevision"]
-            .as_str()
-            .ok_or_else(|| anyhow!("profiles write target has no writeRevision: {read}"))?
-            .to_string();
-        ensure!(!expected_revision.is_empty(), "empty writeRevision: {read}");
+        let expected_revision = write_targets[0].write_revision.clone();
+        ensure!(
+            !expected_revision.is_empty(),
+            "empty writeRevision: {read:?}"
+        );
 
         // 7b. Profiles write: the canonical empty file, guarded by the revision.
-        let profiles_data = json!({
+        let profiles_data = ProfilesData::new(json!({
             "kind": "gentle-pi.agent_model_profiles",
             "version": 1,
             "profiles": {},
-        });
-        let write = self.raw_roundtrip(
-            "set_config",
-            json!({
-                "store": "profiles",
-                "data": profiles_data,
-                "expectedRevision": expected_revision,
-            }),
-        )?;
-        let write = write.ensure_ok()?.clone();
+        }))
+        .map_err(|e| anyhow!("profiles data: {e}"))?;
+        let write = self
+            .typed_set_config(ConfigWrite::Profiles(profiles_data), &expected_revision)?
+            .set_config()
+            .map_err(|e| anyhow!("set_config decode: {e}"))?;
+        ensure!(write.changed, "write must change: {write:?}");
         ensure!(
-            write["changed"].as_bool() == Some(true),
-            "write must change: {write}"
+            write.write_target == ConfigWriteTarget::Global,
+            "profiles writes to the global target: {write:?}"
         );
-        ensure!(
-            write["writeTarget"].as_str() == Some("global"),
-            "profiles writes to the global target: {write}"
-        );
-        let new_write_revision = write["writeRevision"]
-            .as_str()
-            .ok_or_else(|| anyhow!("set_config has no writeRevision: {write}"))?
-            .to_string();
+        let new_write_revision = write.write_revision.clone();
         ensure!(
             !new_write_revision.is_empty() && new_write_revision != expected_revision,
             "writeRevision must advance after a write: {expected_revision} -> {new_write_revision}"
         );
 
-        // The config_changed event follows, carrying the same write revision.
-        let config_event = self.raw_wait_event("config_changed")?;
+        // The config_changed event follows the response (an event published
+        // before it was discarded by the roundtrip, so this wait would time
+        // out), carrying the same write revision.
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        let config_event = loop {
+            match self.next_desktop_record_until(deadline)? {
+                DesktopRecord::Event(event) if event.event == "config_changed" => break event,
+                DesktopRecord::Event(_) => continue,
+                DesktopRecord::Response(response) => {
+                    anyhow::bail!("expected config_changed, got a response: {response:?}")
+                }
+            }
+        };
+        let changed = config_event
+            .config_changed()
+            .map_err(|e| anyhow!("config_changed decode: {e}"))?;
         ensure!(
-            config_event["data"]["store"].as_str() == Some("profiles"),
-            "config event store: {config_event}"
+            changed.store == ConfigStore::Profiles,
+            "config event store: {changed:?}"
         );
         ensure!(
-            config_event["data"]["writeTarget"].as_str() == Some("global"),
-            "config event target: {config_event}"
+            changed.write_target == ConfigWriteTarget::Global,
+            "config event target: {changed:?}"
         );
         ensure!(
-            config_event["data"]["writeRevision"].as_str() == Some(new_write_revision.as_str()),
-            "config event writeRevision must match the response: {config_event}"
+            changed.write_revision == new_write_revision,
+            "config event writeRevision must match the response: {changed:?}"
         );
         ensure!(
-            config_event["data"]["source"].as_str() == Some("desktop"),
-            "config event source: {config_event}"
+            changed.revision == write.state.revision,
+            "config event revision must match the response: {changed:?}"
+        );
+        ensure!(
+            changed.source == "desktop",
+            "config event source: {changed:?}"
         );
 
         // Disk bytes: the owner wrote exactly the canonical serialized file.
@@ -927,17 +932,13 @@ fn assert_capabilities(capabilities: &Capabilities) -> Result<()> {
         DesktopMethod::CancelJob,
         DesktopMethod::GetSubscriptionUsage,
         DesktopMethod::RefreshSubscriptionUsage,
+        DesktopMethod::GetConfig,
+        DesktopMethod::SetConfig,
+        DesktopMethod::GetDesignCanvas,
     ] {
         ensure!(
             capabilities.supports(method),
             "capabilities does not advertise {method}: {capabilities:?}"
-        );
-    }
-    // Methods this probe exercises raw, not yet named by the typed adapter.
-    for name in ["get_config", "set_config", "get_design_canvas"] {
-        ensure!(
-            capabilities.methods.iter().any(|method| method == name),
-            "capabilities does not advertise {name}"
         );
     }
     for event in [

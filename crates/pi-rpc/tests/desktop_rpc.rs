@@ -3,13 +3,15 @@
 //! adapter only builds the outer prompt and decodes the widget records.
 
 use pi_rpc::desktop_rpc::{
+    ConfigChanged, ConfigErrorCode, ConfigLayer, ConfigLayerSource, ConfigScope, ConfigState,
+    ConfigStatus, ConfigStore, ConfigWrite, ConfigWriteTarget, ConfigWriteTargetState,
     DesignCanvas, DesignCanvasEvent, DesignEntry, DesignTransition, DesktopAgent, DesktopAgentStep,
     DesktopAgentUsage, DesktopEvent, DesktopJob, DesktopMethod, DesktopRecord, DesktopRequest,
     DesktopResponse, DesktopRpcError, DesktopSession, Handoff, JobExitCode, MAX_REQUEST_BYTES,
-    PROMPT_COMMAND, PermissionMode, PermissionModeChanged, PermissionModeState, ProviderUsage,
-    RateLimitEvent, RateLimitSource, SCHEMA, SetPermissionModeResult, UsageLimit, UsageLimitScope,
-    UsageRefresh, UsageResetAt, UsageStatus, UsageWindow, WIDGET_KEY, decode_payload,
-    decode_widget,
+    PROMPT_COMMAND, PermissionMode, PermissionModeChanged, PermissionModeState, PinSource,
+    ProfileFallbacksData, ProfilesData, ProviderUsage, RateLimitEvent, RateLimitSource, SCHEMA,
+    SetConfigResult, SetPermissionModeResult, UsageLimit, UsageLimitScope, UsageRefresh,
+    UsageResetAt, UsageStatus, UsageWindow, WIDGET_KEY, decode_payload, decode_widget,
 };
 use pi_rpc::{Response, UiMethod, UiRequest};
 use serde_json::{Value, json};
@@ -2855,4 +2857,1131 @@ fn capabilities_expose_design_canvas_method_and_event() {
     assert!(capabilities.supports(DesktopMethod::GetDesignCanvas));
     assert!(capabilities.emits("design_canvas"));
     assert!(!capabilities.emits("design_canvas_token"));
+}
+
+// --- configuration stores: get_config, set_config and config_changed -----
+
+fn profiles_value() -> Value {
+    json!({
+        "kind": "gentle-pi.agent_model_profiles",
+        "version": 1,
+        "active": "team",
+        "profiles": { "team": { "explore": { "model": "anthropic/claude-sonnet-4" } } },
+    })
+}
+
+fn fallbacks_value() -> Value {
+    json!({
+        "kind": "gentle-pi.profile_model_fallbacks",
+        "version": 1,
+        "profiles": {
+            "team": {
+                "*": [{ "model": "openai/gpt-shared" }],
+                "worker": [{ "model": "openai/gpt-fallback", "thinking": "low" }],
+            },
+        },
+    })
+}
+
+/// A documented `get_config` projection of `profiles` read from disk.
+fn profiles_read() -> Value {
+    json!({
+        "store": "profiles",
+        "scope": "global",
+        "readOnly": false,
+        "status": "ok",
+        "revision": "sha256:1f0c",
+        "value": profiles_value(),
+        "layers": [{ "source": "global", "status": "ok" }],
+        "writeTargets": [{ "target": "global", "status": "ok", "writeRevision": "sha256:8f2a" }],
+    })
+}
+
+fn config_response(data: Value) -> DesktopResponse {
+    record_response(
+        decode_widget(&widget(&response_line("desktop-1", data)))
+            .unwrap()
+            .unwrap(),
+    )
+}
+
+fn config_event(seq: u64, name: &str, data: Value) -> DesktopEvent {
+    record_event(
+        decode_widget(&widget(&event_line(seq, name, data)))
+            .unwrap()
+            .unwrap(),
+    )
+}
+
+fn request_payload(request_id: &str, method: &str, params: Value) -> String {
+    json!({
+        "schema": SCHEMA,
+        "requestId": request_id,
+        "method": method,
+        "params": params,
+    })
+    .to_string()
+}
+
+#[test]
+fn config_methods_use_the_exact_wire_names() {
+    for (method, name) in [
+        (DesktopMethod::GetConfig, "get_config"),
+        (DesktopMethod::SetConfig, "set_config"),
+    ] {
+        assert_eq!(method.as_str(), name);
+        assert_eq!(method.to_string(), name);
+        assert_eq!(DesktopMethod::parse(name).unwrap(), method);
+        assert_eq!(name.parse::<DesktopMethod>().unwrap(), method);
+    }
+    assert!(matches!(
+        DesktopMethod::parse("set_configs"),
+        Err(DesktopRpcError::UnsupportedMethod(_))
+    ));
+}
+
+#[test]
+fn config_stores_are_a_closed_vocabulary_with_their_documented_shape() {
+    let expected = [
+        (
+            ConfigStore::Profiles,
+            "profiles",
+            ConfigScope::Global,
+            false,
+        ),
+        (
+            ConfigStore::Models,
+            "models",
+            ConfigScope::GlobalProject,
+            true,
+        ),
+        (
+            ConfigStore::ProfileFallbacks,
+            "profile_fallbacks",
+            ConfigScope::Global,
+            false,
+        ),
+        (
+            ConfigStore::Subagents,
+            "subagents",
+            ConfigScope::GlobalProject,
+            true,
+        ),
+        (ConfigStore::Pins, "pins", ConfigScope::LocalRepo, false),
+        (
+            ConfigStore::ManagedAssets,
+            "managed_assets",
+            ConfigScope::Global,
+            true,
+        ),
+    ];
+    assert_eq!(ConfigStore::ALL.len(), expected.len());
+    for (store, (want, name, scope, read_only)) in ConfigStore::ALL.into_iter().zip(expected) {
+        assert_eq!(store, want);
+        assert_eq!(store.as_str(), name);
+        assert_eq!(store.to_string(), name);
+        assert_eq!(name.parse::<ConfigStore>().unwrap(), store);
+        assert_eq!(store.scope(), scope);
+        assert_eq!(store.is_read_only(), read_only);
+    }
+    for unknown in ["", "Profiles", "profile", "permission", "../profiles.json"] {
+        assert!(
+            matches!(
+                unknown.parse::<ConfigStore>(),
+                Err(DesktopRpcError::UnknownConfigStore(got)) if got == unknown
+            ),
+            "{unknown:?} must not be a store"
+        );
+    }
+
+    for (scope, name) in [
+        (ConfigScope::Global, "global"),
+        (ConfigScope::GlobalProject, "global+project"),
+        (ConfigScope::LocalRepo, "local+repo"),
+    ] {
+        assert_eq!(scope.as_str(), name);
+        assert_eq!(name.parse::<ConfigScope>().unwrap(), scope);
+    }
+    assert!(matches!(
+        "project".parse::<ConfigScope>(),
+        Err(DesktopRpcError::InvalidConfigScope(_))
+    ));
+
+    for status in ConfigStatus::ALL {
+        assert_eq!(status.as_str().parse::<ConfigStatus>().unwrap(), status);
+    }
+    assert_eq!(
+        ConfigStatus::ALL.map(ConfigStatus::as_str),
+        ["ok", "missing", "invalid"]
+    );
+    assert!(matches!(
+        "stale".parse::<ConfigStatus>(),
+        Err(DesktopRpcError::InvalidConfigStatus(_))
+    ));
+
+    assert_eq!(
+        ConfigLayerSource::ALL.map(ConfigLayerSource::as_str),
+        ["global", "project", "local", "repo"]
+    );
+    assert!(matches!(
+        "cwd".parse::<ConfigLayerSource>(),
+        Err(DesktopRpcError::InvalidConfigLayerSource(_))
+    ));
+    assert_eq!(
+        ConfigWriteTarget::ALL.map(ConfigWriteTarget::as_str),
+        ["global", "local", "repo"]
+    );
+    assert!(matches!(
+        "project".parse::<ConfigWriteTarget>(),
+        Err(DesktopRpcError::InvalidConfigWriteTarget(_))
+    ));
+    assert_eq!(PinSource::Local.as_str(), "local");
+    assert_eq!(PinSource::Repo.as_str(), "repo");
+    assert_eq!(PinSource::Local.write_target(), ConfigWriteTarget::Local);
+    assert_eq!(PinSource::Repo.write_target(), ConfigWriteTarget::Repo);
+}
+
+#[test]
+fn get_config_sends_exactly_the_store_param_for_every_store() {
+    for store in ConfigStore::ALL {
+        let request = DesktopRequest::get_config("desktop-9", store).unwrap();
+        assert_eq!(request.method(), DesktopMethod::GetConfig);
+        assert_eq!(
+            request.payload(),
+            format!(
+                r#"{{"schema":"{SCHEMA}","requestId":"desktop-9","method":"get_config","params":{{"store":"{}"}}}}"#,
+                store.as_str()
+            )
+        );
+    }
+}
+
+#[test]
+fn set_config_sends_exactly_store_data_and_expected_revision() {
+    let profiles = DesktopRequest::set_config(
+        "desktop-2",
+        ConfigWrite::Profiles(ProfilesData::new(profiles_value()).unwrap()),
+        "sha256:8f2a",
+    )
+    .unwrap();
+    assert_eq!(profiles.method(), DesktopMethod::SetConfig);
+    assert_eq!(
+        profiles.payload(),
+        request_payload(
+            "desktop-2",
+            "set_config",
+            json!({
+                "store": "profiles",
+                "data": profiles_value(),
+                "expectedRevision": "sha256:8f2a",
+            }),
+        )
+    );
+
+    let fallbacks = DesktopRequest::set_config(
+        "desktop-3",
+        ConfigWrite::ProfileFallbacks(ProfileFallbacksData::new(fallbacks_value()).unwrap()),
+        "sha256:3c11",
+    )
+    .unwrap();
+    assert_eq!(
+        fallbacks.payload(),
+        request_payload(
+            "desktop-3",
+            "set_config",
+            json!({
+                "store": "profile_fallbacks",
+                "data": fallbacks_value(),
+                "expectedRevision": "sha256:3c11",
+            }),
+        )
+    );
+}
+
+#[test]
+fn set_config_pins_select_one_layer_and_clear_with_an_explicit_null() {
+    let set = ConfigWrite::pin(PinSource::Local, "team");
+    assert_eq!(set.store(), ConfigStore::Pins);
+    assert_eq!(set.write_target(), ConfigWriteTarget::Local);
+    let request = DesktopRequest::set_config("desktop-4", set, "sha256:0d19").unwrap();
+    assert_eq!(
+        request.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-4","method":"set_config","params":{{"store":"pins","data":{{"source":"local","profile":"team"}},"expectedRevision":"sha256:0d19"}}}}"#
+        )
+    );
+
+    // The clear names the layer and sends `profile: null`, never omits it.
+    let clear = ConfigWrite::clear_pin(PinSource::Repo);
+    assert_eq!(clear.write_target(), ConfigWriteTarget::Repo);
+    let request = DesktopRequest::set_config("desktop-5", clear, "sha256:aa").unwrap();
+    assert_eq!(
+        request.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-5","method":"set_config","params":{{"store":"pins","data":{{"source":"repo","profile":null}},"expectedRevision":"sha256:aa"}}}}"#
+        )
+    );
+
+    assert_eq!(
+        ConfigWrite::Profiles(ProfilesData::new(profiles_value()).unwrap()).write_target(),
+        ConfigWriteTarget::Global
+    );
+    assert_eq!(
+        ConfigWrite::ProfileFallbacks(ProfileFallbacksData::new(fallbacks_value()).unwrap())
+            .store(),
+        ConfigStore::ProfileFallbacks
+    );
+}
+
+#[test]
+fn set_config_rejects_unusable_revisions_and_pin_names_before_sending() {
+    assert!(matches!(
+        DesktopRequest::set_config("desktop-1", ConfigWrite::pin(PinSource::Local, "team"), ""),
+        Err(DesktopRpcError::InvalidExpectedRevision)
+    ));
+    assert!(matches!(
+        DesktopRequest::set_config("desktop-1", ConfigWrite::pin(PinSource::Repo, ""), "rev"),
+        Err(DesktopRpcError::InvalidPinProfile)
+    ));
+    let mut session = DesktopSession::new();
+    assert!(matches!(
+        session.issue_set_config(ConfigWrite::pin(PinSource::Local, "team"), ""),
+        Err(DesktopRpcError::InvalidExpectedRevision)
+    ));
+    // A refused request never occupies the session.
+    assert!(session.pending().is_none());
+}
+
+#[test]
+fn store_data_is_any_object_and_the_server_validates_its_content() {
+    assert_eq!(
+        ProfilesData::new(profiles_value()).unwrap().as_value(),
+        &profiles_value()
+    );
+    assert_eq!(
+        ProfileFallbacksData::new(fallbacks_value())
+            .unwrap()
+            .as_value(),
+        &fallbacks_value()
+    );
+
+    // Content the owner normalizer would refuse is still an object: the
+    // client sends it and the server answers `invalid_data`.
+    let server_validated: &[Value] = &[
+        json!({}),
+        json!({ "version": 2, "profiles": [] }),
+        json!({ "kind": "gentle-pi.agent_model_profiles", "version": 1, "profiles": {}, "active": 7 }),
+        json!({ "kind": "gentle-pi.agent_model_profiles", "version": 1, "profiles": {}, "workflow": [] }),
+        json!({ "kind": "gentle-pi.profile_model_fallbacks", "version": 1, "profiles": {}, "path": "/etc/x" }),
+    ];
+    for data in server_validated {
+        let profiles = ProfilesData::new(data.clone()).unwrap();
+        assert_eq!(profiles.as_value(), data);
+        let fallbacks = ProfileFallbacksData::new(data.clone()).unwrap();
+        assert_eq!(fallbacks.as_value(), data);
+    }
+
+    // Whatever `data` holds, the envelope stays exactly `{ store, data,
+    // expectedRevision }`: a member inside `data` never becomes a param.
+    let request = DesktopRequest::set_config(
+        "desktop-1",
+        ConfigWrite::Profiles(
+            ProfilesData::new(json!({ "path": "/etc/x", "store": "models" })).unwrap(),
+        ),
+        "sha256:8f2a",
+    )
+    .unwrap();
+    assert_eq!(
+        request.payload(),
+        request_payload(
+            "desktop-1",
+            "set_config",
+            json!({
+                "store": "profiles",
+                "data": { "path": "/etc/x", "store": "models" },
+                "expectedRevision": "sha256:8f2a",
+            }),
+        )
+    );
+
+    for data in [json!(null), json!([]), json!("profiles.json"), json!(1)] {
+        assert!(
+            matches!(
+                ProfilesData::new(data.clone()),
+                Err(DesktopRpcError::InvalidConfigData(_))
+            ),
+            "{data} must not be profiles data"
+        );
+        assert!(
+            matches!(
+                ProfileFallbacksData::new(data.clone()),
+                Err(DesktopRpcError::InvalidConfigData(_))
+            ),
+            "{data} must not be fallbacks data"
+        );
+    }
+}
+
+#[test]
+fn config_methods_cannot_be_sent_with_untyped_params() {
+    // The generic constructor and the zero-param issue path would let a path
+    // or a read-only store through; only the typed API builds these methods.
+    for method in [DesktopMethod::GetConfig, DesktopMethod::SetConfig] {
+        assert!(matches!(
+            DesktopRequest::new("desktop-1", method, json!({ "store": "models", "path": "/etc" })),
+            Err(DesktopRpcError::TypedParamsRequired(got)) if got == method
+        ));
+        let mut session = DesktopSession::new();
+        assert!(matches!(
+            session.issue(method),
+            Err(DesktopRpcError::TypedParamsRequired(got)) if got == method
+        ));
+        assert!(session.pending().is_none());
+    }
+    // Existing methods keep their generic path.
+    assert!(DesktopRequest::new("desktop-1", DesktopMethod::GetSnapshot, json!({})).is_ok());
+}
+
+#[test]
+fn get_config_decodes_a_writable_store_with_its_write_targets() {
+    let state = config_response(profiles_read()).config().unwrap();
+    assert_eq!(
+        state,
+        ConfigState {
+            store: ConfigStore::Profiles,
+            scope: ConfigScope::Global,
+            read_only: false,
+            status: ConfigStatus::Ok,
+            revision: "sha256:1f0c".into(),
+            value: Some(profiles_value()),
+            layers: vec![ConfigLayer {
+                source: ConfigLayerSource::Global,
+                status: ConfigStatus::Ok,
+            }],
+            write_targets: Some(vec![ConfigWriteTargetState {
+                target: ConfigWriteTarget::Global,
+                status: ConfigStatus::Ok,
+                write_revision: "sha256:8f2a".into(),
+            }]),
+        }
+    );
+    assert_eq!(
+        state.write_revision(ConfigWriteTarget::Global),
+        Some("sha256:8f2a")
+    );
+    assert_eq!(state.write_revision(ConfigWriteTarget::Local), None);
+}
+
+#[test]
+fn get_config_decodes_every_store_and_status() {
+    // A missing writable store: no value, and the missing target still has a
+    // write revision of its own.
+    let missing = config_response(json!({
+        "store": "profile_fallbacks",
+        "scope": "global",
+        "readOnly": false,
+        "status": "missing",
+        "revision": "sha256:3c11",
+        "layers": [{ "source": "global", "status": "missing" }],
+        "writeTargets": [{ "target": "global", "status": "missing", "writeRevision": "sha256:77" }],
+    }))
+    .config()
+    .unwrap();
+    assert_eq!(missing.store, ConfigStore::ProfileFallbacks);
+    assert_eq!(missing.status, ConfigStatus::Missing);
+    assert_eq!(missing.value, None);
+    assert_eq!(
+        missing.write_targets.as_ref().unwrap()[0].status,
+        ConfigStatus::Missing
+    );
+
+    // A read-only merged store reported invalid, with no write targets.
+    let models = config_response(json!({
+        "store": "models",
+        "scope": "global+project",
+        "readOnly": true,
+        "status": "invalid",
+        "revision": "sha256:5a61",
+        "layers": [
+            { "source": "global", "status": "invalid" },
+            { "source": "project", "status": "ok" },
+        ],
+    }))
+    .config()
+    .unwrap();
+    assert_eq!(models.store, ConfigStore::Models);
+    assert_eq!(models.scope, ConfigScope::GlobalProject);
+    assert!(models.read_only);
+    assert_eq!(models.status, ConfigStatus::Invalid);
+    assert_eq!(models.value, None);
+    assert_eq!(models.write_targets, None);
+    assert_eq!(
+        models.layers,
+        vec![
+            ConfigLayer {
+                source: ConfigLayerSource::Global,
+                status: ConfigStatus::Invalid,
+            },
+            ConfigLayer {
+                source: ConfigLayerSource::Project,
+                status: ConfigStatus::Ok,
+            },
+        ]
+    );
+
+    // A merged store stays `ok` while one layer is broken.
+    let subagents = config_response(json!({
+        "store": "subagents",
+        "scope": "global+project",
+        "readOnly": true,
+        "status": "ok",
+        "revision": "sha256:77be",
+        "value": { "defaultMode": "task" },
+        "layers": [
+            { "source": "global", "status": "ok" },
+            { "source": "project", "status": "invalid" },
+        ],
+    }))
+    .config()
+    .unwrap();
+    assert_eq!(subagents.store, ConfigStore::Subagents);
+    assert_eq!(subagents.value, Some(json!({ "defaultMode": "task" })));
+
+    let assets = config_response(json!({
+        "store": "managed_assets",
+        "scope": "global",
+        "readOnly": true,
+        "status": "ok",
+        "revision": "sha256:be05",
+        "value": { "schemaVersion": 1, "assets": {} },
+        "layers": [{ "source": "global", "status": "ok" }],
+    }))
+    .config()
+    .unwrap();
+    assert_eq!(assets.store, ConfigStore::ManagedAssets);
+    assert!(assets.read_only);
+
+    // Pins: two layers, two write targets, and a value even with a stale layer.
+    let pins = config_response(json!({
+        "store": "pins",
+        "scope": "local+repo",
+        "readOnly": false,
+        "status": "ok",
+        "revision": "sha256:0d19",
+        "value": {
+            "resolved": true,
+            "winner": { "source": "repo", "profile": "team" },
+            "invalid": [],
+            "stale": [{ "source": "local", "profile": "retired" }],
+        },
+        "layers": [
+            { "source": "local", "status": "ok" },
+            { "source": "repo", "status": "ok" },
+        ],
+        "writeTargets": [
+            { "target": "local", "status": "ok", "writeRevision": "sha256:l1" },
+            { "target": "repo", "status": "ok", "writeRevision": "sha256:r1" },
+        ],
+    }))
+    .config()
+    .unwrap();
+    assert_eq!(pins.scope, ConfigScope::LocalRepo);
+    assert_eq!(
+        pins.write_revision(ConfigWriteTarget::Local),
+        Some("sha256:l1")
+    );
+    assert_eq!(
+        pins.write_revision(ConfigWriteTarget::Repo),
+        Some("sha256:r1")
+    );
+    assert_eq!(pins.write_revision(ConfigWriteTarget::Global), None);
+
+    // Outside a worktree: invalid, empty layers, and no target offered.
+    let outside = config_response(json!({
+        "store": "pins",
+        "scope": "local+repo",
+        "readOnly": false,
+        "status": "invalid",
+        "revision": "sha256:00",
+        "value": { "reason": "worktree_unresolved" },
+        "layers": [],
+        "writeTargets": [],
+    }))
+    .config()
+    .unwrap();
+    assert_eq!(outside.status, ConfigStatus::Invalid);
+    assert!(outside.layers.is_empty());
+    assert_eq!(outside.write_targets, Some(vec![]));
+}
+
+#[test]
+fn get_config_rejects_shapes_outside_the_contract() {
+    let mut cases: Vec<(&str, Value)> = Vec::new();
+    let with = |key: &str, value: Value| {
+        let mut data = profiles_read();
+        data[key] = value;
+        data
+    };
+    let without = |key: &str| {
+        let mut data = profiles_read();
+        data.as_object_mut().unwrap().remove(key);
+        data
+    };
+    cases.push(("unknown store", with("store", json!("permission"))));
+    cases.push(("missing store", without("store")));
+    cases.push(("unknown scope", with("scope", json!("project"))));
+    cases.push(("scope of another store", with("scope", json!("local+repo"))));
+    cases.push(("readOnly not a bool", with("readOnly", json!("false"))));
+    cases.push(("readOnly disagrees", with("readOnly", json!(true))));
+    cases.push(("unknown status", with("status", json!("stale"))));
+    cases.push(("missing status", without("status")));
+    cases.push(("missing revision", without("revision")));
+    cases.push(("empty revision", with("revision", json!(""))));
+    cases.push(("value not an object", with("value", json!("profiles.json"))));
+    cases.push(("missing layers", without("layers")));
+    cases.push((
+        "layer source",
+        with("layers", json!([{ "source": "cwd", "status": "ok" }])),
+    ));
+    cases.push((
+        "layer status",
+        with("layers", json!([{ "source": "global", "status": "gone" }])),
+    ));
+    cases.push(("writable without writeTargets", without("writeTargets")));
+    cases.push(("writeTargets not an array", with("writeTargets", json!({}))));
+    cases.push((
+        "unknown target",
+        with(
+            "writeTargets",
+            json!([{ "target": "project", "status": "ok", "writeRevision": "r" }]),
+        ),
+    ));
+    cases.push((
+        "target of another store",
+        with(
+            "writeTargets",
+            json!([{ "target": "local", "status": "ok", "writeRevision": "r" }]),
+        ),
+    ));
+    cases.push((
+        "target status",
+        with(
+            "writeTargets",
+            json!([{ "target": "global", "status": "fine", "writeRevision": "r" }]),
+        ),
+    ));
+    cases.push((
+        "missing writeRevision",
+        with(
+            "writeTargets",
+            json!([{ "target": "global", "status": "ok" }]),
+        ),
+    ));
+    cases.push((
+        "empty writeRevision",
+        with(
+            "writeTargets",
+            json!([{ "target": "global", "status": "ok", "writeRevision": "" }]),
+        ),
+    ));
+    // A read-only store must not offer a write target.
+    cases.push((
+        "read-only with writeTargets",
+        json!({
+            "store": "models",
+            "scope": "global+project",
+            "readOnly": true,
+            "status": "ok",
+            "revision": "sha256:9a42",
+            "value": {},
+            "layers": [],
+            "writeTargets": [{ "target": "global", "status": "ok", "writeRevision": "r" }],
+        }),
+    ));
+    for (label, data) in cases {
+        assert!(
+            config_response(data.clone()).config().is_err(),
+            "{label}: {data} must not decode as a config read"
+        );
+    }
+    assert!(matches!(
+        config_response(with("store", json!("permission"))).config(),
+        Err(DesktopRpcError::UnknownConfigStore(_))
+    ));
+    assert!(matches!(
+        config_response(with("status", json!("stale"))).config(),
+        Err(DesktopRpcError::InvalidConfigStatus(_))
+    ));
+}
+
+#[test]
+fn get_config_keeps_only_the_documented_value_rules() {
+    let with = |base: Value, key: &str, value: Value| {
+        let mut data = base;
+        data[key] = value;
+        data
+    };
+    let without = |base: Value, key: &str| {
+        let mut data = base;
+        data.as_object_mut().unwrap().remove(key);
+        data
+    };
+    let pins = json!({
+        "store": "pins",
+        "scope": "local+repo",
+        "readOnly": false,
+        "status": "missing",
+        "revision": "sha256:p0",
+        "value": { "resolved": false, "invalid": [], "stale": [] },
+        "layers": [
+            { "source": "local", "status": "missing" },
+            { "source": "repo", "status": "missing" },
+        ],
+        "writeTargets": [
+            { "target": "local", "status": "missing", "writeRevision": "sha256:lm" },
+            { "target": "repo", "status": "missing", "writeRevision": "sha256:rm" },
+        ],
+    });
+    // `pins` keeps its value whatever its status.
+    assert_eq!(
+        config_response(pins.clone()).config().unwrap().value,
+        Some(json!({ "resolved": false, "invalid": [], "stale": [] }))
+    );
+
+    // Documented: `ok` means normalized content follows, and `pins` always
+    // carries a value.
+    let rejected: Vec<(&str, Value)> = vec![
+        ("ok without value", without(profiles_read(), "value")),
+        (
+            "ok with null value",
+            with(profiles_read(), "value", Value::Null),
+        ),
+        ("pins without value", without(pins.clone(), "value")),
+    ];
+    for (label, data) in rejected {
+        assert!(
+            matches!(
+                config_response(data.clone()).config(),
+                Err(DesktopRpcError::MalformedPayload(_))
+            ),
+            "{label}: {data} must not decode as a config read"
+        );
+    }
+
+    // A stray value on a store that read `missing` or `invalid` is ignored.
+    for status in ["missing", "invalid"] {
+        let state = config_response(with(profiles_read(), "status", json!(status)))
+            .config()
+            .unwrap();
+        assert_eq!(state.status.as_str(), status);
+        assert_eq!(state.value, None);
+    }
+    let models = config_response(json!({
+        "store": "models",
+        "scope": "global+project",
+        "readOnly": true,
+        "status": "invalid",
+        "revision": "sha256:5a61",
+        "value": "not content",
+        "layers": [{ "source": "global", "status": "invalid" }],
+    }))
+    .config()
+    .unwrap();
+    assert_eq!(models.value, None);
+}
+
+#[test]
+fn get_config_leaves_layer_and_target_lists_to_the_server() {
+    let with = |base: Value, key: &str, value: Value| {
+        let mut data = base;
+        data[key] = value;
+        data
+    };
+    // Layer order, membership and repetition are reported as sent.
+    let layers = json!([
+        { "source": "project", "status": "ok" },
+        { "source": "global", "status": "missing" },
+        { "source": "global", "status": "ok" },
+    ]);
+    let state = config_response(with(profiles_read(), "layers", layers))
+        .config()
+        .unwrap();
+    assert_eq!(
+        state.layers,
+        vec![
+            ConfigLayer {
+                source: ConfigLayerSource::Project,
+                status: ConfigStatus::Ok,
+            },
+            ConfigLayer {
+                source: ConfigLayerSource::Global,
+                status: ConfigStatus::Missing,
+            },
+            ConfigLayer {
+                source: ConfigLayerSource::Global,
+                status: ConfigStatus::Ok,
+            },
+        ]
+    );
+
+    // A repeated write target decodes; the first entry answers the lookup.
+    let targets = json!([
+        { "target": "global", "status": "ok", "writeRevision": "sha256:a" },
+        { "target": "global", "status": "ok", "writeRevision": "sha256:b" },
+    ]);
+    let state = config_response(with(profiles_read(), "writeTargets", targets))
+        .config()
+        .unwrap();
+    assert_eq!(state.write_targets.as_ref().unwrap().len(), 2);
+    assert_eq!(
+        state.write_revision(ConfigWriteTarget::Global),
+        Some("sha256:a")
+    );
+}
+
+#[test]
+fn set_config_response_decodes_the_reread_state_and_its_write() {
+    let mut data = profiles_read();
+    data["revision"] = json!("sha256:1c80");
+    data["writeTargets"] =
+        json!([{ "target": "global", "status": "ok", "writeRevision": "sha256:c4b0" }]);
+    data["writeTarget"] = json!("global");
+    data["writeRevision"] = json!("sha256:c4b0");
+    data["changed"] = json!(true);
+    let result = config_response(data.clone()).set_config().unwrap();
+    assert_eq!(
+        result,
+        SetConfigResult {
+            state: ConfigState {
+                store: ConfigStore::Profiles,
+                scope: ConfigScope::Global,
+                read_only: false,
+                status: ConfigStatus::Ok,
+                revision: "sha256:1c80".into(),
+                value: Some(profiles_value()),
+                layers: vec![ConfigLayer {
+                    source: ConfigLayerSource::Global,
+                    status: ConfigStatus::Ok,
+                }],
+                write_targets: Some(vec![ConfigWriteTargetState {
+                    target: ConfigWriteTarget::Global,
+                    status: ConfigStatus::Ok,
+                    write_revision: "sha256:c4b0".into(),
+                }]),
+            },
+            write_target: ConfigWriteTarget::Global,
+            write_revision: "sha256:c4b0".into(),
+            changed: true,
+        }
+    );
+
+    // A pin clear of an absent layer is a no-op: `changed: false`.
+    let clear = config_response(json!({
+        "store": "pins",
+        "scope": "local+repo",
+        "readOnly": false,
+        "status": "missing",
+        "revision": "sha256:p0",
+        "value": { "resolved": false, "invalid": [], "stale": [] },
+        "layers": [
+            { "source": "local", "status": "missing" },
+            { "source": "repo", "status": "missing" },
+        ],
+        "writeTargets": [
+            { "target": "local", "status": "missing", "writeRevision": "sha256:lm" },
+            { "target": "repo", "status": "missing", "writeRevision": "sha256:rm" },
+        ],
+        "writeTarget": "repo",
+        "writeRevision": "sha256:rm",
+        "changed": false,
+    }))
+    .set_config()
+    .unwrap();
+    assert_eq!(clear.write_target, ConfigWriteTarget::Repo);
+    assert!(!clear.changed);
+
+    let mut bad: Vec<(&str, Value)> = Vec::new();
+    for key in ["writeTarget", "writeRevision", "changed"] {
+        let mut missing = data.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        bad.push((key, missing));
+    }
+    let mut wrong = data.clone();
+    wrong["changed"] = json!("yes");
+    bad.push(("changed type", wrong));
+    let mut wrong = data.clone();
+    wrong["writeTarget"] = json!("repo");
+    bad.push(("target of another store", wrong));
+    let mut wrong = data.clone();
+    wrong["writeRevision"] = json!("sha256:other");
+    bad.push(("revision differs from its target", wrong));
+    let mut wrong = data.clone();
+    wrong["writeRevision"] = json!("");
+    bad.push(("empty revision", wrong));
+    let mut wrong = data.clone();
+    wrong["store"] = json!("models");
+    wrong["scope"] = json!("global+project");
+    wrong["readOnly"] = json!(true);
+    wrong.as_object_mut().unwrap().remove("writeTargets");
+    bad.push(("read-only store", wrong));
+    for (label, data) in bad {
+        assert!(
+            config_response(data.clone()).set_config().is_err(),
+            "{label}: {data} must not decode as a set_config result"
+        );
+    }
+}
+
+#[test]
+fn config_failures_keep_their_documented_codes() {
+    let codes = [
+        (ConfigErrorCode::UnknownStore, "unknown_store"),
+        (ConfigErrorCode::ReadOnly, "read_only"),
+        (ConfigErrorCode::InvalidData, "invalid_data"),
+        (ConfigErrorCode::RevisionConflict, "revision_conflict"),
+        (ConfigErrorCode::WriteFailed, "write_failed"),
+        (ConfigErrorCode::ConfigUnavailable, "config_unavailable"),
+    ];
+    assert_eq!(ConfigErrorCode::ALL.len(), codes.len());
+    for (code, name) in codes {
+        assert_eq!(code.as_str(), name);
+        assert_eq!(ConfigErrorCode::parse(name), Some(code));
+        let response = record_response(
+            decode_widget(&widget(&error_line("desktop-1", name, "nope")))
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(response.error().unwrap().config_error(), Some(code));
+        assert!(matches!(
+            response.set_config(),
+            Err(DesktopRpcError::RemoteError(info)) if info.code == name
+        ));
+        assert!(response.config().is_err());
+    }
+    assert_eq!(ConfigErrorCode::parse("internal_error"), None);
+
+    let conflict = record_response(
+        decode_widget(&widget(&error_line(
+            "desktop-1",
+            "revision_conflict",
+            "Config changed since expectedRevision was read",
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    let info = conflict.error().unwrap();
+    assert_eq!(info.config_error(), Some(ConfigErrorCode::RevisionConflict));
+    assert_eq!(
+        info.message,
+        "Config changed since expectedRevision was read"
+    );
+    let other = record_response(
+        decode_widget(&widget(&error_line("desktop-1", "invalid_request", "x")))
+            .unwrap()
+            .unwrap(),
+    );
+    assert_eq!(other.error().unwrap().config_error(), None);
+}
+
+#[test]
+fn config_changed_decodes_its_exact_data_and_checks_the_event_name() {
+    let data = json!({
+        "store": "profiles",
+        "scope": "global",
+        "writeTarget": "global",
+        "revision": "sha256:1c80",
+        "writeRevision": "sha256:c4b0",
+        "source": "desktop",
+    });
+    let event = config_event(1, "config_changed", data.clone());
+    assert_eq!(
+        event.config_changed().unwrap(),
+        ConfigChanged {
+            store: ConfigStore::Profiles,
+            scope: ConfigScope::Global,
+            write_target: ConfigWriteTarget::Global,
+            revision: "sha256:1c80".into(),
+            write_revision: "sha256:c4b0".into(),
+            source: "desktop".into(),
+        }
+    );
+
+    let pin = config_event(
+        2,
+        "config_changed",
+        json!({
+            "store": "pins",
+            "scope": "local+repo",
+            "writeTarget": "local",
+            "revision": "sha256:p",
+            "writeRevision": "sha256:l",
+            "source": "desktop",
+        }),
+    )
+    .config_changed()
+    .unwrap();
+    assert_eq!(pin.write_target, ConfigWriteTarget::Local);
+
+    // A foreign event with the same shape is refused, not misread.
+    let foreign = config_event(3, "permission_mode_changed", data.clone());
+    assert!(matches!(
+        foreign.config_changed(),
+        Err(DesktopRpcError::UnexpectedEvent { expected: "config_changed", got })
+            if got == "permission_mode_changed"
+    ));
+
+    let mut bad: Vec<Value> = Vec::new();
+    for key in [
+        "store",
+        "scope",
+        "writeTarget",
+        "revision",
+        "writeRevision",
+        "source",
+    ] {
+        let mut missing = data.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        bad.push(missing);
+    }
+    for (key, value) in [
+        ("store", json!("models")),
+        ("store", json!("unknown")),
+        ("scope", json!("local+repo")),
+        ("writeTarget", json!("repo")),
+        ("revision", json!("")),
+        ("writeRevision", json!(7)),
+    ] {
+        let mut wrong = data.clone();
+        wrong[key] = value;
+        bad.push(wrong);
+    }
+    for data in bad {
+        assert!(
+            config_event(4, "config_changed", data.clone())
+                .config_changed()
+                .is_err(),
+            "{data} must not decode as config_changed"
+        );
+    }
+}
+
+#[test]
+fn config_requests_flow_through_session_correlation_and_sequence() {
+    let mut session = DesktopSession::new();
+
+    let read = session.issue_get_config(ConfigStore::Pins).unwrap();
+    assert_eq!(read.request_id(), "desktop-1");
+    assert_eq!(read.method(), DesktopMethod::GetConfig);
+    assert_eq!(
+        read.payload(),
+        request_payload("desktop-1", "get_config", json!({ "store": "pins" }))
+    );
+    assert_eq!(
+        session.pending(),
+        Some(("desktop-1", DesktopMethod::GetConfig))
+    );
+    assert!(matches!(
+        session.issue_set_config(ConfigWrite::clear_pin(PinSource::Local), "sha256:l"),
+        Err(DesktopRpcError::RequestInFlight { .. })
+    ));
+    // A response for another id never answers this one.
+    assert!(matches!(
+        session.accept(&widget(&response_line("desktop-9", profiles_read()))),
+        Err(DesktopRpcError::UncorrelatedResponse { .. })
+    ));
+    session
+        .accept(&widget(&response_line("desktop-1", profiles_read())))
+        .unwrap();
+    assert!(session.pending().is_none());
+
+    let write = session
+        .issue_set_config(ConfigWrite::clear_pin(PinSource::Local), "sha256:l")
+        .unwrap();
+    assert_eq!(write.request_id(), "desktop-2");
+    assert_eq!(write.method(), DesktopMethod::SetConfig);
+    assert_eq!(
+        write.payload(),
+        request_payload(
+            "desktop-2",
+            "set_config",
+            json!({
+                "store": "pins",
+                "data": { "source": "local", "profile": null },
+                "expectedRevision": "sha256:l",
+            }),
+        )
+    );
+    // A conflict answers and releases the request.
+    let answered = session
+        .accept(&widget(&error_line(
+            "desktop-2",
+            "revision_conflict",
+            "Config changed since expectedRevision was read",
+        )))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record_response(answered).error().unwrap().config_error(),
+        Some(ConfigErrorCode::RevisionConflict)
+    );
+    assert!(session.pending().is_none());
+
+    // The change event follows the sequence rules like any other event.
+    let changed = json!({
+        "store": "pins",
+        "scope": "local+repo",
+        "writeTarget": "local",
+        "revision": "sha256:p",
+        "writeRevision": "sha256:l2",
+        "source": "desktop",
+    });
+    let first = session
+        .accept(&widget(&event_line(4, "config_changed", changed.clone())))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record_event(first).config_changed().unwrap().write_revision,
+        "sha256:l2"
+    );
+    assert!(matches!(
+        session.accept(&widget(&event_line(4, "config_changed", changed.clone()))),
+        Err(DesktopRpcError::DuplicateSequence { .. })
+    ));
+    assert!(matches!(
+        session.accept(&widget(&event_line(6, "config_changed", changed))),
+        Err(DesktopRpcError::OutOfOrderSequence { .. })
+    ));
+}
+
+#[test]
+fn capabilities_expose_the_config_methods_and_event() {
+    let response = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            capabilities_data(
+                &["capabilities", "get_config", "set_config"],
+                &["config_changed"],
+            ),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    let capabilities = response.capabilities().unwrap();
+    assert!(capabilities.supports(DesktopMethod::GetConfig));
+    assert!(capabilities.supports(DesktopMethod::SetConfig));
+    assert!(capabilities.emits("config_changed"));
+
+    let without = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            capabilities_data(&["capabilities", "get_config"], &[]),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .capabilities()
+    .unwrap();
+    assert!(without.supports(DesktopMethod::GetConfig));
+    assert!(!without.supports(DesktopMethod::SetConfig));
+    assert!(!without.emits("config_changed"));
 }

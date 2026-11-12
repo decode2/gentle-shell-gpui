@@ -19,6 +19,12 @@
 //! transport timeout, or a disposition other than `handled`), and
 //! [`DesktopSession::reset`] / [`DesktopSession::resync_from_snapshot`] for a
 //! backend restart or a lost event sequence.
+//!
+//! The server validates the domain: the client keeps only the rules the
+//! contract documents. The config requests are the one place it checks input
+//! before sending — `set_config` refuses an empty `expectedRevision` and an
+//! empty pin profile (a clear is an explicit `profile: null`), both of which
+//! the server would only answer with `revision_conflict` / `invalid_data`.
 
 use crate::record::{Response as PiResponse, UiMethod, UiRequest};
 use serde::Deserialize;
@@ -52,6 +58,8 @@ pub enum DesktopMethod {
     GetSubscriptionUsage,
     RefreshSubscriptionUsage,
     GetDesignCanvas,
+    GetConfig,
+    SetConfig,
 }
 
 impl DesktopMethod {
@@ -69,7 +77,16 @@ impl DesktopMethod {
             Self::GetSubscriptionUsage => "get_subscription_usage",
             Self::RefreshSubscriptionUsage => "refresh_subscription_usage",
             Self::GetDesignCanvas => "get_design_canvas",
+            Self::GetConfig => "get_config",
+            Self::SetConfig => "set_config",
         }
+    }
+
+    /// Whether the method's params can only be built by its typed
+    /// constructor: the config methods name a store, never a path, so the
+    /// generic `params` path is closed to them.
+    fn requires_typed_params(self) -> bool {
+        matches!(self, Self::GetConfig | Self::SetConfig)
     }
 
     /// Parse a wire method name.
@@ -86,6 +103,8 @@ impl DesktopMethod {
             "get_subscription_usage" => Ok(Self::GetSubscriptionUsage),
             "refresh_subscription_usage" => Ok(Self::RefreshSubscriptionUsage),
             "get_design_canvas" => Ok(Self::GetDesignCanvas),
+            "get_config" => Ok(Self::GetConfig),
+            "set_config" => Ok(Self::SetConfig),
             other => Err(DesktopRpcError::UnsupportedMethod(other.to_string())),
         }
     }
@@ -427,9 +446,54 @@ impl DesktopRequest {
         )
     }
 
+    /// The `get_config` request. Params are exactly `{ store }`: a store
+    /// identifier, never a path.
+    pub fn get_config(
+        request_id: impl Into<String>,
+        store: ConfigStore,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::build(
+            request_id,
+            DesktopMethod::GetConfig,
+            get_config_params(store),
+        )
+    }
+
+    /// The `set_config` request. Params are exactly `{ store, data,
+    /// expectedRevision }`; `expected_revision` is the `writeRevision` of the
+    /// target `write` replaces, as last read. Only the three writable stores
+    /// can be named, through [`ConfigWrite`]. Before sending, an empty
+    /// `expected_revision` ([`DesktopRpcError::InvalidExpectedRevision`]) and
+    /// an empty pin profile ([`DesktopRpcError::InvalidPinProfile`]) are
+    /// refused; everything else in `data` is the server's to validate.
+    pub fn set_config(
+        request_id: impl Into<String>,
+        write: ConfigWrite,
+        expected_revision: impl Into<String>,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::build(
+            request_id,
+            DesktopMethod::SetConfig,
+            set_config_params(&write, &expected_revision.into())?,
+        )
+    }
+
     /// A request for a known method, validated against the id and size limits
-    /// before anything reaches the transport.
+    /// before anything reaches the transport. The config methods are refused
+    /// here: their params come only from [`Self::get_config`] and
+    /// [`Self::set_config`].
     pub fn new(
+        request_id: impl Into<String>,
+        method: DesktopMethod,
+        params: Value,
+    ) -> Result<Self, DesktopRpcError> {
+        if method.requires_typed_params() {
+            return Err(DesktopRpcError::TypedParamsRequired(method));
+        }
+        Self::build(request_id, method, params)
+    }
+
+    fn build(
         request_id: impl Into<String>,
         method: DesktopMethod,
         params: Value,
@@ -495,6 +559,13 @@ impl DesktopRequest {
 pub struct DesktopErrorInfo {
     pub code: String,
     pub message: String,
+}
+
+impl DesktopErrorInfo {
+    /// The documented config failure this error reports, if it is one.
+    pub fn config_error(&self) -> Option<ConfigErrorCode> {
+        ConfigErrorCode::parse(&self.code)
+    }
 }
 
 /// A decoded inner response. `requestId` is kept so the caller can prove the
@@ -573,6 +644,16 @@ impl DesktopResponse {
         DesignCanvas::from_data(self.data()?)
     }
 
+    /// The response to `get_config`.
+    pub fn config(&self) -> Result<ConfigState, DesktopRpcError> {
+        ConfigState::from_data(self.data()?)
+    }
+
+    /// The response to `set_config`.
+    pub fn set_config(&self) -> Result<SetConfigResult, DesktopRpcError> {
+        SetConfigResult::from_data(self.data()?)
+    }
+
     fn data(&self) -> Result<&Value, DesktopRpcError> {
         self.result
             .as_ref()
@@ -623,6 +704,13 @@ impl DesktopEvent {
     pub fn design_canvas(&self) -> Result<DesignCanvasEvent, DesktopRpcError> {
         expect_event(self, "design_canvas")?;
         DesignCanvasEvent::from_data(&self.data)
+    }
+
+    /// Decode the data of a `config_changed` event, verifying the exact event
+    /// name before the shape, exactly like [`Self::agents_update`].
+    pub fn config_changed(&self) -> Result<ConfigChanged, DesktopRpcError> {
+        expect_event(self, "config_changed")?;
+        ConfigChanged::from_data(&self.data)
     }
 }
 
@@ -1750,6 +1838,698 @@ impl DesignCanvasEvent {
     }
 }
 
+/// The six configuration stores the protocol names. A store is an
+/// identifier, never a path; anything else is refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigStore {
+    Profiles,
+    Models,
+    ProfileFallbacks,
+    Subagents,
+    Pins,
+    ManagedAssets,
+}
+
+impl ConfigStore {
+    /// Every store the protocol speaks, in wire order.
+    pub const ALL: [Self; 6] = [
+        Self::Profiles,
+        Self::Models,
+        Self::ProfileFallbacks,
+        Self::Subagents,
+        Self::Pins,
+        Self::ManagedAssets,
+    ];
+
+    /// The wire name of the store.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Profiles => "profiles",
+            Self::Models => "models",
+            Self::ProfileFallbacks => "profile_fallbacks",
+            Self::Subagents => "subagents",
+            Self::Pins => "pins",
+            Self::ManagedAssets => "managed_assets",
+        }
+    }
+
+    /// The owner layers the store is assembled from.
+    pub fn scope(self) -> ConfigScope {
+        match self {
+            Self::Profiles | Self::ProfileFallbacks | Self::ManagedAssets => ConfigScope::Global,
+            Self::Models | Self::Subagents => ConfigScope::GlobalProject,
+            Self::Pins => ConfigScope::LocalRepo,
+        }
+    }
+
+    /// Whether the store is derived or installer-owned, so `set_config` can
+    /// never target it.
+    pub fn is_read_only(self) -> bool {
+        self.write_targets().is_empty()
+    }
+
+    /// The files a write to this store may replace; empty when read-only.
+    pub fn write_targets(self) -> &'static [ConfigWriteTarget] {
+        match self {
+            Self::Profiles | Self::ProfileFallbacks => &[ConfigWriteTarget::Global],
+            Self::Pins => &[ConfigWriteTarget::Local, ConfigWriteTarget::Repo],
+            Self::Models | Self::Subagents | Self::ManagedAssets => &[],
+        }
+    }
+}
+
+impl std::str::FromStr for ConfigStore {
+    type Err = DesktopRpcError;
+
+    fn from_str(store: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == store)
+            .ok_or_else(|| DesktopRpcError::UnknownConfigStore(store.to_string()))
+    }
+}
+
+impl fmt::Display for ConfigStore {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The closed `scope` vocabulary of a config store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigScope {
+    Global,
+    GlobalProject,
+    LocalRepo,
+}
+
+impl ConfigScope {
+    /// Every scope the protocol speaks, in wire order.
+    pub const ALL: [Self; 3] = [Self::Global, Self::GlobalProject, Self::LocalRepo];
+
+    /// The wire name of the scope.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::GlobalProject => "global+project",
+            Self::LocalRepo => "local+repo",
+        }
+    }
+}
+
+impl std::str::FromStr for ConfigScope {
+    type Err = DesktopRpcError;
+
+    fn from_str(scope: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == scope)
+            .ok_or_else(|| DesktopRpcError::InvalidConfigScope(scope.to_string()))
+    }
+}
+
+impl fmt::Display for ConfigScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The closed `status` vocabulary of a store, a layer and a write target.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigStatus {
+    Ok,
+    Missing,
+    Invalid,
+}
+
+impl ConfigStatus {
+    /// Every status the protocol speaks, in wire order.
+    pub const ALL: [Self; 3] = [Self::Ok, Self::Missing, Self::Invalid];
+
+    /// The wire name of the status.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Missing => "missing",
+            Self::Invalid => "invalid",
+        }
+    }
+}
+
+impl std::str::FromStr for ConfigStatus {
+    type Err = DesktopRpcError;
+
+    fn from_str(status: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == status)
+            .ok_or_else(|| DesktopRpcError::InvalidConfigStatus(status.to_string()))
+    }
+}
+
+impl fmt::Display for ConfigStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The closed `source` vocabulary of a store layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigLayerSource {
+    Global,
+    Project,
+    Local,
+    Repo,
+}
+
+impl ConfigLayerSource {
+    /// Every layer source the protocol speaks, in wire order.
+    pub const ALL: [Self; 4] = [Self::Global, Self::Project, Self::Local, Self::Repo];
+
+    /// The wire name of the layer source.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Project => "project",
+            Self::Local => "local",
+            Self::Repo => "repo",
+        }
+    }
+}
+
+impl std::str::FromStr for ConfigLayerSource {
+    type Err = DesktopRpcError;
+
+    fn from_str(source: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == source)
+            .ok_or_else(|| DesktopRpcError::InvalidConfigLayerSource(source.to_string()))
+    }
+}
+
+impl fmt::Display for ConfigLayerSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The closed `target` vocabulary of a write target: one file, not a store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigWriteTarget {
+    Global,
+    Local,
+    Repo,
+}
+
+impl ConfigWriteTarget {
+    /// Every write target the protocol speaks, in wire order.
+    pub const ALL: [Self; 3] = [Self::Global, Self::Local, Self::Repo];
+
+    /// The wire name of the write target.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Local => "local",
+            Self::Repo => "repo",
+        }
+    }
+}
+
+impl std::str::FromStr for ConfigWriteTarget {
+    type Err = DesktopRpcError;
+
+    fn from_str(target: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == target)
+            .ok_or_else(|| DesktopRpcError::InvalidConfigWriteTarget(target.to_string()))
+    }
+}
+
+impl fmt::Display for ConfigWriteTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The pin layer a `pins` write selects. There is no default and no
+/// inference from which file exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PinSource {
+    /// Clone-wide, under the Git common dir.
+    Local,
+    /// Committable, per worktree.
+    Repo,
+}
+
+impl PinSource {
+    /// The wire name of the pin layer.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Repo => "repo",
+        }
+    }
+
+    /// The write target whose `writeRevision` guards this layer.
+    pub fn write_target(self) -> ConfigWriteTarget {
+        match self {
+            Self::Local => ConfigWriteTarget::Local,
+            Self::Repo => ConfigWriteTarget::Repo,
+        }
+    }
+}
+
+impl fmt::Display for PinSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// Check that `data` is a JSON object. The server's owner normalizer is the
+/// validator of the content; the `set_config` envelope, not this check, keeps
+/// paths and extra keys out of the request.
+fn store_document(data: &Value, kind: &'static str) -> Result<(), DesktopRpcError> {
+    if data.is_object() {
+        Ok(())
+    } else {
+        Err(DesktopRpcError::InvalidConfigData(format!(
+            "{kind} data must be an object"
+        )))
+    }
+}
+
+/// The complete `profiles` store content (`AgentProfilesFile`), as
+/// `get_config` returned it. Only the JSON object shape is checked here; the
+/// server's owner normalizer validates the content and answers `invalid_data`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfilesData(Value);
+
+impl ProfilesData {
+    pub const KIND: &'static str = "gentle-pi.agent_model_profiles";
+
+    pub fn new(data: Value) -> Result<Self, DesktopRpcError> {
+        store_document(&data, Self::KIND)?;
+        Ok(Self(data))
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
+/// The complete `profile_fallbacks` store content (`FallbacksFile`), as
+/// `get_config` returned it. Only the JSON object shape is checked here; the
+/// server's owner normalizer validates the content and answers `invalid_data`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProfileFallbacksData(Value);
+
+impl ProfileFallbacksData {
+    pub const KIND: &'static str = "gentle-pi.profile_model_fallbacks";
+
+    pub fn new(data: Value) -> Result<Self, DesktopRpcError> {
+        store_document(&data, Self::KIND)?;
+        Ok(Self(data))
+    }
+
+    pub fn as_value(&self) -> &Value {
+        &self.0
+    }
+}
+
+/// One `set_config` write. Only the three writable stores exist here, so a
+/// read-only store cannot be targeted through the typed API.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConfigWrite {
+    /// Replace the whole `profiles` store.
+    Profiles(ProfilesData),
+    /// Replace the whole `profile_fallbacks` store.
+    ProfileFallbacks(ProfileFallbacksData),
+    /// Pin `profile` in one layer, or clear that layer with `None` (sent as
+    /// `profile: null`).
+    Pin {
+        source: PinSource,
+        profile: Option<String>,
+    },
+}
+
+impl ConfigWrite {
+    /// Pin a profile the `profiles` store defines in one layer.
+    pub fn pin(source: PinSource, profile: impl Into<String>) -> Self {
+        Self::Pin {
+            source,
+            profile: Some(profile.into()),
+        }
+    }
+
+    /// Remove one layer's pin file; the other layer is left as it is.
+    pub fn clear_pin(source: PinSource) -> Self {
+        Self::Pin {
+            source,
+            profile: None,
+        }
+    }
+
+    /// The store this write replaces.
+    pub fn store(&self) -> ConfigStore {
+        match self {
+            Self::Profiles(_) => ConfigStore::Profiles,
+            Self::ProfileFallbacks(_) => ConfigStore::ProfileFallbacks,
+            Self::Pin { .. } => ConfigStore::Pins,
+        }
+    }
+
+    /// The target whose `writeRevision` must be sent as `expectedRevision`.
+    pub fn write_target(&self) -> ConfigWriteTarget {
+        match self {
+            Self::Profiles(_) | Self::ProfileFallbacks(_) => ConfigWriteTarget::Global,
+            Self::Pin { source, .. } => source.write_target(),
+        }
+    }
+}
+
+/// The wire `params` object for `get_config`: exactly `{ store }`.
+fn get_config_params(store: ConfigStore) -> Value {
+    json!({ "store": store.as_str() })
+}
+
+/// The wire `params` object for `set_config`: exactly `{ store, data,
+/// expectedRevision }`, with a non-empty revision and, for a pin, a non-empty
+/// profile or an explicit `null`.
+fn set_config_params(
+    write: &ConfigWrite,
+    expected_revision: &str,
+) -> Result<Value, DesktopRpcError> {
+    if expected_revision.is_empty() {
+        return Err(DesktopRpcError::InvalidExpectedRevision);
+    }
+    let data = match write {
+        ConfigWrite::Profiles(data) => data.as_value().clone(),
+        ConfigWrite::ProfileFallbacks(data) => data.as_value().clone(),
+        ConfigWrite::Pin { source, profile } => {
+            if profile.as_deref() == Some("") {
+                return Err(DesktopRpcError::InvalidPinProfile);
+            }
+            json!({ "source": source.as_str(), "profile": profile })
+        }
+    };
+    Ok(json!({
+        "store": write.store().as_str(),
+        "data": data,
+        "expectedRevision": expected_revision,
+    }))
+}
+
+/// The documented `get_config` / `set_config` failure codes. Other codes
+/// (`invalid_request`, `internal_error`) are not config-specific.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ConfigErrorCode {
+    UnknownStore,
+    ReadOnly,
+    InvalidData,
+    RevisionConflict,
+    WriteFailed,
+    ConfigUnavailable,
+}
+
+impl ConfigErrorCode {
+    /// Every config failure code, in documented order.
+    pub const ALL: [Self; 6] = [
+        Self::UnknownStore,
+        Self::ReadOnly,
+        Self::InvalidData,
+        Self::RevisionConflict,
+        Self::WriteFailed,
+        Self::ConfigUnavailable,
+    ];
+
+    /// The wire code.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownStore => "unknown_store",
+            Self::ReadOnly => "read_only",
+            Self::InvalidData => "invalid_data",
+            Self::RevisionConflict => "revision_conflict",
+            Self::WriteFailed => "write_failed",
+            Self::ConfigUnavailable => "config_unavailable",
+        }
+    }
+
+    /// The config failure a wire code names, if it is one.
+    pub fn parse(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+    }
+}
+
+impl fmt::Display for ConfigErrorCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// A required closed-vocabulary string field, parsed through its vocabulary.
+fn closed_field<T>(data: &Value, field: &'static str) -> Result<T, DesktopRpcError>
+where
+    T: std::str::FromStr<Err = DesktopRpcError>,
+{
+    data.get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| DesktopRpcError::MalformedPayload(format!("{field} must be a string")))?
+        .parse()
+}
+
+/// A required non-empty revision string.
+fn revision_field(data: &Value, field: &'static str) -> Result<String, DesktopRpcError> {
+    let revision = string_field(data, field)?;
+    if revision.is_empty() {
+        return Err(DesktopRpcError::MalformedPayload(format!(
+            "{field} must not be empty"
+        )));
+    }
+    Ok(revision)
+}
+
+/// Refuse a write target the store does not own.
+fn expect_write_target(
+    store: ConfigStore,
+    target: ConfigWriteTarget,
+) -> Result<(), DesktopRpcError> {
+    if store.write_targets().contains(&target) {
+        Ok(())
+    } else {
+        Err(DesktopRpcError::MalformedPayload(format!(
+            "{store} has no write target {target}"
+        )))
+    }
+}
+
+/// One file a store is assembled from, and what reading it produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigLayer {
+    pub source: ConfigLayerSource,
+    pub status: ConfigStatus,
+}
+
+impl ConfigLayer {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            source: closed_field(data, "source")?,
+            status: closed_field(data, "status")?,
+        })
+    }
+}
+
+/// One file a writable store may replace, with the `writeRevision` a write to
+/// it must send as `expectedRevision`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigWriteTargetState {
+    pub target: ConfigWriteTarget,
+    pub status: ConfigStatus,
+    pub write_revision: String,
+}
+
+impl ConfigWriteTargetState {
+    fn from_data(data: &Value, store: ConfigStore) -> Result<Self, DesktopRpcError> {
+        let target = closed_field(data, "target")?;
+        expect_write_target(store, target)?;
+        Ok(Self {
+            target,
+            status: closed_field(data, "status")?,
+            write_revision: revision_field(data, "writeRevision")?,
+        })
+    }
+}
+
+/// The decoded `get_config` data: one store's identity, mutability, status,
+/// read revision, normalized content and layers. `store`, `scope` and
+/// `readOnly` must agree with the documented store table. `value` is present
+/// for an `ok` read and always for `pins`; for any other `missing` or
+/// `invalid` read it is `None`, even if the server sent one. `write_targets` is `Some` exactly for
+/// the writable stores (possibly empty: `pins` outside a Git worktree) and
+/// `None` for the read-only ones.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConfigState {
+    pub store: ConfigStore,
+    pub scope: ConfigScope,
+    pub read_only: bool,
+    pub status: ConfigStatus,
+    pub revision: String,
+    pub value: Option<Value>,
+    pub layers: Vec<ConfigLayer>,
+    pub write_targets: Option<Vec<ConfigWriteTargetState>>,
+}
+
+impl ConfigState {
+    /// The `writeRevision` of one target, the token `set_config` requires.
+    pub fn write_revision(&self, target: ConfigWriteTarget) -> Option<&str> {
+        self.write_targets
+            .as_deref()?
+            .iter()
+            .find(|state| state.target == target)
+            .map(|state| state.write_revision.as_str())
+    }
+
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        let store: ConfigStore = closed_field(data, "store")?;
+        let scope: ConfigScope = closed_field(data, "scope")?;
+        if scope != store.scope() {
+            return Err(DesktopRpcError::MalformedPayload(format!(
+                "{store} scope must be {}, got {scope}",
+                store.scope()
+            )));
+        }
+        let read_only = bool_field(data, "readOnly")?;
+        if read_only != store.is_read_only() {
+            return Err(DesktopRpcError::MalformedPayload(format!(
+                "{store} readOnly must be {}",
+                store.is_read_only()
+            )));
+        }
+        let status = closed_field(data, "status")?;
+        // `ok` means normalized content follows, and `pins` always describes
+        // what its layers amount to. Any other store that read `missing` or
+        // `invalid` produced no content, so a stray `value` there is ignored.
+        let value = if status == ConfigStatus::Ok || store == ConfigStore::Pins {
+            match data.get("value") {
+                Some(value @ Value::Object(_)) => Some(value.clone()),
+                _ => {
+                    return Err(DesktopRpcError::MalformedPayload(format!(
+                        "{store} with status {status} must carry a value object"
+                    )));
+                }
+            }
+        } else {
+            None
+        };
+        let layers = data
+            .get("layers")
+            .and_then(Value::as_array)
+            .ok_or_else(|| DesktopRpcError::MalformedPayload("config has no layers array".into()))?
+            .iter()
+            .map(ConfigLayer::from_data)
+            .collect::<Result<_, _>>()?;
+        let write_targets = match data.get("writeTargets") {
+            None | Some(Value::Null) if read_only => None,
+            Some(Value::Array(items)) if !read_only => Some(
+                items
+                    .iter()
+                    .map(|item| ConfigWriteTargetState::from_data(item, store))
+                    .collect::<Result<_, _>>()?,
+            ),
+            _ if read_only => {
+                return Err(DesktopRpcError::MalformedPayload(format!(
+                    "read-only {store} must not offer writeTargets"
+                )));
+            }
+            _ => {
+                return Err(DesktopRpcError::MalformedPayload(format!(
+                    "writable {store} has no writeTargets array"
+                )));
+            }
+        };
+        Ok(Self {
+            store,
+            scope,
+            read_only,
+            status,
+            revision: revision_field(data, "revision")?,
+            value,
+            layers,
+            write_targets,
+        })
+    }
+}
+
+/// The decoded `set_config` data: the store re-read after the attempt, the
+/// target this request named, that target's resulting `writeRevision` (the
+/// next `expectedRevision`), and whether the content actually changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetConfigResult {
+    pub state: ConfigState,
+    pub write_target: ConfigWriteTarget,
+    pub write_revision: String,
+    pub changed: bool,
+}
+
+impl SetConfigResult {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        let state = ConfigState::from_data(data)?;
+        let write_target = closed_field(data, "writeTarget")?;
+        expect_write_target(state.store, write_target)?;
+        let write_revision = revision_field(data, "writeRevision")?;
+        if state.write_revision(write_target) != Some(write_revision.as_str()) {
+            return Err(DesktopRpcError::MalformedPayload(format!(
+                "writeRevision does not match the {write_target} write target"
+            )));
+        }
+        Ok(Self {
+            state,
+            write_target,
+            write_revision,
+            changed: bool_field(data, "changed")?,
+        })
+    }
+}
+
+/// The data of a `config_changed` event: the resulting values of the
+/// `set_config` response it follows. `source` is `desktop` because this slice
+/// only publishes changes it made itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigChanged {
+    pub store: ConfigStore,
+    pub scope: ConfigScope,
+    pub write_target: ConfigWriteTarget,
+    pub revision: String,
+    pub write_revision: String,
+    pub source: String,
+}
+
+impl ConfigChanged {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        let store: ConfigStore = closed_field(data, "store")?;
+        let scope = closed_field(data, "scope")?;
+        if scope != store.scope() {
+            return Err(DesktopRpcError::MalformedPayload(format!(
+                "{store} scope must be {}, got {scope}",
+                store.scope()
+            )));
+        }
+        let write_target = closed_field(data, "writeTarget")?;
+        expect_write_target(store, write_target)?;
+        Ok(Self {
+            store,
+            scope,
+            write_target,
+            revision: revision_field(data, "revision")?,
+            write_revision: revision_field(data, "writeRevision")?,
+            source: string_field(data, "source")?,
+        })
+    }
+}
+
 /// Pi's answer to the outer prompt: `disposition: "handled"` means accepted.
 /// The domain result is never here, it arrives as a widget record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1839,7 +2619,32 @@ impl DesktopSession {
     /// responses are correlated by id, but a serial client keeps the failure
     /// modes obvious.
     pub fn issue(&mut self, method: DesktopMethod) -> Result<DesktopRequest, DesktopRpcError> {
+        if method.requires_typed_params() {
+            return Err(DesktopRpcError::TypedParamsRequired(method));
+        }
         self.issue_with(method, json!({}))
+    }
+
+    /// Issue `get_config` with exactly `{ store }`.
+    pub fn issue_get_config(
+        &mut self,
+        store: ConfigStore,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_with(DesktopMethod::GetConfig, get_config_params(store))
+    }
+
+    /// Issue `set_config` with exactly `{ store, data, expectedRevision }`,
+    /// refusing the same empty revision and empty pin profile as
+    /// [`DesktopRequest::set_config`] without occupying the session.
+    pub fn issue_set_config(
+        &mut self,
+        write: ConfigWrite,
+        expected_revision: impl Into<String>,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_with(
+            DesktopMethod::SetConfig,
+            set_config_params(&write, &expected_revision.into())?,
+        )
     }
 
     /// Issue `set_permission_mode` with its typed params. `get_permission_mode`
@@ -1927,7 +2732,7 @@ impl DesktopSession {
             });
         }
         let request =
-            DesktopRequest::new(format!("desktop-{}", self.next_request_id), method, params)?;
+            DesktopRequest::build(format!("desktop-{}", self.next_request_id), method, params)?;
         self.next_request_id += 1;
         self.pending = Some(Pending {
             request_id: request.request_id().to_string(),
@@ -2168,6 +2973,25 @@ pub enum DesktopRpcError {
     InvalidLastStep(String),
     /// A design canvas `transition` outside the closed vocabulary.
     InvalidDesignTransition(String),
+    /// A config store identifier outside the six documented stores.
+    UnknownConfigStore(String),
+    /// A config `scope` outside the closed vocabulary.
+    InvalidConfigScope(String),
+    /// A config `status` outside the closed vocabulary.
+    InvalidConfigStatus(String),
+    /// A config layer `source` outside the closed vocabulary.
+    InvalidConfigLayerSource(String),
+    /// A config write `target` outside the closed vocabulary.
+    InvalidConfigWriteTarget(String),
+    /// Store data that is not a JSON object.
+    InvalidConfigData(String),
+    /// A pin write named an empty profile; clearing a pin is `None`.
+    InvalidPinProfile,
+    /// A `set_config` request carried an empty `expectedRevision`.
+    InvalidExpectedRevision,
+    /// A method whose params only its typed constructor may build was sent
+    /// through the generic path.
+    TypedParamsRequired(DesktopMethod),
     /// An event was decoded through an accessor for another event name.
     UnexpectedEvent { expected: &'static str, got: String },
     /// `params` is not a JSON object.
@@ -2250,6 +3074,36 @@ impl fmt::Display for DesktopRpcError {
                 write!(
                     formatter,
                     "unknown desktop design canvas transition: {transition}"
+                )
+            }
+            Self::UnknownConfigStore(store) => {
+                write!(formatter, "unknown desktop config store: {store}")
+            }
+            Self::InvalidConfigScope(scope) => {
+                write!(formatter, "unknown desktop config scope: {scope}")
+            }
+            Self::InvalidConfigStatus(status) => {
+                write!(formatter, "unknown desktop config status: {status}")
+            }
+            Self::InvalidConfigLayerSource(source) => {
+                write!(formatter, "unknown desktop config layer source: {source}")
+            }
+            Self::InvalidConfigWriteTarget(target) => {
+                write!(formatter, "unknown desktop config write target: {target}")
+            }
+            Self::InvalidConfigData(reason) => {
+                write!(formatter, "invalid desktop config data: {reason}")
+            }
+            Self::InvalidPinProfile => {
+                formatter.write_str("desktop pin profile must be a non-empty name")
+            }
+            Self::InvalidExpectedRevision => {
+                formatter.write_str("desktop expectedRevision must be a non-empty string")
+            }
+            Self::TypedParamsRequired(method) => {
+                write!(
+                    formatter,
+                    "desktop {method} params must come from its typed request"
                 )
             }
             Self::UnexpectedEvent { expected, got } => {
