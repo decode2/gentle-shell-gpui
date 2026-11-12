@@ -34,14 +34,14 @@ flowchart TD
 
 `crates/pi-rpc` is a stable boundary: it knows nothing about GPUI, windows, tabs or visual components. `crates/app` depends on it, never the other way around.
 
-`crates/core` depends on nothing in the project (neither `app` nor `pi-rpc`) and not on GPUI; its only dependencies are `serde`, `serde_json`, `regex`, and `hmac` and `sha2` (gentle-stream's handshake). It compiles the same on macOS, Windows and Linux: it contains no platform-specific code except the syntax of the policy's `file:` paths, chosen with `cfg!(windows)` at compile time. When a module mixed pure logic and effects, the pure part lives in `core`, and the effectful part stays in `app` and calls it:
+`crates/core` depends on nothing in the project (neither `app` nor `pi-rpc`) and not on GPUI; its only dependencies are `serde`, `serde_json` and `regex`. It compiles the same on macOS, Windows and Linux: it contains no platform-specific code except the syntax of the policy's `file:` paths, chosen with `cfg!(windows)` at compile time. When a module mixed pure logic and effects, the pure part lives in `core`, and the effectful part stays in `app` and calls it:
 
 | `core` | Stays in `app` |
 | --- | --- |
 | `transcript`, `activity`, `tools`, `commands` | `session/agents.rs`: `now_ms` (system clock). |
 | `devices`: the device hub's list (plus AVDs it hasn't seen), launch-intent and device-command detection in agents' shell commands | `devices/`: the hub process and API, the panel (tabs, docked or floating, web viewer per device), `gentle-device`, the agents' instructions, SDK and simctl discovery. |
 | `scroll`: row weights from content, the scroll estimate for rows not laid out yet, the steady thumb rule | `session/view/rail.rs` and `transcript_list.rs`: recording on-screen row heights, drawing the rail. |
-| `music`: gentle-stream's wire protocol (frames, HMAC challenge and answer), its runtime folder, the player's state and the mood helper's answer | `music/`: the Unix socket, the Python helper, polling, the ♪ popover; `setup/music.rs`: finding and installing the player. |
+| `music`: gentle-stream's `ctl --json` envelope (the player's state and its structured errors) and the cache folder `setup-samples` uses | `music/`: running `gentle-stream ctl` per request, polling, the ♪ popover; `setup/music.rs`: finding and installing the player. |
 | `web`: http(s) URL extraction, loopback filtering and log punctuation | `browser/` and session events: in-app browser card and `WebSurface`; `platform/shims.rs` writes the `gentle-open` and `gentle-device` shims. |
 | `gentle_state`: `PermissionMode`, jobs, phase inference | `shared/gentle_state.rs`: reading and saving `permission-mode.json`. |
 | `notifications`: `Alert`, policy validation and changes; `alert_timing`: `Gate` and `ContextLatch` | `alerts/`: file cache and writing, playback, bundled tones, notifying the window. |

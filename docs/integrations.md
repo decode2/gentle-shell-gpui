@@ -13,7 +13,7 @@ How Gentle Shell GPUI connects to Gentle Shell (the `gentle-shell --mode rpc` ba
 | Launcher subcommands (`upgrade`, `install`, `remove`, `setup`) | `features/settings/upgrade.rs`, `settings/packages.rs`, `setup/gentle.rs` | Child process |
 | Engram (memory) | `features/memory/client.rs`, `gentle_core::engram` | Local HTTP |
 | Maestro (UI testing tools for the agent) | `features/settings/maestro.rs` (the section), `features/setup/maestro.rs`, `setup/fetch.rs` | Downloads into the toolchain; `gentle-shell mcp add` |
-| Music (gentle-stream) | `features/music/`, `features/settings/music.rs`, `features/setup/music.rs`, `gentle_core::music` | Unix socket (`multiprocessing.connection`); a Python helper in the player's environment |
+| Music (gentle-stream) | `features/music/`, `features/settings/music.rs`, `features/setup/music.rs`, `gentle_core::music` | `gentle-stream ctl --json` child process |
 | Subscription usage | `features/usage/`, `state::desktop::subscription` | Gentle Desktop RPC when the backend advertises `get_subscription_usage`; HTTPS fallback (legacy) |
 | Gentle Shell update | `features/updates/` | HTTPS (npm registry) |
 | App update | `features/app_update/` | HTTPS (GitHub releases) |
@@ -358,7 +358,6 @@ App paths: `dirs::data_dir()/gentle-shell-gpui/` (on macOS, `~/Library/Applicati
 | `<config>/persona.json`, `<cwd>/.pi/gentle-ai/persona.json` | Gentle AI | R | `settings/snapshot.rs` |
 | `<cwd>/.pi/gentle-ai/profile.json`, `<git common>/gentle-ai/profile-pin.json` | Gentle AI | R/W (over RPC: the `pins` store, clone layer written by name; Make default's repo-scoped pin still writes the file) | `profiles/pins.rs` |
 | `*.jsonl` sessions | Pi | R | `sessions/`, `usage/stats.rs` |
-| gentle-stream's runtime folder (`$XDG_RUNTIME_DIR/gentle-stream`, else `~/.cache/gentle-stream/run`): `authkey`, `player.sock` | gentle-stream | R (the key, to authenticate) | `music/client.rs` |
 | `~/.cache/gentle-stream/FluidR3_GM.sf2` | gentle-stream (`setup-samples`) | R (exists?) | `setup/music.rs` |
 
 `<agent>` and `<config>` are `pi_rpc::resolve_homes()`. When writing a Gentle Shell file, its exact schema is respected (e.g. `permission-mode.json` rejects extra keys) and it is written atomically (temp file + `rename`), as `shared/gentle_state.rs` and `profiles/files.rs` do.
@@ -401,21 +400,20 @@ Same as the launcher's startup check (`lib/gentle-shell-startup-update.ts`): `re
 | ClaudeBridge | `gentle-shell install npm:<bridge>` |
 | Engram | `Gentleman-Programming/engram` release from GitHub, verified, into `toolchain/bin` |
 | Maestro (Settings → UI testing, not part of this checklist) | Java 17+ is looked up (`toolchain/java`, `JAVA_HOME`, macOS `/usr/libexec/java_home -v 17+`, the `java` on the PATH, each checked by its `release` file); without one, the latest Temurin 21 JRE from `api.adoptium.net`, checked against Adoptium's sha256, into `toolchain/java`. The CLI is looked up (`toolchain/maestro/bin`, PATH, `~/.maestro/bin`); without one, `maestro.zip` from `mobile-dev-inc/maestro`'s latest GitHub release, checked against its `checksums_sha256.txt`, into `toolchain/maestro`. Then `gentle-shell mcp add maestro --env JAVA_HOME=<home> --description … -- <maestro> mcp` (`cmd /c <maestro.bat> mcp` on Windows). `status` reports the CLI (and whether it is the app's own), Java and whether Pi's `mcp.json` has an enabled `maestro` server; `test_connection` runs `gentle-shell mcp list` and returns the `maestro:` line; `disconnect` runs `gentle-shell mcp remove maestro`; `remove` disconnects and deletes `toolchain/maestro` and `toolchain/java`. Install and disconnect emit `SettingsEvent::Changed`, so tabs restart when idle and load or drop the tools. |
-| Music (Settings → Music, not part of this checklist) | macOS and Linux only. The player is looked up (`toolchain/music/bin`, `gentle-stream` on the PATH, Gentle Shell's `~/.gentle-shell/music/bin`) with the Python of its own virtualenv next to its real path. Install mirrors Gentle Shell's `/gentle:music` offer: uv 0.13.6 (its pinned sha256, `fetch.rs` `install_uv`) into `toolchain/music/uv`, then `uv tool install --python 3.13 'gentle-stream[samples] @ <pinned archive>'` with every uv folder inside `toolchain/music` and inherited `UV_*`/`PYTHON*`/`PIP_*` dropped; without the system FluidSynth library it retries without `[samples]`. Sampled instruments run `gentle-stream setup-samples`. Remove stops the player and deletes `toolchain/music`. |
+| Music (Settings → Music, not part of this checklist) | macOS and Linux only. The player is looked up (`toolchain/music/bin`, `gentle-stream` on the PATH, Gentle Shell's `~/.gentle-shell/music/bin`) and driven over its `ctl` CLI. Install mirrors Gentle Shell's `/gentle:music` offer: uv 0.13.6 (its pinned sha256, `fetch.rs` `install_uv`) into `toolchain/music/uv`, then `uv tool install --python 3.13 'gentle-stream[samples] @ <pinned archive>'` with every uv folder inside `toolchain/music` and inherited `UV_*`/`PYTHON*`/`PIP_*` dropped; without the system FluidSynth library it retries without `[samples]`. Sampled instruments run `gentle-stream setup-samples`. Remove stops the player and deletes `toolchain/music`. |
 | Provider | Providers screen |
 
 Anything that needs `sudo` or an interactive login is delivered as `Fix::Terminal`, and `features/onboarding/` opens it in a terminal tab. After installing, `refresh_paths` (= `forget_cached` + `apply_toolchain_path`).
 
 ### Music (`features/music/`)
 
-gentle-stream's background player (one per user, `gentle-stream daemon`) owns the audio and keeps playing after its clients leave. The app talks to it the way gentle-stream's own TUI does:
+gentle-stream's background player (one per user, `gentle-stream daemon`) owns the audio and keeps playing after its clients leave. The app controls it through the same `ctl` CLI gentle-stream itself ships, one short process per request:
 
-- **Socket.** `client.rs` connects to `player.sock` in the runtime folder (`gentle_core::music::runtime_dir`, same rule as gentle-stream) and speaks Python's `multiprocessing.connection`: 4-byte big-endian length frames, then a mutual HMAC-SHA256 challenge with the `authkey` file (the player challenges first; the app's 40-byte nonce comes from `/dev/urandom`). Requests are JSON: `state` (with `bands` for the spectrum), `toggle`, `next`, `set_volume`, `stop`. The player authenticates one client at a time with a listen queue of one, so a refused connect is retried briefly.
-- **Helper.** Starting the player and turning a mood into a style run a short Python script (`HELPER` in `music/mod.rs`) with the player's own Python: `client.ensure()` (gentle-stream's startup, ready pipe included), then `GentleShell(binary=<launcher>).interpret_with_usage(mood, player.style)` and `set_style`. The launcher is `pi_rpc::resolve_backend`'s program; the call uses Gentle Shell's default model and reports its tokens and cost.
-- **Polling.** Every 4 s while nothing plays (a player started from a terminal shows up), every 1.5 s while one plays, every 70 ms with 40 bands while the popover is open. One connection is kept and reopened after a drop.
-- **Quitting.** The app stops a player it started; one started elsewhere keeps playing.
+- **CLI.** `client.rs` runs `gentle-stream ctl <action> --json` with the resolved player binary (`setup::music::player`), `pi_rpc::command` and `pi_rpc::child_path()` as `PATH`. Actions: `start` (attaches to or starts the player), `status`, `volume 0..100`, `mood <text>`, `toggle`, `next`, `stop`. A successful answer is one machine envelope with `running`, `playing`, `volume` (a whole percent), `name`, `genre` and `mood`; failures are structured (`nothing_playing`, `invalid_request`, `unavailable`). Only `start` may spawn a player; `mood` passes `--gentle-shell <launcher>` so Gentle Shell's model reads the text, and the app starts the player first when nothing is playing.
+- **Polling.** Every 4 s while nothing plays (a player started from a terminal shows up), every 1.5 s while one plays, every 1 s while the popover is open. Each poll is one `ctl status --json` process, so a poll never spawns a second player.
+- **Quitting.** The app stops a player it started (`ctl stop`); one started elsewhere keeps playing.
 
-These are gentle-stream internals, not a public CLI (its CLI only has `ctl play|pause|toggle|next|stop|status`); the archive the app installs is pinned, so a player installed some other way may differ.
+The snapshot guarantees no key, mode, bpm or spectrum, so those displays degrade to empty (the popover's spectrum stays flat); the app never invents them.
 
 ### Git (`features/git/`)
 
