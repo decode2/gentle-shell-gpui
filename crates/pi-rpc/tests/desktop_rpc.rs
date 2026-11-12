@@ -4,8 +4,9 @@
 
 use pi_rpc::desktop_rpc::{
     DesktopEvent, DesktopMethod, DesktopRecord, DesktopRequest, DesktopResponse, DesktopRpcError,
-    DesktopSession, Handoff, MAX_REQUEST_BYTES, PROMPT_COMMAND, SCHEMA, WIDGET_KEY, decode_payload,
-    decode_widget,
+    DesktopSession, Handoff, MAX_REQUEST_BYTES, PROMPT_COMMAND, PermissionMode,
+    PermissionModeChanged, PermissionModeState, SCHEMA, SetPermissionModeResult, WIDGET_KEY,
+    decode_payload, decode_widget,
 };
 use pi_rpc::{Response, UiMethod, UiRequest};
 use serde_json::{Value, json};
@@ -846,4 +847,328 @@ fn capabilities_retain_events_and_check_the_described_wire_values() {
         capabilities(json!({ "methods": ["capabilities"] })),
         Err(DesktopRpcError::MalformedPayload(_))
     ));
+}
+
+// --- permission mode additions --------------------------------------------
+
+#[test]
+fn get_permission_mode_request_uses_the_wire_method_name_and_empty_params() {
+    let request = DesktopRequest::get_permission_mode("desktop-1").unwrap();
+    assert_eq!(request.method(), DesktopMethod::GetPermissionMode);
+    assert_eq!(
+        request.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-1","method":"get_permission_mode","params":{{}}}}"#
+        )
+    );
+    assert_eq!(
+        DesktopMethod::parse("get_permission_mode").unwrap(),
+        DesktopMethod::GetPermissionMode
+    );
+    assert_eq!(
+        "get_permission_mode".parse::<DesktopMethod>().unwrap(),
+        DesktopMethod::GetPermissionMode
+    );
+    assert_eq!(
+        "set_permission_mode".parse::<DesktopMethod>().unwrap(),
+        DesktopMethod::SetPermissionMode
+    );
+}
+
+#[test]
+fn set_permission_mode_request_has_the_exact_payload_for_every_mode_and_persist() {
+    for (mode, wire) in [
+        (PermissionMode::Normal, "normal"),
+        (PermissionMode::Auto, "auto"),
+        (PermissionMode::Yolo, "yolo"),
+        (PermissionMode::SuperYolo, "super-yolo"),
+    ] {
+        // `persist: None` omits the key, so the server's documented default
+        // (`false`) applies.
+        let omitted = DesktopRequest::set_permission_mode("desktop-1", mode, None).unwrap();
+        assert_eq!(omitted.method(), DesktopMethod::SetPermissionMode);
+        assert_eq!(
+            omitted.payload(),
+            format!(
+                r#"{{"schema":"{SCHEMA}","requestId":"desktop-1","method":"set_permission_mode","params":{{"mode":"{wire}"}}}}"#
+            )
+        );
+
+        let keep = DesktopRequest::set_permission_mode("desktop-2", mode, Some(false)).unwrap();
+        assert_eq!(
+            keep.payload(),
+            format!(
+                r#"{{"schema":"{SCHEMA}","requestId":"desktop-2","method":"set_permission_mode","params":{{"mode":"{wire}","persist":false}}}}"#
+            )
+        );
+
+        let persist = DesktopRequest::set_permission_mode("desktop-3", mode, Some(true)).unwrap();
+        assert_eq!(
+            persist.payload(),
+            format!(
+                r#"{{"schema":"{SCHEMA}","requestId":"desktop-3","method":"set_permission_mode","params":{{"mode":"{wire}","persist":true}}}}"#
+            )
+        );
+    }
+}
+
+#[test]
+fn permission_mode_wire_values_round_trip_and_reject_unknowns() {
+    for (mode, wire) in [
+        (PermissionMode::Normal, "normal"),
+        (PermissionMode::Auto, "auto"),
+        (PermissionMode::Yolo, "yolo"),
+        (PermissionMode::SuperYolo, "super-yolo"),
+    ] {
+        assert_eq!(mode.as_str(), wire);
+        assert_eq!(mode.to_string(), wire);
+        assert_eq!(wire.parse::<PermissionMode>().unwrap(), mode);
+    }
+    for bogus in ["turbo", "NORMAL", "super_yolo", ""] {
+        assert!(matches!(
+            bogus.parse::<PermissionMode>(),
+            Err(DesktopRpcError::InvalidPermissionMode(_))
+        ));
+    }
+}
+
+#[test]
+fn permission_mode_responses_decode_their_typed_state() {
+    // `get_permission_mode` returns the live state: only mode and default_mode.
+    let get = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "mode": "yolo", "default_mode": "normal" }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    assert_eq!(
+        get.permission_mode().unwrap(),
+        PermissionModeState {
+            mode: PermissionMode::Yolo,
+            default_mode: PermissionMode::Normal,
+        }
+    );
+
+    // `set_permission_mode` returns the actual resulting state plus the two
+    // attempt flags.
+    let set = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-2",
+            json!({ "mode": "auto", "default_mode": "auto", "persisted": true, "changed": true }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    assert_eq!(
+        set.set_permission_mode().unwrap(),
+        SetPermissionModeResult {
+            mode: PermissionMode::Auto,
+            default_mode: PermissionMode::Auto,
+            persisted: true,
+            changed: true,
+            persist_error: None,
+        }
+    );
+
+    // A failed save keeps the live change and reports the persist error.
+    let failed_save = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-3",
+            json!({
+                "mode": "auto",
+                "default_mode": "normal",
+                "persisted": false,
+                "changed": true,
+                "persist_error": { "code": "default_unchanged", "message": "Default permission mode unchanged" },
+            }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    let result = failed_save.set_permission_mode().unwrap();
+    assert!(!result.persisted);
+    assert!(result.changed);
+    let persist_error = result.persist_error.unwrap();
+    assert_eq!(persist_error.code, "default_unchanged");
+    assert_eq!(persist_error.message, "Default permission mode unchanged");
+}
+
+#[test]
+fn permission_mode_changed_events_decode_their_typed_data() {
+    let ui = widget(&event_line(
+        1,
+        "permission_mode_changed",
+        json!({
+            "mode": "auto",
+            "previous_mode": "normal",
+            "default_mode": "auto",
+            "persisted": true,
+            "source": "desktop",
+        }),
+    ));
+    let event = record_event(decode_widget(&ui).unwrap().unwrap());
+    assert_eq!(event.event, "permission_mode_changed");
+    assert_eq!(
+        event.permission_mode_changed().unwrap(),
+        PermissionModeChanged {
+            mode: PermissionMode::Auto,
+            previous_mode: PermissionMode::Normal,
+            default_mode: PermissionMode::Auto,
+            persisted: true,
+            source: "desktop".to_string(),
+        }
+    );
+}
+
+#[test]
+fn permission_mode_decoding_rejects_unknown_modes_and_malformed_shapes() {
+    let response_cases: &[Value] = &[
+        json!({ "mode": "turbo", "default_mode": "normal" }),
+        json!({ "mode": "auto", "default_mode": "turbo" }),
+        json!({ "mode": 7, "default_mode": "normal" }),
+        json!({ "mode": "auto" }),
+        json!({ "mode": "auto", "default_mode": "normal", "persisted": false }),
+        json!({ "mode": "auto", "default_mode": "normal", "persisted": false, "changed": "yes" }),
+        json!({
+            "mode": "auto", "default_mode": "normal", "persisted": false, "changed": false,
+            "persist_error": "nope",
+        }),
+    ];
+    for data in response_cases {
+        let response = record_response(
+            decode_widget(&widget(&response_line("desktop-1", data.clone())))
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(
+            response.set_permission_mode().is_err(),
+            "{data} should not decode as a set_permission_mode result"
+        );
+    }
+
+    // The read accessor applies the same mode and shape validation.
+    let bad_read = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "mode": "auto" }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    assert!(bad_read.permission_mode().is_err());
+
+    let event_cases: &[Value] = &[
+        json!({ "mode": "turbo", "previous_mode": "normal", "default_mode": "normal", "persisted": false, "source": "desktop" }),
+        json!({ "mode": "auto", "previous_mode": "normal", "default_mode": "auto", "persisted": false }),
+        json!({ "mode": "auto", "previous_mode": "normal", "default_mode": "auto", "persisted": false, "source": 7 }),
+    ];
+    for data in event_cases {
+        let event = record_event(
+            decode_widget(&widget(&event_line(
+                1,
+                "permission_mode_changed",
+                data.clone(),
+            )))
+            .unwrap()
+            .unwrap(),
+        );
+        assert!(
+            event.permission_mode_changed().is_err(),
+            "{data} should not decode as a permission_mode_changed event"
+        );
+    }
+}
+
+#[test]
+fn permission_mode_decoding_ignores_unknown_extra_fields() {
+    // The existing decoders read the fields they know and ignore the rest, so
+    // an evolving server stays compatible with this client.
+    let set = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({
+                "mode": "auto",
+                "default_mode": "normal",
+                "persisted": false,
+                "changed": true,
+                "extra": { "anything": true },
+            }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    let result = set.set_permission_mode().unwrap();
+    assert_eq!(result.mode, PermissionMode::Auto);
+    assert!(result.changed);
+}
+
+#[test]
+fn capabilities_expose_the_permission_methods_and_event() {
+    let response = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            capabilities_data(
+                &[
+                    "capabilities",
+                    "get_snapshot",
+                    "get_permission_mode",
+                    "set_permission_mode",
+                ],
+                &["permission_mode_changed"],
+            ),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    let capabilities = response.capabilities().unwrap();
+    assert!(capabilities.supports(DesktopMethod::GetPermissionMode));
+    assert!(capabilities.supports(DesktopMethod::SetPermissionMode));
+    assert!(capabilities.emits("permission_mode_changed"));
+    assert!(!capabilities.emits("config_changed"));
+}
+
+#[test]
+fn the_session_issues_permission_requests_with_typed_params() {
+    let mut session = DesktopSession::new();
+
+    let read = session.issue(DesktopMethod::GetPermissionMode).unwrap();
+    assert_eq!(read.request_id(), "desktop-1");
+    assert_eq!(
+        read.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-1","method":"get_permission_mode","params":{{}}}}"#
+        )
+    );
+
+    // Only one request may be in flight.
+    assert!(matches!(
+        session.issue_set_permission_mode(PermissionMode::Auto, Some(true)),
+        Err(DesktopRpcError::RequestInFlight { .. })
+    ));
+
+    // Complete the read, then the typed set goes out with the exact params.
+    session
+        .accept(&widget(&response_line(
+            "desktop-1",
+            json!({ "mode": "normal", "default_mode": "normal" }),
+        )))
+        .unwrap();
+
+    let set = session
+        .issue_set_permission_mode(PermissionMode::SuperYolo, Some(true))
+        .unwrap();
+    assert_eq!(set.request_id(), "desktop-2");
+    assert_eq!(set.method(), DesktopMethod::SetPermissionMode);
+    assert_eq!(
+        set.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-2","method":"set_permission_mode","params":{{"mode":"super-yolo","persist":true}}}}"#
+        )
+    );
+    assert_eq!(
+        session.pending(),
+        Some(("desktop-2", DesktopMethod::SetPermissionMode))
+    );
 }

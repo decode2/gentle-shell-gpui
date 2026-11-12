@@ -43,6 +43,8 @@ pub const MAX_REQUEST_ID_UNITS: usize = 128;
 pub enum DesktopMethod {
     Capabilities,
     GetSnapshot,
+    GetPermissionMode,
+    SetPermissionMode,
 }
 
 impl DesktopMethod {
@@ -51,6 +53,8 @@ impl DesktopMethod {
         match self {
             Self::Capabilities => "capabilities",
             Self::GetSnapshot => "get_snapshot",
+            Self::GetPermissionMode => "get_permission_mode",
+            Self::SetPermissionMode => "set_permission_mode",
         }
     }
 
@@ -59,12 +63,76 @@ impl DesktopMethod {
         match method {
             "capabilities" => Ok(Self::Capabilities),
             "get_snapshot" => Ok(Self::GetSnapshot),
+            "get_permission_mode" => Ok(Self::GetPermissionMode),
+            "set_permission_mode" => Ok(Self::SetPermissionMode),
             other => Err(DesktopRpcError::UnsupportedMethod(other.to_string())),
         }
     }
 }
 
 impl fmt::Display for DesktopMethod {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for DesktopMethod {
+    type Err = DesktopRpcError;
+
+    fn from_str(method: &str) -> Result<Self, Self::Err> {
+        Self::parse(method)
+    }
+}
+
+/// The permission modes the wire defines. The wire name is lowercase snake
+/// case; `super-yolo` is the only mode with a hyphen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PermissionMode {
+    Normal,
+    Auto,
+    Yolo,
+    SuperYolo,
+}
+
+impl PermissionMode {
+    /// Every mode the protocol speaks, in wire order.
+    pub const ALL: [Self; 4] = [Self::Normal, Self::Auto, Self::Yolo, Self::SuperYolo];
+
+    /// The wire name of the mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Normal => "normal",
+            Self::Auto => "auto",
+            Self::Yolo => "yolo",
+            Self::SuperYolo => "super-yolo",
+        }
+    }
+}
+
+impl serde::Serialize for PermissionMode {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for PermissionMode {
+    type Err = DesktopRpcError;
+
+    fn from_str(mode: &str) -> Result<Self, Self::Err> {
+        match mode {
+            "normal" => Ok(Self::Normal),
+            "auto" => Ok(Self::Auto),
+            "yolo" => Ok(Self::Yolo),
+            "super-yolo" => Ok(Self::SuperYolo),
+            other => Err(DesktopRpcError::InvalidPermissionMode(other.to_string())),
+        }
+    }
+}
+
+impl fmt::Display for PermissionMode {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(self.as_str())
     }
@@ -87,6 +155,24 @@ struct WireRequest<'a> {
     params: &'a Value,
 }
 
+/// The typed params of `set_permission_mode`; `persist` is omitted rather than
+/// sent as `null`, so the server's documented default applies.
+#[derive(serde::Serialize)]
+struct SetPermissionParams {
+    mode: PermissionMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    persist: Option<bool>,
+}
+
+/// The wire `params` object for `set_permission_mode`.
+fn set_permission_mode_params(
+    mode: PermissionMode,
+    persist: Option<bool>,
+) -> Result<Value, DesktopRpcError> {
+    serde_json::to_value(SetPermissionParams { mode, persist })
+        .map_err(|error| DesktopRpcError::MalformedPayload(error.to_string()))
+}
+
 impl DesktopRequest {
     /// The `capabilities` request. It takes no params.
     pub fn capabilities(request_id: impl Into<String>) -> Result<Self, DesktopRpcError> {
@@ -96,6 +182,25 @@ impl DesktopRequest {
     /// The `get_snapshot` request. It takes no params.
     pub fn get_snapshot(request_id: impl Into<String>) -> Result<Self, DesktopRpcError> {
         Self::new(request_id, DesktopMethod::GetSnapshot, json!({}))
+    }
+
+    /// The `get_permission_mode` request. It takes no params.
+    pub fn get_permission_mode(request_id: impl Into<String>) -> Result<Self, DesktopRpcError> {
+        Self::new(request_id, DesktopMethod::GetPermissionMode, json!({}))
+    }
+
+    /// The `set_permission_mode` request. `persist` is `None` to let the
+    /// server default it to `false`, or `Some` to send an explicit flag.
+    pub fn set_permission_mode(
+        request_id: impl Into<String>,
+        mode: PermissionMode,
+        persist: Option<bool>,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::new(
+            request_id,
+            DesktopMethod::SetPermissionMode,
+            set_permission_mode_params(mode, persist)?,
+        )
     }
 
     /// A request for a known method, validated against the id and size limits
@@ -203,6 +308,16 @@ impl DesktopResponse {
         Snapshot::from_data(self.data()?)
     }
 
+    /// The response to `get_permission_mode`.
+    pub fn permission_mode(&self) -> Result<PermissionModeState, DesktopRpcError> {
+        PermissionModeState::from_data(self.data()?)
+    }
+
+    /// The response to `set_permission_mode`.
+    pub fn set_permission_mode(&self) -> Result<SetPermissionModeResult, DesktopRpcError> {
+        SetPermissionModeResult::from_data(self.data()?)
+    }
+
     fn data(&self) -> Result<&Value, DesktopRpcError> {
         self.result
             .as_ref()
@@ -216,6 +331,15 @@ pub struct DesktopEvent {
     pub seq: u64,
     pub event: String,
     pub data: Value,
+}
+
+impl DesktopEvent {
+    /// Decode the data of a `permission_mode_changed` event. Like the other
+    /// typed accessors it decodes the data as-is; an event of another name
+    /// simply fails to fit the shape.
+    pub fn permission_mode_changed(&self) -> Result<PermissionModeChanged, DesktopRpcError> {
+        PermissionModeChanged::from_data(&self.data)
+    }
 }
 
 /// A record decoded from the Desktop widget.
@@ -311,6 +435,61 @@ fn name_list(data: &Value, field: &'static str) -> Result<Vec<String>, DesktopRp
     Ok(names)
 }
 
+/// A required permission mode field of a data document.
+fn permission_mode_field(
+    data: &Value,
+    field: &'static str,
+) -> Result<PermissionMode, DesktopRpcError> {
+    data.get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| DesktopRpcError::MalformedPayload(format!("{field} must be a mode string")))?
+        .parse()
+}
+
+/// A required boolean field of a data document.
+fn bool_field(data: &Value, field: &'static str) -> Result<bool, DesktopRpcError> {
+    data.get(field)
+        .and_then(Value::as_bool)
+        .ok_or_else(|| DesktopRpcError::MalformedPayload(format!("{field} must be a boolean")))
+}
+
+/// A required string field of a data document.
+fn string_field(data: &Value, field: &'static str) -> Result<String, DesktopRpcError> {
+    data.get(field)
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| DesktopRpcError::MalformedPayload(format!("{field} must be a string")))
+}
+
+/// An optional `{ code, message }` error object of a data document, such as
+/// the `persist_error` of a `set_permission_mode` response.
+fn optional_error_field(
+    data: &Value,
+    field: &'static str,
+) -> Result<Option<DesktopErrorInfo>, DesktopRpcError> {
+    match data.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(object)) => {
+            let code = object
+                .get("code")
+                .and_then(Value::as_str)
+                .filter(|code| !code.is_empty())
+                .ok_or_else(|| DesktopRpcError::MalformedPayload(format!("{field} has no code")))?;
+            let message = object
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            Ok(Some(DesktopErrorInfo {
+                code: code.to_string(),
+                message: message.to_string(),
+            }))
+        }
+        Some(_) => Err(DesktopRpcError::MalformedPayload(format!(
+            "{field} must be an error object"
+        ))),
+    }
+}
+
 /// The decoded `get_snapshot` data.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Snapshot {
@@ -334,6 +513,74 @@ impl Snapshot {
                 DesktopRpcError::MalformedPayload("snapshot has no state object".into())
             })?;
         Ok(Self { sequence, state })
+    }
+}
+
+/// The live permission state read by `get_permission_mode`: the session mode
+/// in effect now and the trusted default a new primary session would start
+/// from. Both are the server's actual state, never an echo of a request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionModeState {
+    pub mode: PermissionMode,
+    pub default_mode: PermissionMode,
+}
+
+impl PermissionModeState {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            mode: permission_mode_field(data, "mode")?,
+            default_mode: permission_mode_field(data, "default_mode")?,
+        })
+    }
+}
+
+/// The actual state after `set_permission_mode`. `mode` and `default_mode`
+/// are re-read from the owner; `persisted` reports whether the request saved
+/// the default; `changed` reports whether either value moved. `persist_error`
+/// is present only when a requested save failed, and the live change stays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetPermissionModeResult {
+    pub mode: PermissionMode,
+    pub default_mode: PermissionMode,
+    pub persisted: bool,
+    pub changed: bool,
+    pub persist_error: Option<DesktopErrorInfo>,
+}
+
+impl SetPermissionModeResult {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            mode: permission_mode_field(data, "mode")?,
+            default_mode: permission_mode_field(data, "default_mode")?,
+            persisted: bool_field(data, "persisted")?,
+            changed: bool_field(data, "changed")?,
+            persist_error: optional_error_field(data, "persist_error")?,
+        })
+    }
+}
+
+/// The data of a `permission_mode_changed` event: the change the server just
+/// applied. `source` is `desktop` because this slice only publishes changes
+/// it made itself; other session changes are visible through
+/// `get_permission_mode` but do not emit this event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionModeChanged {
+    pub mode: PermissionMode,
+    pub previous_mode: PermissionMode,
+    pub default_mode: PermissionMode,
+    pub persisted: bool,
+    pub source: String,
+}
+
+impl PermissionModeChanged {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            mode: permission_mode_field(data, "mode")?,
+            previous_mode: permission_mode_field(data, "previous_mode")?,
+            default_mode: permission_mode_field(data, "default_mode")?,
+            persisted: bool_field(data, "persisted")?,
+            source: string_field(data, "source")?,
+        })
     }
 }
 
@@ -426,16 +673,36 @@ impl DesktopSession {
     /// responses are correlated by id, but a serial client keeps the failure
     /// modes obvious.
     pub fn issue(&mut self, method: DesktopMethod) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_with(method, json!({}))
+    }
+
+    /// Issue `set_permission_mode` with its typed params. `get_permission_mode`
+    /// has no params and is issued with [`Self::issue`].
+    pub fn issue_set_permission_mode(
+        &mut self,
+        mode: PermissionMode,
+        persist: Option<bool>,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_with(
+            DesktopMethod::SetPermissionMode,
+            set_permission_mode_params(mode, persist)?,
+        )
+    }
+
+    /// A new request with a fresh id; `params` is built by the typed callers
+    /// above, never from app-supplied JSON.
+    fn issue_with(
+        &mut self,
+        method: DesktopMethod,
+        params: Value,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
         if let Some(pending) = &self.pending {
             return Err(DesktopRpcError::RequestInFlight {
                 request_id: pending.request_id.clone(),
             });
         }
-        let request = DesktopRequest::new(
-            format!("desktop-{}", self.next_request_id),
-            method,
-            json!({}),
-        )?;
+        let request =
+            DesktopRequest::new(format!("desktop-{}", self.next_request_id), method, params)?;
         self.next_request_id += 1;
         self.pending = Some(Pending {
             request_id: request.request_id().to_string(),
@@ -658,6 +925,8 @@ pub enum DesktopRpcError {
     InvalidRequestId { units: usize },
     /// A method this client does not implement.
     UnsupportedMethod(String),
+    /// A permission mode the wire does not define.
+    InvalidPermissionMode(String),
     /// `params` is not a JSON object.
     ParamsNotObject,
     /// The encoded inner request exceeds [`MAX_REQUEST_BYTES`].
@@ -706,6 +975,9 @@ impl fmt::Display for DesktopRpcError {
             ),
             Self::UnsupportedMethod(method) => {
                 write!(formatter, "unsupported desktop method: {method}")
+            }
+            Self::InvalidPermissionMode(mode) => {
+                write!(formatter, "unknown desktop permission mode: {mode}")
             }
             Self::ParamsNotObject => {
                 formatter.write_str("desktop request params must be an object")
