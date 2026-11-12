@@ -332,6 +332,8 @@ pub(in crate::features::session) mod desktop {
         pending_resync: bool,
         /// Live subagents and background jobs over the same channel.
         supervision: supervision::Agents,
+        /// Provider subscription usage over the same channel.
+        subscription: subscription::Subscription,
     }
 
     impl Default for Desktop {
@@ -351,6 +353,7 @@ pub(in crate::features::session) mod desktop {
                 generation: 0,
                 pending_resync: false,
                 supervision: supervision::Agents::default(),
+                subscription: subscription::Subscription::default(),
             }
         }
 
@@ -366,6 +369,7 @@ pub(in crate::features::session) mod desktop {
             self.generation += 1;
             self.pending_resync = false;
             self.supervision.reset();
+            self.subscription.reset(&mut self.session);
         }
 
         /// The backend is ready and Pi listed (or did not list) the extension's
@@ -425,7 +429,8 @@ pub(in crate::features::session) mod desktop {
                     Some(DesktopMethod::Capabilities) => match response.capabilities() {
                         Ok(capabilities) => {
                             self.capabilities = Some(capabilities.clone());
-                            self.supervision.set_capabilities(capabilities);
+                            self.supervision.set_capabilities(capabilities.clone());
+                            self.subscription.set_capabilities(capabilities);
                             Applied {
                                 sends: self.issue(DesktopMethod::GetSnapshot, Step::Snapshot),
                                 report: None,
@@ -446,14 +451,17 @@ pub(in crate::features::session) mod desktop {
                         }
                         Err(error) => self.unavailable(Report::Snapshot(error)),
                     },
-                    // The permission and supervision methods are served by
-                    // their own slices; this channel only probes and sequences.
+                    // The permission, supervision and subscription methods are
+                    // served by their own slices; this channel only probes and
+                    // sequences.
                     Some(DesktopMethod::GetPermissionMode)
                     | Some(DesktopMethod::SetPermissionMode)
                     | Some(DesktopMethod::ListSubagents)
                     | Some(DesktopMethod::ListJobs)
                     | Some(DesktopMethod::CancelSubagent)
-                    | Some(DesktopMethod::CancelJob) => Applied::default(),
+                    | Some(DesktopMethod::CancelJob)
+                    | Some(DesktopMethod::GetSubscriptionUsage)
+                    | Some(DesktopMethod::RefreshSubscriptionUsage) => Applied::default(),
                     None => Applied::default(),
                 },
                 Ok(Some(DesktopRecord::Event(event))) => {
@@ -627,6 +635,49 @@ pub(in crate::features::session) mod desktop {
             &mut self,
         ) -> Option<supervision::CancelTarget> {
             self.supervision.take_cancel_target()
+        }
+
+        /// The subscription slice's snapshot, as the Usage screen reads it.
+        pub(in crate::features::session) fn subscription_snapshot(&self) -> subscription::Snapshot {
+            self.subscription.snapshot()
+        }
+
+        /// Ask the server for the whole-account subscription usage once.
+        pub(in crate::features::session) fn subscription_seed(&mut self) -> subscription::Applied {
+            self.subscription.seed(&mut self.session)
+        }
+
+        /// Refresh the whole-account subscription usage.
+        pub(in crate::features::session) fn subscription_refresh(
+            &mut self,
+        ) -> subscription::Applied {
+            self.subscription.refresh(&mut self.session)
+        }
+
+        /// One incoming UI request for the subscription slice.
+        pub(in crate::features::session) fn subscription_apply(
+            &mut self,
+            request: &UiRequest,
+        ) -> subscription::Applied {
+            self.subscription.apply(&mut self.session, request)
+        }
+
+        /// The pending timeout for a subscription request.
+        pub(in crate::features::session) fn subscription_expire(
+            &mut self,
+            generation: u64,
+        ) -> subscription::Applied {
+            self.subscription.expire(&mut self.session, generation)
+        }
+
+        /// Pi answered the outer prompt of a subscription request.
+        pub(in crate::features::session) fn subscription_outer(
+            &mut self,
+            generation: u64,
+            handled: bool,
+        ) -> subscription::Applied {
+            self.subscription
+                .outer(&mut self.session, generation, handled)
         }
 
         /// Stop asking this backend and say why once: the channel is unusable
@@ -1774,6 +1825,482 @@ pub(in crate::features::session) mod desktop {
             }
         }
     }
+
+    /// Gentle Desktop's provider subscription usage in one tab.
+    ///
+    /// When the backend's `capabilities` advertise `get_subscription_usage`,
+    /// the Usage screen reads the whole-account snapshot through this slice
+    /// and refreshes it with `refresh_subscription_usage`. `rate_limit`
+    /// events reconcile per-provider snapshots — Claude's 5h/week response
+    /// headers included — so those windows finally arrive in the app. It
+    /// borrows the parent's [`DesktopSession`], so probe, permission,
+    /// supervision and subscription requests share one id space, one pending
+    /// slot and one event baseline.
+    ///
+    /// The slice is pure RPC state: it never reads `auth.json`, resolves a
+    /// `$VAR`/`!command`, builds a bearer header, or calls a provider API.
+    /// When the peer does not offer the methods, the Usage screen keeps the
+    /// legacy `auth.json` path; any other failure here never falls back to it.
+    pub(in crate::features::session) mod subscription {
+        use pi_rpc::UiRequest;
+        use pi_rpc::desktop_rpc::{
+            Capabilities, DesktopEvent, DesktopMethod, DesktopRecord, DesktopResponse,
+            DesktopRpcError, DesktopSession, ProviderUsage, UsageStatus,
+        };
+
+        use super::Send;
+
+        /// The wire name of the only event this slice applies.
+        pub(in crate::features::session) const RATE_LIMIT: &str = "rate_limit";
+
+        /// What one decision produced: the requests to send, and a failure the
+        /// tab shows through its report path.
+        #[derive(Debug, Default)]
+        pub(in crate::features::session) struct Applied {
+            pub(in crate::features::session) sends: Vec<Send>,
+            pub(in crate::features::session) report: Option<Report>,
+        }
+
+        /// Why a subscription request stopped or what it surfaced. The first
+        /// two variants are the legacy-fallback signals for the Usage screen;
+        /// every other variant leaves the snapshot unchanged and never
+        /// triggers a direct provider API call.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub(in crate::features::session) enum Report {
+            /// The extension does not advertise the method at all.
+            Unsupported,
+            /// The server answered `unsupported_method` for a method its
+            /// capabilities claimed.
+            UnsupportedMethod,
+            /// Capabilities are not known yet: the peer may still offer the
+            /// method, so this is not a legacy-fallback signal.
+            NotReady,
+            /// The request timed out before the server answered.
+            Timeout,
+            /// A transport, server or decoding failure.
+            Failure(DesktopRpcError),
+            /// A gap in the event sequence: events were lost, so the channel
+            /// must resync on a fresh snapshot. The record was already
+            /// accepted, so the wiring must not accept it again.
+            OutOfOrderSequence,
+        }
+
+        impl Report {
+            /// What the conversation says about it.
+            pub(in crate::features::session) fn message(&self) -> String {
+                match self {
+                    Self::Unsupported | Self::UnsupportedMethod => {
+                        "This Gentle Shell does not support reading subscription usage from Desktop."
+                            .to_string()
+                    }
+                    Self::NotReady => {
+                        "Gentle Desktop is still loading; try again in a moment.".to_string()
+                    }
+                    Self::Timeout => "The subscription usage request timed out.".to_string(),
+                    Self::Failure(error) => {
+                        format!("The subscription usage request failed ({error}).")
+                    }
+                    Self::OutOfOrderSequence => {
+                        "Gentle Desktop events were lost; resyncing subscription usage.".to_string()
+                    }
+                }
+            }
+
+            /// Only these two mean the Usage screen keeps its legacy `auth.json`
+            /// path; every other failure is shown honestly with no fallback.
+            pub(in crate::features::session) fn is_legacy(&self) -> bool {
+                matches!(self, Self::Unsupported | Self::UnsupportedMethod)
+            }
+        }
+
+        /// The slice's state as the Usage screen reads it. Plain data on
+        /// purpose: the screen decides how to render, never this slice.
+        #[derive(Debug, Clone, PartialEq)]
+        pub(crate) struct Snapshot {
+            pub(crate) providers: Vec<ProviderUsage>,
+            pub(crate) legacy: bool,
+            pub(crate) not_ready: bool,
+            pub(crate) pending: bool,
+            pub(crate) error: Option<String>,
+        }
+
+        pub(in crate::features::session) struct Subscription {
+            capabilities: Option<Capabilities>,
+            /// The last good providers, reconciled by provider id.
+            providers: Vec<ProviderUsage>,
+            /// A `get_subscription_usage` was issued for this backend.
+            seeded: bool,
+            /// A get/refresh request issued by this slice is in flight.
+            pending: bool,
+            /// The last failure, cleared by a successful answer.
+            report: Option<Report>,
+            /// Bumped per request, so an old timer cannot drop a newer one.
+            generation: u64,
+        }
+
+        impl Default for Subscription {
+            fn default() -> Self {
+                Self::new()
+            }
+        }
+
+        impl Subscription {
+            pub(in crate::features::session) fn new() -> Self {
+                Self {
+                    capabilities: None,
+                    providers: Vec::new(),
+                    seeded: false,
+                    pending: false,
+                    report: None,
+                    generation: 0,
+                }
+            }
+
+            /// Adopt the peer's capabilities once the probe completes.
+            pub(in crate::features::session) fn set_capabilities(
+                &mut self,
+                capabilities: Capabilities,
+            ) {
+                self.capabilities = Some(capabilities);
+            }
+
+            /// What the extension offers, when the probe has said.
+            #[allow(dead_code)]
+            pub(in crate::features::session) fn capabilities(&self) -> Option<&Capabilities> {
+                self.capabilities.as_ref()
+            }
+
+            /// The state the Usage screen renders from.
+            pub(in crate::features::session) fn snapshot(&self) -> Snapshot {
+                Snapshot {
+                    providers: self.providers.clone(),
+                    legacy: self.legacy(),
+                    not_ready: self.capabilities.is_none(),
+                    pending: self.pending,
+                    error: self
+                        .report
+                        .as_ref()
+                        .filter(|report| !report.is_legacy() && !matches!(report, Report::NotReady))
+                        .map(Report::message),
+                }
+            }
+
+            /// Whether the peer is known to lack the methods, or refused one it
+            /// advertised: the legacy-fallback signal for the Usage screen.
+            fn legacy(&self) -> bool {
+                match &self.report {
+                    Some(Report::UnsupportedMethod) => true,
+                    _ => self.capabilities.as_ref().is_some_and(|capabilities| {
+                        !capabilities.supports(DesktopMethod::GetSubscriptionUsage)
+                    }),
+                }
+            }
+
+            /// Ask the server for the whole-account snapshot once per backend.
+            /// It waits for any in-flight request, so the probe and the other
+            /// slices never issue two requests at once.
+            pub(in crate::features::session) fn seed(
+                &mut self,
+                session: &mut DesktopSession,
+            ) -> Applied {
+                if self.seeded {
+                    return Applied::default();
+                }
+                let Some(capabilities) = &self.capabilities else {
+                    return Applied {
+                        report: Some(Report::NotReady),
+                        ..Applied::default()
+                    };
+                };
+                if !capabilities.supports(DesktopMethod::GetSubscriptionUsage) {
+                    return Applied {
+                        report: Some(Report::Unsupported),
+                        ..Applied::default()
+                    };
+                }
+                if session.pending().is_some() {
+                    return Applied::default();
+                }
+                self.seeded = true;
+                self.get(session)
+            }
+
+            /// Fetch the whole-account snapshot (`get_subscription_usage`).
+            pub(in crate::features::session) fn get(
+                &mut self,
+                session: &mut DesktopSession,
+            ) -> Applied {
+                self.issue(session, DesktopMethod::GetSubscriptionUsage)
+            }
+
+            /// Refresh the whole-account snapshot (`refresh_subscription_usage`).
+            pub(in crate::features::session) fn refresh(
+                &mut self,
+                session: &mut DesktopSession,
+            ) -> Applied {
+                self.issue(session, DesktopMethod::RefreshSubscriptionUsage)
+            }
+
+            fn issue(&mut self, session: &mut DesktopSession, method: DesktopMethod) -> Applied {
+                let Some(capabilities) = &self.capabilities else {
+                    return Applied {
+                        report: Some(Report::NotReady),
+                        ..Applied::default()
+                    };
+                };
+                if !capabilities.supports(method) {
+                    return Applied {
+                        report: Some(Report::Unsupported),
+                        ..Applied::default()
+                    };
+                }
+                let request = match method {
+                    DesktopMethod::GetSubscriptionUsage => {
+                        session.issue_get_subscription_usage(None)
+                    }
+                    DesktopMethod::RefreshSubscriptionUsage => {
+                        session.issue_refresh_subscription_usage(None)
+                    }
+                    _ => unreachable!("subscription only issues its two methods"),
+                };
+                let request = match request {
+                    Ok(request) => request,
+                    Err(error) => return self.failure(error),
+                };
+                self.generation += 1;
+                self.pending = true;
+                Applied {
+                    sends: vec![Send {
+                        request,
+                        generation: self.generation,
+                    }],
+                    report: None,
+                }
+            }
+
+            /// Pi answered the outer `prompt` of a subscription request.
+            pub(in crate::features::session) fn outer(
+                &mut self,
+                session: &mut DesktopSession,
+                generation: u64,
+                handled: bool,
+            ) -> Applied {
+                if handled || generation != self.generation || !owns_pending(session) {
+                    return Applied::default();
+                }
+                self.rollback(session);
+                self.report = Some(Report::Failure(DesktopRpcError::UnexpectedDisposition {
+                    disposition: None,
+                }));
+                Applied {
+                    report: self.report.clone(),
+                    ..Applied::default()
+                }
+            }
+
+            /// One incoming UI request; applies only the records this slice owns
+            /// (typed get/refresh responses and `rate_limit` events).
+            pub(in crate::features::session) fn apply(
+                &mut self,
+                session: &mut DesktopSession,
+                request: &UiRequest,
+            ) -> Applied {
+                // The session clears the pending request while correlating, so
+                // the method it answered is read first.
+                let awaiting = session.pending().map(|(_, method)| method);
+                match session.accept(request) {
+                    Ok(Some(DesktopRecord::Response(response))) => match awaiting {
+                        Some(DesktopMethod::GetSubscriptionUsage)
+                        | Some(DesktopMethod::RefreshSubscriptionUsage) => {
+                            self.apply_response(response)
+                        }
+                        _ => Applied::default(),
+                    },
+                    Ok(Some(DesktopRecord::Event(event))) => self.apply_event(event),
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync. The record was already accepted, so it is never
+                    // accepted again.
+                    Err(DesktopRpcError::OutOfOrderSequence { .. }) => Applied {
+                        report: Some(Report::OutOfOrderSequence),
+                        ..Applied::default()
+                    },
+                    // Not this protocol's widget, or a late, repeated or
+                    // malformed record: the outer channel owns resync, so this
+                    // slice only refuses to apply it.
+                    _ => Applied::default(),
+                }
+            }
+
+            /// The pending timeout for `generation` fired. The request is
+            /// dropped and the timeout is reported rather than disappearing
+            /// silently.
+            pub(in crate::features::session) fn expire(
+                &mut self,
+                session: &mut DesktopSession,
+                generation: u64,
+            ) -> Applied {
+                if generation != self.generation || !owns_pending(session) {
+                    return Applied::default();
+                }
+                self.rollback(session);
+                self.report = Some(Report::Timeout);
+                Applied {
+                    report: Some(Report::Timeout),
+                    ..Applied::default()
+                }
+            }
+
+            /// The backend was replaced or exited: nothing it said or numbered
+            /// applies. Request ids keep advancing, so a late answer can never
+            /// match a new request.
+            pub(in crate::features::session) fn reset(&mut self, session: &mut DesktopSession) {
+                session.reset();
+                self.capabilities = None;
+                self.providers.clear();
+                self.seeded = false;
+                self.pending = false;
+                self.report = None;
+                self.generation += 1;
+            }
+
+            fn emits(&self, event: &str) -> bool {
+                self.capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.emits(event))
+            }
+
+            /// A request could not be issued (one already in flight, or the
+            /// request itself failed validation).
+            fn failure(&self, error: DesktopRpcError) -> Applied {
+                Applied {
+                    report: Some(Report::Failure(error)),
+                    ..Applied::default()
+                }
+            }
+
+            /// Drop the request in flight. The generation moves, so a late
+            /// timer or disposition for the abandoned request is stale.
+            fn rollback(&mut self, session: &mut DesktopSession) {
+                session.abandon();
+                self.pending = false;
+                self.generation += 1;
+            }
+
+            fn apply_response(&mut self, response: DesktopResponse) -> Applied {
+                // The request is answered either way, so it is no longer pending.
+                self.pending = false;
+                match response.subscription_usage() {
+                    Ok(usage) => {
+                        self.providers = merge_full(&self.providers, usage.providers);
+                        self.report = None;
+                        Applied::default()
+                    }
+                    Err(DesktopRpcError::RemoteError(info))
+                        if info.code == "unsupported_method" =>
+                    {
+                        self.report = Some(Report::UnsupportedMethod);
+                        Applied {
+                            report: Some(Report::UnsupportedMethod),
+                            ..Applied::default()
+                        }
+                    }
+                    Err(error) => {
+                        self.report = Some(Report::Failure(error.clone()));
+                        Applied {
+                            report: Some(Report::Failure(error)),
+                            ..Applied::default()
+                        }
+                    }
+                }
+            }
+
+            /// A `rate_limit` event, applied only when the peer advertised that
+            /// exact name. Foreign names and unadvertised events never touch the
+            /// snapshot. The snapshots are full provider projections, so they
+            /// replace the matching provider (missing ids never drop others).
+            fn apply_event(&mut self, event: DesktopEvent) -> Applied {
+                if event.event != RATE_LIMIT {
+                    return Applied::default();
+                }
+                if !self.emits(RATE_LIMIT) {
+                    return Applied::default();
+                }
+                match event.rate_limit() {
+                    Ok(limit) => {
+                        reconcile(&mut self.providers, limit.snapshots);
+                        self.report = None;
+                        Applied::default()
+                    }
+                    Err(error) => Applied {
+                        report: Some(Report::Failure(error)),
+                        ..Applied::default()
+                    },
+                }
+            }
+        }
+
+        /// Whether the pending request is one this slice issued. The probe and
+        /// the other slices share the session, so a stale subscription timer or
+        /// disposition must not abandon their requests.
+        fn owns_pending(session: &DesktopSession) -> bool {
+            matches!(
+                session.pending().map(|(_, method)| method),
+                Some(DesktopMethod::GetSubscriptionUsage)
+                    | Some(DesktopMethod::RefreshSubscriptionUsage)
+            )
+        }
+
+        /// Replace the whole snapshot, keeping the last good limits of a
+        /// provider that reports `pending`/`stale` with none.
+        fn merge_full(
+            previous: &[ProviderUsage],
+            incoming: Vec<ProviderUsage>,
+        ) -> Vec<ProviderUsage> {
+            incoming
+                .into_iter()
+                .map(|mut provider| {
+                    retain_last_good(
+                        previous
+                            .iter()
+                            .find(|existing| existing.provider == provider.provider),
+                        &mut provider,
+                    );
+                    provider
+                })
+                .collect()
+        }
+
+        /// Upsert event snapshots into the current snapshot by provider id.
+        fn reconcile(current: &mut Vec<ProviderUsage>, snapshots: Vec<ProviderUsage>) {
+            for mut provider in snapshots {
+                retain_last_good(
+                    current
+                        .iter()
+                        .find(|existing| existing.provider == provider.provider),
+                    &mut provider,
+                );
+                if let Some(existing) = current
+                    .iter_mut()
+                    .find(|entry| entry.provider == provider.provider)
+                {
+                    *existing = provider;
+                } else {
+                    current.push(provider);
+                }
+            }
+        }
+
+        /// Keep the last good limits when a `pending`/`stale` entry carries
+        /// none: the data is still valid, just not fresh.
+        fn retain_last_good(previous: Option<&ProviderUsage>, incoming: &mut ProviderUsage) {
+            if incoming.limits.is_empty()
+                && matches!(incoming.status, UsageStatus::Pending | UsageStatus::Stale)
+                && let Some(previous) = previous.filter(|p| !p.limits.is_empty())
+            {
+                incoming.limits = previous.limits.clone();
+            }
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
@@ -1781,11 +2308,12 @@ mod tests {
     use pi_rpc::UiRequest;
     use pi_rpc::desktop_rpc::{
         Capabilities, DesktopMethod, DesktopSession, PROMPT_COMMAND, PermissionMode, SCHEMA,
-        WIDGET_KEY,
+        UsageStatus, WIDGET_KEY,
     };
     use serde_json::{Value, json};
 
     use super::desktop::permission::{self, Permission, Report as PermissionReport};
+    use super::desktop::subscription::{Report as SubscriptionReport, Subscription};
     use super::desktop::supervision::{Agents, Report as SupervisionReport};
     use super::desktop::{self, Desktop, Report, Step};
     use super::{ExtensionUi, ModelInfo, TodoIsland};
@@ -3555,5 +4083,466 @@ mod tests {
         );
         assert!(desktop.cancel_subagent_supported());
         assert!(desktop.cancel_job_supported());
+    }
+
+    // Gentle Desktop's subscription usage slice: providers and windows are
+    // built directly, so no process runs and no file or network is touched.
+
+    fn subscription_ready(events: &[&str]) -> (Subscription, DesktopSession) {
+        let mut subscription = Subscription::new();
+        subscription.set_capabilities(supervision_capabilities(
+            &["get_subscription_usage", "refresh_subscription_usage"],
+            events,
+        ));
+        (subscription, DesktopSession::new())
+    }
+
+    fn usage_response_lines(request_id: &str, providers: Value) -> Vec<String> {
+        record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": request_id,
+            "ok": true,
+            "data": {"providers": providers},
+        }))
+    }
+
+    fn provider_json(provider: &str, status: &str, limits: Value) -> Value {
+        json!({ "provider": provider, "status": status, "limits": limits })
+    }
+
+    /// Claude's 5h and weekly windows, exactly as a `rate_limit` snapshot
+    /// carries them from the response headers.
+    fn claude_provider(status: &str) -> Value {
+        json!({
+            "provider": "claude",
+            "status": status,
+            "fetchedAt": 1788600000000u64,
+            "limits": [{
+                "name": "prompts",
+                "limitReached": false,
+                "windows": [
+                    {"label": "5h", "usedPercent": 42.5, "windowSeconds": 18000, "resetAt": null},
+                    {"label": "week", "usedPercent": 10.0, "windowSeconds": 604800, "resetAt": 1789200000000u64},
+                ],
+            }],
+        })
+    }
+
+    fn rate_limit_lines(seq: u64, source: &str, snapshots: Value) -> Vec<String> {
+        record(json!({
+            "schema": SCHEMA,
+            "kind": "event",
+            "seq": seq,
+            "event": "rate_limit",
+            "data": {"source": source, "snapshots": snapshots},
+        }))
+    }
+
+    #[test]
+    fn subscription_seed_issues_get_once_and_waits_for_pending() {
+        let (mut subscription, mut session) = subscription_ready(&["rate_limit"]);
+
+        // A request in flight (the probe's snapshot, say) defers the seed.
+        let probe = session.issue(DesktopMethod::GetSnapshot).unwrap();
+        assert!(subscription.seed(&mut session).sends.is_empty());
+        session
+            .accept(&desktop_widget(snapshot_lines(probe.request_id(), 4)))
+            .unwrap();
+
+        let seeded = subscription.seed(&mut session);
+        assert_eq!(seeded.sends.len(), 1);
+        assert_eq!(
+            seeded.sends[0].request.method(),
+            DesktopMethod::GetSubscriptionUsage
+        );
+        let payload: Value = serde_json::from_str(seeded.sends[0].request.payload()).unwrap();
+        assert_eq!(payload["method"], "get_subscription_usage");
+        assert_eq!(payload["params"], json!({}));
+
+        // Seeded exactly once: a second seed sends nothing while it is pending
+        // or after it is answered. The snapshot reports the in-flight request
+        // so the screen stays on Loading rather than flashing the empty hint.
+        assert!(subscription.seed(&mut session).sends.is_empty());
+        assert!(subscription.snapshot().pending);
+        assert!(subscription.snapshot().providers.is_empty());
+        let id = seeded.sends[0].request.request_id().to_string();
+        let applied = subscription.apply(
+            &mut session,
+            &desktop_widget(usage_response_lines(
+                &id,
+                json!([provider_json("codex", "ok", json!([]))]),
+            )),
+        );
+        assert!(applied.report.is_none());
+        assert!(!subscription.snapshot().pending);
+        assert_eq!(subscription.snapshot().providers.len(), 1);
+        assert!(subscription.seed(&mut session).sends.is_empty());
+    }
+
+    #[test]
+    fn subscription_refresh_uses_the_refresh_method() {
+        let (mut subscription, mut session) = subscription_ready(&[]);
+
+        let seeded = subscription.seed(&mut session);
+        let id = seeded.sends[0].request.request_id().to_string();
+        subscription.apply(
+            &mut session,
+            &desktop_widget(usage_response_lines(&id, json!([]))),
+        );
+
+        let refreshed = subscription.refresh(&mut session);
+        assert_eq!(refreshed.sends.len(), 1);
+        assert_eq!(
+            refreshed.sends[0].request.method(),
+            DesktopMethod::RefreshSubscriptionUsage
+        );
+        let payload: Value = serde_json::from_str(refreshed.sends[0].request.payload()).unwrap();
+        assert_eq!(payload["method"], "refresh_subscription_usage");
+        assert_eq!(payload["params"], json!({}));
+    }
+
+    #[test]
+    fn subscription_decodes_every_status_into_the_snapshot() {
+        for status in UsageStatus::ALL {
+            let (mut subscription, mut session) = subscription_ready(&[]);
+            let seeded = subscription.seed(&mut session);
+            let id = seeded.sends[0].request.request_id().to_string();
+            let applied = subscription.apply(
+                &mut session,
+                &desktop_widget(usage_response_lines(
+                    &id,
+                    json!([provider_json("codex", status.as_str(), json!([]))]),
+                )),
+            );
+            assert!(applied.report.is_none(), "{status:?} should decode");
+            let snapshot = subscription.snapshot();
+            assert_eq!(snapshot.providers.len(), 1);
+            assert_eq!(snapshot.providers[0].status, status);
+        }
+    }
+
+    #[test]
+    fn subscription_keeps_last_good_limits_for_pending_and_stale() {
+        let (mut subscription, mut session) = subscription_ready(&[]);
+        let seeded = subscription.seed(&mut session);
+        let id = seeded.sends[0].request.request_id().to_string();
+        let window = json!([{
+            "label": "5h", "usedPercent": 42.5, "windowSeconds": 18000, "resetAt": null,
+        }]);
+        let limit = json!([{ "name": "prompts", "limitReached": false, "windows": window }]);
+
+        // A good read seeds the limits.
+        subscription.apply(
+            &mut session,
+            &desktop_widget(usage_response_lines(
+                &id,
+                json!([provider_json("codex", "ok", limit.clone())]),
+            )),
+        );
+        assert_eq!(subscription.snapshot().providers[0].limits.len(), 1);
+
+        // A stale read with no limits keeps the last good window, marked stale.
+        let refreshed = subscription.refresh(&mut session);
+        let id = refreshed.sends[0].request.request_id().to_string();
+        subscription.apply(
+            &mut session,
+            &desktop_widget(usage_response_lines(
+                &id,
+                json!([provider_json("codex", "stale", json!([]))]),
+            )),
+        );
+        let snapshot = subscription.snapshot();
+        assert_eq!(snapshot.providers[0].status, UsageStatus::Stale);
+        assert_eq!(snapshot.providers[0].limits.len(), 1, "last good kept");
+
+        // A pending read with no limits keeps it too.
+        let refreshed = subscription.refresh(&mut session);
+        let id = refreshed.sends[0].request.request_id().to_string();
+        subscription.apply(
+            &mut session,
+            &desktop_widget(usage_response_lines(
+                &id,
+                json!([provider_json("codex", "pending", json!([]))]),
+            )),
+        );
+        assert_eq!(
+            subscription.snapshot().providers[0].status,
+            UsageStatus::Pending
+        );
+        assert_eq!(subscription.snapshot().providers[0].limits.len(), 1);
+
+        // A failed read is shown honestly: no limits are invented.
+        let refreshed = subscription.refresh(&mut session);
+        let id = refreshed.sends[0].request.request_id().to_string();
+        subscription.apply(
+            &mut session,
+            &desktop_widget(usage_response_lines(
+                &id,
+                json!([provider_json("codex", "failed", json!([]))]),
+            )),
+        );
+        assert_eq!(
+            subscription.snapshot().providers[0].status,
+            UsageStatus::Failed
+        );
+        assert!(subscription.snapshot().providers[0].limits.is_empty());
+    }
+
+    #[test]
+    fn subscription_reconciles_claude_rate_limit_snapshots() {
+        let (mut subscription, mut session) = subscription_ready(&["rate_limit"]);
+
+        let applied = subscription.apply(
+            &mut session,
+            &desktop_widget(rate_limit_lines(
+                1,
+                "response",
+                json!([claude_provider("ok")]),
+            )),
+        );
+        assert!(applied.report.is_none());
+        let snapshot = subscription.snapshot();
+        assert_eq!(snapshot.providers.len(), 1);
+        assert_eq!(snapshot.providers[0].provider, "claude");
+        assert_eq!(snapshot.providers[0].limits.len(), 1);
+        assert_eq!(snapshot.providers[0].limits[0].windows.len(), 2);
+        assert_eq!(snapshot.providers[0].limits[0].windows[0].label, "5h");
+        assert_eq!(snapshot.providers[0].limits[0].windows[1].label, "week");
+
+        // A later event replaces the same provider by id (full projection).
+        let applied = subscription.apply(
+            &mut session,
+            &desktop_widget(rate_limit_lines(
+                2,
+                "refresh",
+                json!([provider_json("claude", "stale", json!([]))]),
+            )),
+        );
+        assert!(applied.report.is_none());
+        let snapshot = subscription.snapshot();
+        assert_eq!(snapshot.providers.len(), 1);
+        assert_eq!(snapshot.providers[0].status, UsageStatus::Stale);
+        // Last good limits are kept across the event too.
+        assert_eq!(snapshot.providers[0].limits.len(), 1);
+    }
+
+    #[test]
+    fn subscription_foreign_and_unadvertised_events_do_not_touch_the_snapshot() {
+        let (mut subscription, mut session) = subscription_ready(&["rate_limit"]);
+
+        // A foreign event name is never applied, even when it fits the shape.
+        let foreign = subscription.apply(
+            &mut session,
+            &desktop_widget(record(json!({
+                "schema": SCHEMA, "kind": "event", "seq": 1,
+                "event": "agents_update",
+                "data": {"source": "refresh", "snapshots": []},
+            }))),
+        );
+        assert!(foreign.report.is_none());
+        assert!(subscription.snapshot().providers.is_empty());
+
+        // A rate_limit event the peer never advertised is ignored too.
+        let (mut unadvertised, mut unadvertised_session) = subscription_ready(&["state_changed"]);
+        let applied = unadvertised.apply(
+            &mut unadvertised_session,
+            &desktop_widget(rate_limit_lines(
+                1,
+                "response",
+                json!([claude_provider("ok")]),
+            )),
+        );
+        assert!(applied.report.is_none());
+        assert!(unadvertised.snapshot().providers.is_empty());
+    }
+
+    #[test]
+    fn subscription_legacy_signal_is_unsupported_or_unsupported_method_only() {
+        // Capabilities known but without the method: legacy, not an error.
+        let mut missing = Subscription::new();
+        missing.set_capabilities(supervision_capabilities(&["get_snapshot"], &[]));
+        let mut missing_session = DesktopSession::new();
+        let applied = missing.seed(&mut missing_session);
+        assert!(applied.sends.is_empty());
+        assert_eq!(applied.report, Some(SubscriptionReport::Unsupported));
+        let snapshot = missing.snapshot();
+        assert!(snapshot.legacy);
+        assert!(!snapshot.not_ready);
+        assert!(snapshot.error.is_none());
+
+        // The server answers unsupported_method for a method it advertised.
+        let (mut claimed, mut claimed_session) = subscription_ready(&[]);
+        let seeded = claimed.seed(&mut claimed_session);
+        let id = seeded.sends[0].request.request_id().to_string();
+        let applied = claimed.apply(
+            &mut claimed_session,
+            &desktop_widget(error_lines(&id, "unsupported_method", "nope")),
+        );
+        assert_eq!(applied.report, Some(SubscriptionReport::UnsupportedMethod));
+        assert!(claimed.snapshot().legacy);
+        assert!(claimed.snapshot().error.is_none());
+
+        // Any other failure is neither legacy, and it surfaces as an error.
+        let (mut failed, mut failed_session) = subscription_ready(&[]);
+        let seeded = failed.seed(&mut failed_session);
+        let id = seeded.sends[0].request.request_id().to_string();
+        let applied = failed.apply(
+            &mut failed_session,
+            &desktop_widget(record(json!({
+                "schema": SCHEMA, "kind": "response", "requestId": id, "ok": true,
+                "data": {"providers": "nope"},
+            }))),
+        );
+        assert!(matches!(
+            applied.report,
+            Some(SubscriptionReport::Failure(_))
+        ));
+        let snapshot = failed.snapshot();
+        assert!(!snapshot.legacy);
+        assert!(snapshot.error.is_some());
+    }
+
+    #[test]
+    fn subscription_issues_only_rpc_until_unsupported_is_confirmed() {
+        let (mut subscription, mut session) = subscription_ready(&[]);
+
+        // Before any confirmation, the slice's only effect is the RPC get
+        // request; it never issues a direct provider API call.
+        let seeded = subscription.seed(&mut session);
+        assert_eq!(seeded.sends.len(), 1);
+        assert_eq!(
+            seeded.sends[0].request.method(),
+            DesktopMethod::GetSubscriptionUsage
+        );
+        assert!(!subscription.snapshot().legacy);
+        let id = seeded.sends[0].request.request_id().to_string();
+
+        // The unsupported_method answer is what flips the legacy signal; it is
+        // not an error, so the Usage screen switches once and then stays there.
+        let applied = subscription.apply(
+            &mut session,
+            &desktop_widget(error_lines(&id, "unsupported_method", "nope")),
+        );
+        assert_eq!(applied.report, Some(SubscriptionReport::UnsupportedMethod));
+        let snapshot = subscription.snapshot();
+        assert!(snapshot.legacy);
+        assert!(snapshot.error.is_none());
+    }
+
+    #[test]
+    fn subscription_without_capabilities_is_not_ready_not_legacy() {
+        let mut subscription = Subscription::new();
+        let mut session = DesktopSession::new();
+        let applied = subscription.seed(&mut session);
+        assert!(applied.sends.is_empty());
+        assert_eq!(applied.report, Some(SubscriptionReport::NotReady));
+        let snapshot = subscription.snapshot();
+        assert!(snapshot.not_ready);
+        assert!(!snapshot.legacy);
+
+        // Refresh without capabilities is also NotReady.
+        let applied = subscription.refresh(&mut session);
+        assert_eq!(applied.report, Some(SubscriptionReport::NotReady));
+    }
+
+    #[test]
+    fn subscription_reset_forgets_state_and_a_late_response_is_benign() {
+        let (mut subscription, mut session) = subscription_ready(&["rate_limit"]);
+        let seeded = subscription.seed(&mut session);
+        let id = seeded.sends[0].request.request_id().to_string();
+        subscription.apply(
+            &mut session,
+            &desktop_widget(usage_response_lines(&id, json!([claude_provider("ok")]))),
+        );
+        assert_eq!(subscription.snapshot().providers.len(), 1);
+
+        subscription.reset(&mut session);
+        assert!(subscription.snapshot().providers.is_empty());
+        assert!(subscription.snapshot().not_ready);
+
+        // The old answer arrives late: not applied, never reported.
+        let applied = subscription.apply(
+            &mut session,
+            &desktop_widget(usage_response_lines(
+                &id,
+                json!([claude_provider("failed")]),
+            )),
+        );
+        assert!(applied.sends.is_empty() && applied.report.is_none());
+        assert!(subscription.snapshot().providers.is_empty());
+    }
+
+    #[test]
+    fn subscription_timeout_and_unhandled_outer_roll_back() {
+        let (mut subscription, mut session) = subscription_ready(&[]);
+        let seeded = subscription.seed(&mut session);
+        let generation = seeded.sends[0].generation;
+
+        // A stale timer cannot drop a newer request.
+        assert!(
+            subscription
+                .expire(&mut session, generation.wrapping_sub(1))
+                .sends
+                .is_empty()
+        );
+
+        // Its own timer drops the request and reports the timeout.
+        let timed_out = subscription.expire(&mut session, generation);
+        assert!(timed_out.sends.is_empty());
+        assert_eq!(timed_out.report, Some(SubscriptionReport::Timeout));
+        assert!(subscription.snapshot().error.is_some());
+
+        // A rejected outer prompt rolls back and reports a transport failure.
+        let refreshed = subscription.refresh(&mut session);
+        let generation = refreshed.sends[0].generation;
+        let applied = subscription.outer(&mut session, generation, false);
+        assert!(matches!(
+            applied.report,
+            Some(SubscriptionReport::Failure(_))
+        ));
+    }
+
+    #[test]
+    fn subscription_refuses_a_second_request_while_one_is_in_flight() {
+        let (mut subscription, mut session) = subscription_ready(&[]);
+        let seeded = subscription.seed(&mut session);
+        assert_eq!(seeded.sends.len(), 1);
+
+        let second = subscription.refresh(&mut session);
+        assert!(second.sends.is_empty());
+        assert!(matches!(
+            second.report,
+            Some(SubscriptionReport::Failure(_))
+        ));
+    }
+
+    #[test]
+    fn subscription_gap_signals_out_of_order_without_fabricating_state() {
+        let mut desktop = probed(4);
+        let mut subscription = Subscription::new();
+        subscription.set_capabilities(supervision_capabilities(
+            &["get_subscription_usage", "refresh_subscription_usage"],
+            &["rate_limit"],
+        ));
+
+        // An event that skipped a sequence surfaces the gap instead of applying.
+        let applied = subscription.apply(
+            desktop.session(),
+            &desktop_widget(rate_limit_lines(
+                6,
+                "response",
+                json!([claude_provider("ok")]),
+            )),
+        );
+        assert!(applied.sends.is_empty());
+        assert_eq!(applied.report, Some(SubscriptionReport::OutOfOrderSequence));
+        assert!(subscription.snapshot().providers.is_empty());
+
+        // The channel owns the recovery: exactly one get_snapshot.
+        let sends = desktop.resync();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].request.method(), DesktopMethod::GetSnapshot);
+        assert!(desktop.resync().is_empty());
     }
 }

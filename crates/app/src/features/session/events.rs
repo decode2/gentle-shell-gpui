@@ -344,6 +344,19 @@ impl SessionView {
                 }
                 self.sync_supervision(cx);
             }
+            DesktopRoute::Subscription => {
+                let applied = self.desktop.subscription_apply(request);
+                match applied.report.as_ref() {
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync. The record was already accepted, so it is never
+                    // accepted again.
+                    Some(desktop::subscription::Report::OutOfOrderSequence) => {
+                        let sends = self.desktop.resync();
+                        self.send_desktop(sends, cx);
+                    }
+                    _ => self.apply_subscription(applied, cx),
+                }
+            }
             DesktopRoute::Channel => {
                 let applied = self.desktop.ui(request);
                 self.apply_desktop(applied, cx);
@@ -502,12 +515,14 @@ impl SessionView {
 
 /// Which slice owns one incoming Desktop record. A record is routed to the
 /// permission slice only when it is a permission response or the advertised
-/// permission event; everything else belongs to the channel (probe, resync,
-/// and every benign foreign/late record). The shared session then accepts the
-/// record exactly once, in the slice that owns it.
+/// permission event; supervision owns its responses and events; subscription
+/// owns its responses and `rate_limit`; everything else belongs to the channel
+/// (probe, resync, and every benign foreign/late record). The shared session
+/// then accepts the record exactly once, in the slice that owns it.
 enum DesktopRoute {
     Permission,
     Supervision,
+    Subscription,
     Channel,
 }
 
@@ -530,6 +545,12 @@ fn route_desktop_widget(
                     | Some(DesktopMethod::CancelJob)
             ) {
                 DesktopRoute::Supervision
+            } else if matches!(
+                pending,
+                Some(DesktopMethod::GetSubscriptionUsage)
+                    | Some(DesktopMethod::RefreshSubscriptionUsage)
+            ) {
+                DesktopRoute::Subscription
             } else {
                 DesktopRoute::Channel
             }
@@ -544,6 +565,11 @@ fn route_desktop_widget(
                 || event.event == desktop::supervision::JOBS_UPDATE =>
         {
             DesktopRoute::Supervision
+        }
+        Ok(Some(DesktopRecord::Event(event)))
+            if event.event == desktop::subscription::RATE_LIMIT =>
+        {
+            DesktopRoute::Subscription
         }
         _ => DesktopRoute::Channel,
     }
@@ -832,6 +858,38 @@ mod tests {
         assert!(matches!(
             route_desktop_widget(&decoded, None),
             DesktopRoute::Channel
+        ));
+
+        // Subscription responses and the advertised `rate_limit` event go to
+        // the subscription slice.
+        let usage_response = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": "desktop-1",
+            "ok": true,
+            "data": {"providers": []},
+        }))));
+        let decoded = decode_widget(&usage_response);
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::GetSubscriptionUsage)),
+            DesktopRoute::Subscription
+        ));
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::RefreshSubscriptionUsage)),
+            DesktopRoute::Subscription
+        ));
+
+        let rate_limit_event = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "event",
+            "seq": 1,
+            "event": "rate_limit",
+            "data": {"source": "response", "snapshots": []},
+        }))));
+        let decoded = decode_widget(&rate_limit_event);
+        assert!(matches!(
+            route_desktop_widget(&decoded, None),
+            DesktopRoute::Subscription
         ));
 
         // A cleared widget and a broken record are not this protocol's answer:

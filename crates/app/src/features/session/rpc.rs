@@ -13,6 +13,7 @@ use pi_rpc::desktop_rpc::DesktopMethod;
 use serde_json::{Value, json};
 
 use super::state::desktop::permission::Applied as PermissionApplied;
+use super::state::desktop::subscription::Applied as SubscriptionApplied;
 use super::state::desktop::supervision::Applied as SupervisionApplied;
 use super::state::desktop::{self, Applied as DesktopApplied, Send as DesktopSend};
 use super::state::{BackendStatus, ModelInfo};
@@ -123,13 +124,52 @@ impl SessionView {
         self.send_desktop(applied.sends, cx);
     }
 
+    /// Act on a subscription decision: say what failed through the tab's report
+    /// path (legacy signals are the Usage screen's concern, not a session
+    /// error), then send whatever the usage slice asked for.
+    pub(super) fn apply_subscription(
+        &mut self,
+        applied: SubscriptionApplied,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(report) = &applied.report
+            && !report.is_legacy()
+        {
+            self.transcript
+                .notice(NoticeLevel::Warning, report.message());
+            cx.notify();
+        }
+        self.send_desktop(applied.sends, cx);
+    }
+
+    /// The Usage screen's snapshot of this session's subscription usage. Pure
+    /// read: the screen decides how to render, never this session.
+    pub(crate) fn subscription_snapshot(&self) -> super::state::desktop::subscription::Snapshot {
+        self.desktop.subscription_snapshot()
+    }
+
+    /// Ask the server for the whole-account subscription usage once (the Usage
+    /// screen opened). Idempotent: a later call is a no-op.
+    pub(crate) fn subscription_seed(&mut self, cx: &mut Context<Self>) {
+        let applied = self.desktop.subscription_seed();
+        self.send_desktop(applied.sends, cx);
+    }
+
+    /// Refresh the whole-account subscription usage (the Usage screen's
+    /// refresh button).
+    pub(crate) fn subscription_refresh(&mut self, cx: &mut Context<Self>) {
+        let applied = self.desktop.subscription_refresh();
+        self.send_desktop(applied.sends, cx);
+    }
+
     /// Reset the Gentle Desktop channel when the conversation changes on the
     /// same backend (new/open session). It forgets the old session's pending
     /// request and event baseline (without rewinding request ids) and returns
     /// the channel to Idle, so the `refresh_state` that follows re-probes
     /// capabilities and the supervision lists re-seed exactly once behind it.
     /// The permission slice keeps its confirmed mode; its capabilities are
-    /// refreshed by the same re-probe.
+    /// refreshed by the same re-probe. The subscription slice is reset with
+    /// the channel.
     fn reset_desktop_channel(&mut self) {
         self.desktop.reset();
     }
@@ -239,6 +279,10 @@ impl SessionView {
                 let applied = self.desktop.supervision_expire(generation);
                 self.apply_supervision(applied, cx);
             }
+            DesktopMethod::GetSubscriptionUsage | DesktopMethod::RefreshSubscriptionUsage => {
+                let applied = self.desktop.subscription_expire(generation);
+                self.apply_subscription(applied, cx);
+            }
         }
     }
 
@@ -268,6 +312,10 @@ impl SessionView {
             | DesktopMethod::CancelJob => {
                 let applied = self.desktop.supervision_outer(generation, handled);
                 self.apply_supervision(applied, cx);
+            }
+            DesktopMethod::GetSubscriptionUsage | DesktopMethod::RefreshSubscriptionUsage => {
+                let applied = self.desktop.subscription_outer(generation, handled);
+                self.apply_subscription(applied, cx);
             }
         }
     }

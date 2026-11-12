@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Result, anyhow, ensure};
 use pi_rpc::desktop_rpc::{
     Capabilities, DesktopMethod, DesktopRecord, DesktopRequest, DesktopResponse, DesktopSession,
-    PROMPT_COMMAND, PermissionMode, SCHEMA, Snapshot, WIDGET_KEY,
+    PROMPT_COMMAND, PermissionMode, SCHEMA, Snapshot, UsageRefresh, WIDGET_KEY,
 };
 use pi_rpc::{Incoming, LaunchSpec, PiProcess, UiMethod, UiRequest};
 use serde_json::{Value, json};
@@ -34,6 +34,9 @@ use serde_json::{Value, json};
 /// How long one Desktop roundtrip may take before the probe gives up. The
 /// first request also covers backend boot, so this is deliberately generous.
 const STEP_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long to watch for an event that must NOT arrive (a `rate_limit` after
+/// an `unsupported` refresh). Short: its absence is immediate.
+const NO_EVENT_WINDOW: Duration = Duration::from_secs(2);
 /// Grace handed to `PiProcess::shutdown` before the process tree is killed.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
@@ -372,6 +375,82 @@ impl Probe {
         self.typed_roundtrip(request)
     }
 
+    /// Issue `refresh_subscription_usage` for one provider and wait for its
+    /// correlated response, failing if a `rate_limit` event appears either
+    /// before or shortly after the answer. The child environment is fully
+    /// offline, so no provider traffic happens.
+    fn typed_refresh_subscription_usage(&mut self, provider: &str) -> Result<DesktopResponse> {
+        let request = self
+            .session
+            .issue_refresh_subscription_usage(Some(provider))
+            .map_err(|e| anyhow!("issue refresh_subscription_usage: {e}"))?;
+        let request_id = request.request_id().to_string();
+        let outer = pollster::block_on(self.process()?.request(request.prompt_command()))
+            .map_err(|e| anyhow!("outer prompt for {request_id} failed: {e:#}"))?;
+        let disposition = outer.data.get("disposition").and_then(Value::as_str);
+        ensure!(
+            disposition == Some("handled"),
+            "outer prompt for {request_id} was not handled (disposition {disposition:?})"
+        );
+        let deadline = Instant::now() + STEP_TIMEOUT;
+        let response = loop {
+            match self.next_desktop_record_until(deadline)? {
+                DesktopRecord::Response(response) => {
+                    ensure!(
+                        response.request_id() == Some(request_id.as_str()),
+                        "correlation mismatch: expected {request_id}, got {:?}",
+                        response.request_id()
+                    );
+                    break response;
+                }
+                DesktopRecord::Event(event) => {
+                    ensure!(
+                        event.event != "rate_limit",
+                        "unexpected rate_limit event during refresh: {event:?}"
+                    );
+                }
+            }
+        };
+        self.assert_no_rate_limit_event(Instant::now() + NO_EVENT_WINDOW)?;
+        Ok(response)
+    }
+
+    /// Assert that no Desktop `rate_limit` event is published before
+    /// `deadline`. Other records are consumed, and Desktop records still route
+    /// through the session so its event sequence stays in step.
+    fn assert_no_rate_limit_event(&mut self, deadline: Instant) -> Result<()> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Ok(());
+            }
+            match self.incoming.next(remaining) {
+                PumpItem::Message(Incoming::Stderr(line)) => {
+                    self.stderr.push(line.clone());
+                    eprintln!("[backend stderr] {line}");
+                }
+                PumpItem::Message(Incoming::Exited(code)) => {
+                    anyhow::bail!("backend exited ({code:?})")
+                }
+                PumpItem::Message(Incoming::Ui(ui)) => match self.session.accept(&ui)? {
+                    Some(DesktopRecord::Event(event)) => {
+                        ensure!(
+                            event.event != "rate_limit",
+                            "unexpected rate_limit event: {event:?}"
+                        );
+                    }
+                    Some(DesktopRecord::Response(_)) => {
+                        anyhow::bail!("unexpected response while watching for rate_limit")
+                    }
+                    None => {}
+                },
+                PumpItem::Message(Incoming::Event(_)) => continue,
+                PumpItem::Closed => anyhow::bail!("backend closed"),
+                PumpItem::Timeout => return Ok(()),
+            }
+        }
+    }
+
     /// A raw Desktop request (a method the typed adapter does not name yet),
     /// correlated by its own monotonic `probe-N` id.
     fn raw_roundtrip(&mut self, method: &str, params: Value) -> Result<RawDesktopAnswer> {
@@ -664,6 +743,26 @@ impl Probe {
             "pending usage must carry no limits: {usage}"
         );
 
+        // 8b. Refresh disposition: anthropic is offline/unsupported, so the
+        // typed refresh reports `refresh: "unsupported"`, emits no rate_limit
+        // event, and touches no network (the child env is fully offline).
+        let refreshed = self
+            .typed_refresh_subscription_usage("anthropic")?
+            .subscription_usage()
+            .map_err(|e| anyhow!("subscription_usage decode: {e}"))?;
+        ensure!(
+            refreshed.providers.len() == 1,
+            "exactly one provider requested: {refreshed:?}"
+        );
+        ensure!(
+            refreshed.providers[0].provider == "anthropic",
+            "usage provider: {refreshed:?}"
+        );
+        ensure!(
+            refreshed.providers[0].refresh == Some(UsageRefresh::Unsupported),
+            "anthropic refresh must be unsupported: {refreshed:?}"
+        );
+
         // 9. Stopped design canvas: no server, no designs, and no URL.
         let design = self.raw_roundtrip("get_design_canvas", json!({}))?;
         let design = design.ensure_ok()?.clone();
@@ -826,6 +925,8 @@ fn assert_capabilities(capabilities: &Capabilities) -> Result<()> {
         DesktopMethod::CancelSubagent,
         DesktopMethod::ListJobs,
         DesktopMethod::CancelJob,
+        DesktopMethod::GetSubscriptionUsage,
+        DesktopMethod::RefreshSubscriptionUsage,
     ] {
         ensure!(
             capabilities.supports(method),
@@ -833,12 +934,7 @@ fn assert_capabilities(capabilities: &Capabilities) -> Result<()> {
         );
     }
     // Methods this probe exercises raw, not yet named by the typed adapter.
-    for name in [
-        "get_config",
-        "set_config",
-        "get_subscription_usage",
-        "get_design_canvas",
-    ] {
+    for name in ["get_config", "set_config", "get_design_canvas"] {
         ensure!(
             capabilities.methods.iter().any(|method| method == name),
             "capabilities does not advertise {name}"

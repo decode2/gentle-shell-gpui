@@ -6,6 +6,7 @@ use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+use pi_rpc::desktop_rpc::UsageRefresh;
 
 use super::status_line;
 use crate::features::usage::credentials::{CardState, ProviderCard};
@@ -36,14 +37,14 @@ fn updated_ago(fetched_at: i64, now: i64) -> String {
 
 impl UsageView {
     pub(super) fn render_usage(&self) -> AnyElement {
-        let (cards, others) = match &self.usage {
+        let (cards, others, empty) = match &self.usage {
             UsageState::Loading => {
                 return h_flex()
                     .gap_2()
                     .text_sm()
                     .text_color(ui::muted())
                     .child(Spinner::new().small().color(ui::muted()))
-                    .child("Reading credentials…")
+                    .child("Reading subscription usage…")
                     .into_any_element();
             }
             UsageState::Failed(error) => {
@@ -59,7 +60,7 @@ impl UsageView {
                                     .small()
                                     .text_color(ui::danger()),
                             )
-                            .child(ui::section_label("Could not read credentials")),
+                            .child(ui::section_label("Could not read subscription usage")),
                     )
                     .child(
                         div()
@@ -69,7 +70,11 @@ impl UsageView {
                     )
                     .into_any_element();
             }
-            UsageState::Loaded { cards, others } => (cards, others),
+            UsageState::Loaded {
+                cards,
+                others,
+                empty,
+            } => (cards, others, empty),
         };
         let now = now_ms();
         v_flex()
@@ -81,7 +86,7 @@ impl UsageView {
                         div()
                             .text_sm()
                             .text_color(ui::muted())
-                            .child("No subscription provider is signed in. Sign in to ChatGPT (Codex), Claude or NaN from Providers."),
+                            .child(empty.message()),
                     ),
                 )
             })
@@ -105,16 +110,22 @@ impl UsageView {
     fn render_card(card: &ProviderCard, now: i64) -> Div {
         let (plan, fetched_at) = match &card.state {
             CardState::Ready(usage) => (usage.plan.clone(), Some(usage.fetched_at)),
+            CardState::Pending(Some(usage)) | CardState::Stale(Some(usage)) => {
+                (usage.plan.clone(), None)
+            }
             _ => (None, None),
         };
         let status = match &card.state {
             CardState::Loading => Some(ui::chip("fetching", ui::info())),
             CardState::SignIn(_) => Some(ui::chip("signed out", ui::warning())),
             CardState::Failed(_) => Some(ui::chip("error", ui::danger())),
+            CardState::Pending(_) => Some(ui::chip("pending", ui::info())),
+            CardState::Stale(_) => Some(ui::chip("stale", ui::warning())),
+            CardState::Unavailable => Some(ui::chip("unavailable", ui::muted())),
             CardState::Note(_) | CardState::Ready(_) => None,
         };
         let body: AnyElement = match &card.state {
-            CardState::Loading => h_flex()
+            CardState::Loading | CardState::Pending(None) => h_flex()
                 .gap_2()
                 .text_xs()
                 .text_color(ui::muted())
@@ -131,7 +142,19 @@ impl UsageView {
                 status_line(ui::danger(), Some(IconName::CircleAlert), error.clone())
                     .into_any_element()
             }
-            CardState::Ready(usage) => v_flex()
+            CardState::Unavailable => status_line(
+                ui::muted(),
+                None,
+                "No subscription usage is available for this provider.",
+            )
+            .into_any_element(),
+            CardState::Stale(None) => {
+                status_line(ui::muted(), None, "No subscription usage reported yet.")
+                    .into_any_element()
+            }
+            CardState::Ready(usage)
+            | CardState::Pending(Some(usage))
+            | CardState::Stale(Some(usage)) => v_flex()
                 .gap_3()
                 .children(
                     usage
@@ -160,6 +183,9 @@ impl UsageView {
                         d.child(ui::chip(plan, ui::accent()).flex_shrink_0())
                     })
                     .children(status)
+                    .when_some(card.refresh, |d, refresh| {
+                        d.child(Self::refresh_chip(refresh).flex_shrink_0())
+                    })
                     .child(div().flex_1())
                     .when_some(fetched_at, |d, at| {
                         d.child(
@@ -173,6 +199,14 @@ impl UsageView {
                     }),
             )
             .child(body)
+    }
+
+    /// Whether the server can refresh this provider's usage on request.
+    fn refresh_chip(refresh: UsageRefresh) -> Div {
+        match refresh {
+            UsageRefresh::Unsupported => ui::chip("refresh unsupported", ui::muted()),
+            UsageRefresh::OutOfScope => ui::chip("refresh out of scope", ui::muted()),
+        }
     }
 
     fn render_limit(limit: &UsageLimit, now: i64) -> AnyElement {

@@ -6,8 +6,9 @@ use pi_rpc::desktop_rpc::{
     DesktopAgent, DesktopAgentStep, DesktopAgentUsage, DesktopEvent, DesktopJob, DesktopMethod,
     DesktopRecord, DesktopRequest, DesktopResponse, DesktopRpcError, DesktopSession, Handoff,
     JobExitCode, MAX_REQUEST_BYTES, PROMPT_COMMAND, PermissionMode, PermissionModeChanged,
-    PermissionModeState, SCHEMA, SetPermissionModeResult, WIDGET_KEY, decode_payload,
-    decode_widget,
+    PermissionModeState, ProviderUsage, RateLimitEvent, RateLimitSource, SCHEMA,
+    SetPermissionModeResult, UsageLimit, UsageLimitScope, UsageRefresh, UsageResetAt, UsageStatus,
+    UsageWindow, WIDGET_KEY, decode_payload, decode_widget,
 };
 use pi_rpc::{Response, UiMethod, UiRequest};
 use serde_json::{Value, json};
@@ -1831,4 +1832,544 @@ fn subagent_and_job_events_keep_the_sequence_rules() {
         })
     ));
     assert_eq!(session.last_sequence(), Some(8));
+}
+
+// --- subscription usage methods and event -------------------------------
+
+fn usage_provider_data() -> Value {
+    json!({
+        "provider": "codex",
+        "status": "ok",
+        "fetchedAt": 1788600000000u64,
+        "plan": "pro",
+        "refresh": "unsupported",
+        "limits": [
+            {
+                "name": "prompts",
+                "limitReached": false,
+                "scope": "provider",
+                "windows": [
+                    {
+                        "label": "5h/week",
+                        "usedPercent": 42.5,
+                        "windowSeconds": 18000,
+                        "resetAt": 1789200000000u64,
+                        "used": 76.5,
+                        "budget": 180.0,
+                    },
+                    {
+                        "label": "48h/month",
+                        "usedPercent": 0.0,
+                        "windowSeconds": 172800,
+                        "resetAt": null,
+                    },
+                ],
+            }
+        ],
+    })
+}
+
+fn full_provider() -> ProviderUsage {
+    ProviderUsage {
+        provider: "codex".into(),
+        status: UsageStatus::Ok,
+        fetched_at: Some(1788600000000.0),
+        plan: Some("pro".into()),
+        refresh: Some(UsageRefresh::Unsupported),
+        limits: vec![UsageLimit {
+            name: "prompts".into(),
+            limit_reached: false,
+            scope: Some(UsageLimitScope::Provider),
+            windows: vec![
+                UsageWindow {
+                    label: "5h/week".into(),
+                    used_percent: 42.5,
+                    window_seconds: 18000.0,
+                    reset_at: UsageResetAt::At(1789200000000.0),
+                    used: Some(76.5),
+                    budget: Some(180.0),
+                },
+                UsageWindow {
+                    label: "48h/month".into(),
+                    used_percent: 0.0,
+                    window_seconds: 172800.0,
+                    reset_at: UsageResetAt::Null,
+                    used: None,
+                    budget: None,
+                },
+            ],
+        }],
+    }
+}
+
+fn minimal_usage_provider(status: &str) -> Value {
+    json!({ "provider": "codex", "status": status, "limits": [] })
+}
+
+fn single_usage_provider(data: Value) -> ProviderUsage {
+    let response = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "providers": [data] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    let usage = response.subscription_usage().unwrap();
+    assert_eq!(usage.providers.len(), 1);
+    usage.providers.into_iter().next().unwrap()
+}
+
+#[test]
+fn subscription_usage_methods_use_the_exact_wire_names_and_shapes() {
+    for (method, wire) in [
+        (
+            DesktopMethod::GetSubscriptionUsage,
+            "get_subscription_usage",
+        ),
+        (
+            DesktopMethod::RefreshSubscriptionUsage,
+            "refresh_subscription_usage",
+        ),
+    ] {
+        assert_eq!(method.as_str(), wire);
+        assert_eq!(DesktopMethod::parse(wire).unwrap(), method);
+        assert_eq!(wire.parse::<DesktopMethod>().unwrap(), method);
+    }
+
+    let get = DesktopRequest::get_subscription_usage("desktop-1", None).unwrap();
+    assert_eq!(get.method(), DesktopMethod::GetSubscriptionUsage);
+    assert_eq!(
+        get.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-1","method":"get_subscription_usage","params":{{}}}}"#
+        )
+    );
+
+    let get_for = DesktopRequest::get_subscription_usage("desktop-2", Some("nan")).unwrap();
+    assert_eq!(
+        get_for.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-2","method":"get_subscription_usage","params":{{"provider":"nan"}}}}"#
+        )
+    );
+
+    let refresh = DesktopRequest::refresh_subscription_usage("desktop-3", None).unwrap();
+    assert_eq!(
+        refresh.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-3","method":"refresh_subscription_usage","params":{{}}}}"#
+        )
+    );
+
+    let refresh_for =
+        DesktopRequest::refresh_subscription_usage("desktop-4", Some("claude")).unwrap();
+    assert_eq!(
+        refresh_for.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-4","method":"refresh_subscription_usage","params":{{"provider":"claude"}}}}"#
+        )
+    );
+}
+
+#[test]
+fn subscription_usage_rejects_an_empty_provider_before_anything_is_sent() {
+    assert!(matches!(
+        DesktopRequest::get_subscription_usage("desktop-1", Some("")),
+        Err(DesktopRpcError::InvalidProvider)
+    ));
+    assert!(matches!(
+        DesktopRequest::refresh_subscription_usage("desktop-1", Some("")),
+        Err(DesktopRpcError::InvalidProvider)
+    ));
+
+    let mut session = DesktopSession::new();
+    assert!(matches!(
+        session.issue_get_subscription_usage(Some("")),
+        Err(DesktopRpcError::InvalidProvider)
+    ));
+    assert!(matches!(
+        session.issue_refresh_subscription_usage(Some("")),
+        Err(DesktopRpcError::InvalidProvider)
+    ));
+    // A rejected request never consumes an id or leaves one pending.
+    assert!(session.pending().is_none());
+    assert_eq!(
+        session
+            .issue_get_subscription_usage(None)
+            .unwrap()
+            .request_id(),
+        "desktop-1"
+    );
+}
+
+#[test]
+fn subscription_usage_decodes_providers_limits_and_windows() {
+    assert_eq!(
+        single_usage_provider(usage_provider_data()),
+        full_provider()
+    );
+
+    // `fetch_at`, `plan`, `refresh`, `scope`, `used` and `budget` are optional
+    // and decode to None rather than being invented.
+    let minimal = single_usage_provider(minimal_usage_provider("pending"));
+    assert_eq!(minimal.provider, "codex");
+    assert_eq!(minimal.status, UsageStatus::Pending);
+    assert_eq!(minimal.fetched_at, None);
+    assert_eq!(minimal.plan, None);
+    assert_eq!(minimal.refresh, None);
+    assert!(minimal.limits.is_empty());
+}
+
+#[test]
+fn subscription_usage_limits_default_to_empty_when_absent() {
+    // A pending, failed or unavailable provider may omit `limits` entirely:
+    // the typed accessor projects an empty list, never an error or invented
+    // usage. Only a present non-array `limits` stays malformed.
+    for status in ["pending", "failed", "unavailable"] {
+        let provider = single_usage_provider(json!({ "provider": "codex", "status": status }));
+        assert_eq!(provider.status.as_str(), status);
+        assert!(provider.limits.is_empty());
+    }
+}
+
+#[test]
+fn subscription_usage_decodes_every_status_and_refresh_disposition() {
+    for status in UsageStatus::ALL {
+        assert_eq!(status.as_str(), status.to_string());
+        assert_eq!(status.as_str().parse::<UsageStatus>().unwrap(), status);
+        let provider = single_usage_provider(minimal_usage_provider(status.as_str()));
+        assert_eq!(provider.status, status);
+    }
+
+    for refresh in UsageRefresh::ALL {
+        assert_eq!(refresh.as_str(), refresh.to_string());
+        assert_eq!(refresh.as_str().parse::<UsageRefresh>().unwrap(), refresh);
+        let data = json!({
+            "provider": "codex",
+            "status": "ok",
+            "refresh": refresh.as_str(),
+            "limits": [],
+        });
+        assert_eq!(single_usage_provider(data).refresh, Some(refresh));
+    }
+
+    // `refresh` is optional: its absence is not a default disposition.
+    assert_eq!(
+        single_usage_provider(minimal_usage_provider("ok")).refresh,
+        None
+    );
+
+    assert!(matches!(
+        "turbo".parse::<UsageStatus>(),
+        Err(DesktopRpcError::InvalidUsageStatus(_))
+    ));
+    assert!(matches!(
+        "later".parse::<UsageRefresh>(),
+        Err(DesktopRpcError::InvalidUsageRefresh(_))
+    ));
+    assert!(matches!(
+        "account".parse::<UsageLimitScope>(),
+        Err(DesktopRpcError::InvalidUsageScope(_))
+    ));
+    assert!(matches!(
+        "push".parse::<RateLimitSource>(),
+        Err(DesktopRpcError::InvalidRateLimitSource(_))
+    ));
+}
+
+#[test]
+fn usage_reset_at_is_distinct_from_absent() {
+    let window = |data: Value| {
+        let provider = single_usage_provider(json!({
+            "provider": "x",
+            "status": "ok",
+            "limits": [{
+                "name": "n",
+                "limitReached": false,
+                "windows": [data],
+            }],
+        }));
+        provider.limits[0].windows[0].clone()
+    };
+
+    assert_eq!(
+        window(json!({
+            "label": "w", "usedPercent": 1.0, "windowSeconds": 60, "resetAt": null
+        }))
+        .reset_at,
+        UsageResetAt::Null
+    );
+    assert_eq!(
+        window(json!({
+            "label": "w", "usedPercent": 1.0, "windowSeconds": 60, "resetAt": 1789200000000u64
+        }))
+        .reset_at,
+        UsageResetAt::At(1789200000000.0)
+    );
+
+    // `resetAt` is required: absent is malformed, never conflated with null.
+    let absent = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            json!({ "providers": [{
+                "provider": "x",
+                "status": "ok",
+                "limits": [{
+                    "name": "n",
+                    "limitReached": false,
+                    "windows": [{ "label": "w", "usedPercent": 1.0, "windowSeconds": 60 }],
+                }],
+            }] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    assert!(matches!(
+        absent.subscription_usage(),
+        Err(DesktopRpcError::MalformedPayload(_))
+    ));
+}
+
+#[test]
+fn rate_limit_event_decodes_source_and_snapshots() {
+    let ui = widget(&event_line(
+        1,
+        "rate_limit",
+        json!({
+            "source": "refresh",
+            "snapshots": [{ "provider": "claude", "status": "failed", "limits": [] }],
+        }),
+    ));
+    let event = record_event(decode_widget(&ui).unwrap().unwrap());
+    assert_eq!(event.event, "rate_limit");
+    assert_eq!(
+        event.rate_limit().unwrap(),
+        RateLimitEvent {
+            source: RateLimitSource::Refresh,
+            snapshots: vec![ProviderUsage {
+                provider: "claude".into(),
+                status: UsageStatus::Failed,
+                fetched_at: None,
+                plan: None,
+                refresh: None,
+                limits: vec![],
+            }],
+        }
+    );
+
+    let response = record_event(
+        decode_widget(&widget(&event_line(
+            2,
+            "rate_limit",
+            json!({
+                "source": "response",
+                "snapshots": [usage_provider_data()],
+            }),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .rate_limit()
+    .unwrap();
+    assert_eq!(response.source, RateLimitSource::Response);
+    assert_eq!(response.snapshots, vec![full_provider()]);
+}
+
+#[test]
+fn rate_limit_verifies_the_exact_event_name_and_rejects_malformed_data() {
+    // The exact event name is checked first: a foreign event that happens to
+    // fit the shape is refused, not misread.
+    let foreign = record_event(
+        decode_widget(&widget(&event_line(
+            1,
+            "agents_update",
+            json!({ "source": "refresh", "snapshots": [] }),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    assert!(matches!(
+        foreign.rate_limit(),
+        Err(DesktopRpcError::UnexpectedEvent { expected: "rate_limit", got })
+            if got == "agents_update"
+    ));
+
+    let cases: &[Value] = &[
+        json!({ "snapshots": [] }),                          // missing source
+        json!({ "source": "refresh" }),                      // missing snapshots
+        json!({ "source": "push", "snapshots": [] }),        // unknown source
+        json!({ "source": 7, "snapshots": [] }),             // source not a string
+        json!({ "source": "refresh", "snapshots": "nope" }), // snapshots not an array
+        // Snapshot entries use the provider shape; a non-array `limits` stays
+        // malformed even though an absent one defaults to empty.
+        json!({ "source": "refresh", "snapshots": [{ "provider": "x", "status": "ok", "limits": "nope" }] }),
+        json!({ "source": "refresh", "snapshots": [{
+            "provider": "x", "status": "ok",
+            "limits": [{ "name": "n", "limitReached": false }],
+        }] }),
+    ];
+    for data in cases {
+        let event = record_event(
+            decode_widget(&widget(&event_line(1, "rate_limit", data.clone())))
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(
+            event.rate_limit().is_err(),
+            "{data} should not decode as a rate_limit event"
+        );
+    }
+}
+
+#[test]
+fn malformed_subscription_usage_payloads_are_rejected() {
+    let provider_cases: &[Value] = &[
+        json!({ "status": "ok", "limits": [] }),
+        json!({ "provider": "", "status": "ok", "limits": [] }),
+        json!({ "provider": "x" }),
+        json!({ "provider": "x", "status": "turbo", "limits": [] }),
+        json!({ "provider": "x", "status": "ok", "limits": "nope" }),
+        json!({ "provider": "x", "status": "ok", "limits": [{}] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "", "limitReached": false, "windows": [] }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n" }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n", "limitReached": "yes", "windows": [] }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n", "limitReached": false }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n", "limitReached": false, "windows": "nope" }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n", "limitReached": false, "windows": [{}] }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n", "limitReached": false, "windows": [{ "label": "", "usedPercent": 1.0, "windowSeconds": 60, "resetAt": null }] }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n", "limitReached": false, "windows": [{ "label": "w", "usedPercent": "full", "windowSeconds": 60, "resetAt": null }] }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n", "limitReached": false, "windows": [{ "label": "w", "usedPercent": 1.0, "windowSeconds": "an hour", "resetAt": null }] }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n", "limitReached": false, "windows": [{ "label": "w", "usedPercent": 1.0, "windowSeconds": 60 }] }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n", "limitReached": false, "windows": [{ "label": "w", "usedPercent": 1.0, "windowSeconds": 60, "resetAt": "soon" }] }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n", "limitReached": false, "windows": [{ "label": "w", "usedPercent": 1.0, "windowSeconds": 60, "resetAt": null, "used": "many" }] }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n", "limitReached": false, "windows": [{ "label": "w", "usedPercent": 1.0, "windowSeconds": 60, "resetAt": null, "budget": [] }] }] }),
+        json!({ "provider": "x", "status": "ok", "limits": [{ "name": "n", "limitReached": false, "scope": "account", "windows": [] }] }),
+        json!({ "provider": "x", "status": "ok", "refresh": "later", "limits": [] }),
+        json!({ "provider": "x", "status": "ok", "fetchedAt": "yesterday", "limits": [] }),
+        json!({ "provider": "x", "status": "ok", "plan": 7, "limits": [] }),
+    ];
+    for data in provider_cases {
+        let response = record_response(
+            decode_widget(&widget(&response_line(
+                "desktop-1",
+                json!({ "providers": [data.clone()] }),
+            )))
+            .unwrap()
+            .unwrap(),
+        );
+        assert!(
+            response.subscription_usage().is_err(),
+            "{data} should not decode as subscription usage"
+        );
+    }
+
+    // The response shape requires the `providers` array.
+    for data in [
+        json!({}),
+        json!({ "providers": "nope" }),
+        json!({ "providers": [7] }),
+    ] {
+        let response = record_response(
+            decode_widget(&widget(&response_line("desktop-1", data.clone())))
+                .unwrap()
+                .unwrap(),
+        );
+        assert!(
+            response.subscription_usage().is_err(),
+            "{data} should not decode as subscription usage"
+        );
+    }
+}
+
+#[test]
+fn subscription_usage_rejects_non_finite_numbers() {
+    // serde_json refuses a number that overflows to infinity, so a non-finite
+    // `usedPercent` fails the whole record closed rather than decoding usage.
+    let payload = format!(
+        r#"{{"schema":"{SCHEMA}","kind":"response","requestId":"desktop-1","ok":true,"data":{{"providers":[{{"provider":"codex","status":"ok","limits":[{{"name":"prompts","limitReached":false,"windows":[{{"label":"5h","usedPercent":1e400,"windowSeconds":18000,"resetAt":null}}]}}]}}]}}}}"#
+    );
+    assert!(matches!(
+        decode_payload(&payload),
+        Err(DesktopRpcError::MalformedPayload(_))
+    ));
+}
+
+#[test]
+fn subscription_usage_ignores_unknown_extra_fields() {
+    // The projection carries no credential, account or URL fields; an evolving
+    // server may add them and this client stays compatible by ignoring them.
+    let provider = single_usage_provider(json!({
+        "provider": "codex",
+        "status": "ok",
+        "limits": [],
+        "account": "acct_123",
+        "url": "https://example.invalid",
+        "apiKey": "secret",
+    }));
+    assert_eq!(provider.provider, "codex");
+    assert_eq!(provider.status, UsageStatus::Ok);
+    assert!(provider.limits.is_empty());
+}
+
+#[test]
+fn subscription_usage_requests_flow_through_session_correlation() {
+    let mut session = DesktopSession::new();
+
+    let get = session.issue_get_subscription_usage(None).unwrap();
+    assert_eq!(get.request_id(), "desktop-1");
+    assert_eq!(
+        session.pending(),
+        Some(("desktop-1", DesktopMethod::GetSubscriptionUsage))
+    );
+
+    // One request in flight, whatever the method.
+    assert!(matches!(
+        session.issue_refresh_subscription_usage(None),
+        Err(DesktopRpcError::RequestInFlight { .. })
+    ));
+
+    session
+        .accept(&widget(&response_line(
+            "desktop-1",
+            json!({ "providers": [] }),
+        )))
+        .unwrap();
+    assert!(session.pending().is_none());
+
+    let refresh = session
+        .issue_refresh_subscription_usage(Some("claude"))
+        .unwrap();
+    assert_eq!(refresh.request_id(), "desktop-2");
+    assert_eq!(refresh.method(), DesktopMethod::RefreshSubscriptionUsage);
+    assert_eq!(
+        refresh.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-2","method":"refresh_subscription_usage","params":{{"provider":"claude"}}}}"#
+        )
+    );
+}
+
+#[test]
+fn capabilities_expose_subscription_usage_methods_and_event() {
+    let response = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            capabilities_data(
+                &[
+                    "capabilities",
+                    "get_subscription_usage",
+                    "refresh_subscription_usage",
+                ],
+                &["rate_limit"],
+            ),
+        )))
+        .unwrap()
+        .unwrap(),
+    );
+    let capabilities = response.capabilities().unwrap();
+    assert!(capabilities.supports(DesktopMethod::GetSubscriptionUsage));
+    assert!(capabilities.supports(DesktopMethod::RefreshSubscriptionUsage));
+    assert!(capabilities.emits("rate_limit"));
+    assert!(!capabilities.emits("usage_changed"));
 }

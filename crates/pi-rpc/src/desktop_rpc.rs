@@ -49,6 +49,8 @@ pub enum DesktopMethod {
     CancelSubagent,
     ListJobs,
     CancelJob,
+    GetSubscriptionUsage,
+    RefreshSubscriptionUsage,
 }
 
 impl DesktopMethod {
@@ -63,6 +65,8 @@ impl DesktopMethod {
             Self::CancelSubagent => "cancel_subagent",
             Self::ListJobs => "list_jobs",
             Self::CancelJob => "cancel_job",
+            Self::GetSubscriptionUsage => "get_subscription_usage",
+            Self::RefreshSubscriptionUsage => "refresh_subscription_usage",
         }
     }
 
@@ -77,6 +81,8 @@ impl DesktopMethod {
             "cancel_subagent" => Ok(Self::CancelSubagent),
             "list_jobs" => Ok(Self::ListJobs),
             "cancel_job" => Ok(Self::CancelJob),
+            "get_subscription_usage" => Ok(Self::GetSubscriptionUsage),
+            "refresh_subscription_usage" => Ok(Self::RefreshSubscriptionUsage),
             other => Err(DesktopRpcError::UnsupportedMethod(other.to_string())),
         }
     }
@@ -287,6 +293,21 @@ fn cancel_params(id: String) -> Result<Value, DesktopRpcError> {
     Ok(json!({ "id": id }))
 }
 
+/// The wire `params` object for `get_subscription_usage` and
+/// `refresh_subscription_usage`: `{}` for the whole account, or exactly
+/// `{ provider }` with a non-empty provider string.
+fn subscription_usage_params(provider: Option<&str>) -> Result<Value, DesktopRpcError> {
+    match provider {
+        None => Ok(json!({})),
+        Some(provider) => {
+            if provider.is_empty() {
+                return Err(DesktopRpcError::InvalidProvider);
+            }
+            Ok(json!({ "provider": provider }))
+        }
+    }
+}
+
 impl DesktopRequest {
     /// The `capabilities` request. It takes no params.
     pub fn capabilities(request_id: impl Into<String>) -> Result<Self, DesktopRpcError> {
@@ -350,6 +371,32 @@ impl DesktopRequest {
             request_id,
             DesktopMethod::CancelJob,
             cancel_params(id.into())?,
+        )
+    }
+
+    /// The `get_subscription_usage` request. `provider` is `None` for the
+    /// whole-account snapshot, or `Some` for a single provider.
+    pub fn get_subscription_usage(
+        request_id: impl Into<String>,
+        provider: Option<&str>,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::new(
+            request_id,
+            DesktopMethod::GetSubscriptionUsage,
+            subscription_usage_params(provider)?,
+        )
+    }
+
+    /// The `refresh_subscription_usage` request, with the same optional
+    /// provider param as [`Self::get_subscription_usage`].
+    pub fn refresh_subscription_usage(
+        request_id: impl Into<String>,
+        provider: Option<&str>,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::new(
+            request_id,
+            DesktopMethod::RefreshSubscriptionUsage,
+            subscription_usage_params(provider)?,
         )
     }
 
@@ -488,6 +535,12 @@ impl DesktopResponse {
         CancelJobResult::from_data(self.data()?)
     }
 
+    /// The response to `get_subscription_usage` and
+    /// `refresh_subscription_usage`, which share the same data shape.
+    pub fn subscription_usage(&self) -> Result<SubscriptionUsage, DesktopRpcError> {
+        SubscriptionUsage::from_data(self.data()?)
+    }
+
     fn data(&self) -> Result<&Value, DesktopRpcError> {
         self.result
             .as_ref()
@@ -524,6 +577,13 @@ impl DesktopEvent {
     pub fn jobs_update(&self) -> Result<JobList, DesktopRpcError> {
         expect_event(self, "jobs_update")?;
         JobList::from_data(&self.data)
+    }
+
+    /// Decode the data of a `rate_limit` event, verifying the exact event
+    /// name before the shape, exactly like [`Self::agents_update`].
+    pub fn rate_limit(&self) -> Result<RateLimitEvent, DesktopRpcError> {
+        expect_event(self, "rate_limit")?;
+        RateLimitEvent::from_data(&self.data)
     }
 }
 
@@ -1069,6 +1129,454 @@ impl CancelJobResult {
     }
 }
 
+/// The closed `status` vocabulary of a provider usage entry. Anything else is
+/// a server change and is refused rather than read as usable usage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UsageStatus {
+    Ok,
+    Pending,
+    Stale,
+    Failed,
+    Unavailable,
+}
+
+impl UsageStatus {
+    /// Every status the protocol speaks, in wire order.
+    pub const ALL: [Self; 5] = [
+        Self::Ok,
+        Self::Pending,
+        Self::Stale,
+        Self::Failed,
+        Self::Unavailable,
+    ];
+
+    /// The wire name of the status.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Pending => "pending",
+            Self::Stale => "stale",
+            Self::Failed => "failed",
+            Self::Unavailable => "unavailable",
+        }
+    }
+}
+
+impl std::str::FromStr for UsageStatus {
+    type Err = DesktopRpcError;
+
+    fn from_str(status: &str) -> Result<Self, Self::Err> {
+        match status {
+            "ok" => Ok(Self::Ok),
+            "pending" => Ok(Self::Pending),
+            "stale" => Ok(Self::Stale),
+            "failed" => Ok(Self::Failed),
+            "unavailable" => Ok(Self::Unavailable),
+            other => Err(DesktopRpcError::InvalidUsageStatus(other.to_string())),
+        }
+    }
+}
+
+impl fmt::Display for UsageStatus {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The closed `refresh` disposition of a provider usage entry: whether the
+/// server can refresh the provider's usage on request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UsageRefresh {
+    Unsupported,
+    OutOfScope,
+}
+
+impl UsageRefresh {
+    /// Every disposition the protocol speaks, in wire order.
+    pub const ALL: [Self; 2] = [Self::Unsupported, Self::OutOfScope];
+
+    /// The wire name of the disposition.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unsupported => "unsupported",
+            Self::OutOfScope => "out_of_scope",
+        }
+    }
+}
+
+impl std::str::FromStr for UsageRefresh {
+    type Err = DesktopRpcError;
+
+    fn from_str(refresh: &str) -> Result<Self, Self::Err> {
+        match refresh {
+            "unsupported" => Ok(Self::Unsupported),
+            "out_of_scope" => Ok(Self::OutOfScope),
+            other => Err(DesktopRpcError::InvalidUsageRefresh(other.to_string())),
+        }
+    }
+}
+
+impl fmt::Display for UsageRefresh {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The closed `scope` vocabulary of a usage limit. Only `provider` is spoken
+/// today; an unknown scope is refused rather than misread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum UsageLimitScope {
+    Provider,
+}
+
+impl UsageLimitScope {
+    /// The wire name of the scope.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+        }
+    }
+}
+
+impl std::str::FromStr for UsageLimitScope {
+    type Err = DesktopRpcError;
+
+    fn from_str(scope: &str) -> Result<Self, Self::Err> {
+        match scope {
+            "provider" => Ok(Self::Provider),
+            other => Err(DesktopRpcError::InvalidUsageScope(other.to_string())),
+        }
+    }
+}
+
+impl fmt::Display for UsageLimitScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The closed `source` vocabulary of a `rate_limit` event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RateLimitSource {
+    Refresh,
+    Response,
+}
+
+impl RateLimitSource {
+    /// Every source the protocol speaks, in wire order.
+    pub const ALL: [Self; 2] = [Self::Refresh, Self::Response];
+
+    /// The wire name of the source.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Refresh => "refresh",
+            Self::Response => "response",
+        }
+    }
+}
+
+impl std::str::FromStr for RateLimitSource {
+    type Err = DesktopRpcError;
+
+    fn from_str(source: &str) -> Result<Self, Self::Err> {
+        match source {
+            "refresh" => Ok(Self::Refresh),
+            "response" => Ok(Self::Response),
+            other => Err(DesktopRpcError::InvalidRateLimitSource(other.to_string())),
+        }
+    }
+}
+
+impl fmt::Display for RateLimitSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The `resetAt` of a usage window. A window without a recorded reset point
+/// is `Null`; an absent `resetAt` is malformed and never decoded, so a null
+/// reset and a missing one are never conflated.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum UsageResetAt {
+    At(f64),
+    Null,
+}
+
+/// A finite number field of a usage document. Usage numbers may be fractional
+/// but never non-finite.
+fn finite_number_field(data: &Value, field: &'static str) -> Result<f64, DesktopRpcError> {
+    let value = data
+        .get(field)
+        .and_then(Value::as_f64)
+        .ok_or_else(|| DesktopRpcError::MalformedPayload(format!("{field} must be a number")))?;
+    if !value.is_finite() {
+        return Err(DesktopRpcError::MalformedPayload(format!(
+            "{field} must be a finite number"
+        )));
+    }
+    Ok(value)
+}
+
+/// An optional finite number field: absent and `null` both decode to `None`.
+fn optional_finite_number_field(
+    data: &Value,
+    field: &'static str,
+) -> Result<Option<f64>, DesktopRpcError> {
+    match data.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(number)) => {
+            let value = number.as_f64().ok_or_else(|| {
+                DesktopRpcError::MalformedPayload(format!("{field} must be a finite number"))
+            })?;
+            if !value.is_finite() {
+                return Err(DesktopRpcError::MalformedPayload(format!(
+                    "{field} must be a finite number"
+                )));
+            }
+            Ok(Some(value))
+        }
+        Some(_) => Err(DesktopRpcError::MalformedPayload(format!(
+            "{field} must be a finite number"
+        ))),
+    }
+}
+
+/// A required `resetAt` field: a finite number or `null`, never absent.
+fn usage_reset_at_field(
+    data: &Value,
+    field: &'static str,
+) -> Result<UsageResetAt, DesktopRpcError> {
+    match data.get(field) {
+        Some(Value::Null) => Ok(UsageResetAt::Null),
+        Some(Value::Number(number)) => {
+            let value = number.as_f64().ok_or_else(|| {
+                DesktopRpcError::MalformedPayload(format!(
+                    "{field} must be a finite number or null"
+                ))
+            })?;
+            if !value.is_finite() {
+                return Err(DesktopRpcError::MalformedPayload(format!(
+                    "{field} must be a finite number or null"
+                )));
+            }
+            Ok(UsageResetAt::At(value))
+        }
+        _ => Err(DesktopRpcError::MalformedPayload(format!(
+            "{field} must be a finite number or null"
+        ))),
+    }
+}
+
+/// A required `status` field of a provider usage entry.
+fn usage_status_field(data: &Value, field: &'static str) -> Result<UsageStatus, DesktopRpcError> {
+    data.get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            DesktopRpcError::MalformedPayload(format!("{field} must be a status string"))
+        })?
+        .parse()
+}
+
+/// An optional closed-vocabulary string field: absent and `null` decode to
+/// `None`, any other value is parsed through the vocabulary.
+fn optional_usage_refresh_field(
+    data: &Value,
+    field: &'static str,
+) -> Result<Option<UsageRefresh>, DesktopRpcError> {
+    match data.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => text.parse().map(Some),
+        Some(_) => Err(DesktopRpcError::MalformedPayload(format!(
+            "{field} must be a refresh disposition string"
+        ))),
+    }
+}
+
+/// An optional `scope` field of a usage limit.
+fn optional_usage_scope_field(
+    data: &Value,
+    field: &'static str,
+) -> Result<Option<UsageLimitScope>, DesktopRpcError> {
+    match data.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => text.parse().map(Some),
+        Some(_) => Err(DesktopRpcError::MalformedPayload(format!(
+            "{field} must be a scope string"
+        ))),
+    }
+}
+
+/// A required `source` field of a `rate_limit` event.
+fn rate_limit_source_field(
+    data: &Value,
+    field: &'static str,
+) -> Result<RateLimitSource, DesktopRpcError> {
+    data.get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            DesktopRpcError::MalformedPayload(format!("{field} must be a source string"))
+        })?
+        .parse()
+}
+
+/// A required array of provider usage entries from a usage document, named by
+/// the calling field (`providers` or `snapshots`).
+fn provider_entries(
+    data: &Value,
+    field: &'static str,
+) -> Result<Vec<ProviderUsage>, DesktopRpcError> {
+    let items = data.get(field).and_then(Value::as_array).ok_or_else(|| {
+        DesktopRpcError::MalformedPayload(format!("usage data has no {field} array"))
+    })?;
+    items.iter().map(ProviderUsage::from_data).collect()
+}
+
+/// A provider usage entry's `limits`. Absent (and `null`) default to an empty
+/// list — a pending, failed or unavailable provider has no limits to report —
+/// while a present non-array value stays malformed.
+fn usage_limit_entries(data: &Value) -> Result<Vec<UsageLimit>, DesktopRpcError> {
+    match data.get("limits") {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items.iter().map(UsageLimit::from_data).collect(),
+        Some(_) => Err(DesktopRpcError::MalformedPayload(
+            "usage entry limits must be an array".into(),
+        )),
+    }
+}
+
+/// A required `windows` array of a usage limit.
+fn usage_window_entries(data: &Value) -> Result<Vec<UsageWindow>, DesktopRpcError> {
+    let items = data
+        .get("windows")
+        .and_then(Value::as_array)
+        .ok_or_else(|| DesktopRpcError::MalformedPayload("limit has no windows array".into()))?;
+    items.iter().map(UsageWindow::from_data).collect()
+}
+
+/// The decoded `get_subscription_usage` / `refresh_subscription_usage` data:
+/// one entry per provider the server reports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubscriptionUsage {
+    pub providers: Vec<ProviderUsage>,
+}
+
+impl SubscriptionUsage {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            providers: provider_entries(data, "providers")?,
+        })
+    }
+}
+
+/// One projected provider usage entry. Only these fields exist on the wire:
+/// identity, the closed status, the optional fetch timestamp and plan name,
+/// the optional refresh disposition, and the limits. No credential, account
+/// or URL fields are part of this projection.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProviderUsage {
+    pub provider: String,
+    pub status: UsageStatus,
+    pub fetched_at: Option<f64>,
+    pub plan: Option<String>,
+    pub refresh: Option<UsageRefresh>,
+    pub limits: Vec<UsageLimit>,
+}
+
+impl ProviderUsage {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        let provider = string_field(data, "provider")?;
+        if provider.is_empty() {
+            return Err(DesktopRpcError::MalformedPayload(
+                "provider entry has no provider".into(),
+            ));
+        }
+        Ok(Self {
+            provider,
+            status: usage_status_field(data, "status")?,
+            fetched_at: optional_finite_number_field(data, "fetchedAt")?,
+            plan: text_field(data, "plan")?,
+            refresh: optional_usage_refresh_field(data, "refresh")?,
+            limits: usage_limit_entries(data)?,
+        })
+    }
+}
+
+/// One projected usage limit: its name, whether it is reached, the optional
+/// scope hint, and the bounded windows.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageLimit {
+    pub name: String,
+    pub limit_reached: bool,
+    pub scope: Option<UsageLimitScope>,
+    pub windows: Vec<UsageWindow>,
+}
+
+impl UsageLimit {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        let name = string_field(data, "name")?;
+        if name.is_empty() {
+            return Err(DesktopRpcError::MalformedPayload(
+                "limit has no name".into(),
+            ));
+        }
+        Ok(Self {
+            name,
+            limit_reached: bool_field(data, "limitReached")?,
+            scope: optional_usage_scope_field(data, "scope")?,
+            windows: usage_window_entries(data)?,
+        })
+    }
+}
+
+/// One projected usage window: the human label, the derived usage percentage,
+/// the window length, its reset point, and the raw used/budget allowances when
+/// the server supplies them.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageWindow {
+    pub label: String,
+    pub used_percent: f64,
+    pub window_seconds: f64,
+    pub reset_at: UsageResetAt,
+    pub used: Option<f64>,
+    pub budget: Option<f64>,
+}
+
+impl UsageWindow {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        let label = string_field(data, "label")?;
+        if label.is_empty() {
+            return Err(DesktopRpcError::MalformedPayload(
+                "window has no label".into(),
+            ));
+        }
+        Ok(Self {
+            label,
+            used_percent: finite_number_field(data, "usedPercent")?,
+            window_seconds: finite_number_field(data, "windowSeconds")?,
+            reset_at: usage_reset_at_field(data, "resetAt")?,
+            used: optional_finite_number_field(data, "used")?,
+            budget: optional_finite_number_field(data, "budget")?,
+        })
+    }
+}
+
+/// The decoded `rate_limit` event data: which path hit the limit and the
+/// provider snapshots it carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RateLimitEvent {
+    pub source: RateLimitSource,
+    pub snapshots: Vec<ProviderUsage>,
+}
+
+impl RateLimitEvent {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            source: rate_limit_source_field(data, "source")?,
+            snapshots: provider_entries(data, "snapshots")?,
+        })
+    }
+}
+
 /// Pi's answer to the outer prompt: `disposition: "handled"` means accepted.
 /// The domain result is never here, it arrives as a widget record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1198,6 +1706,28 @@ impl DesktopSession {
         id: impl Into<String>,
     ) -> Result<DesktopRequest, DesktopRpcError> {
         self.issue_with(DesktopMethod::CancelJob, cancel_params(id.into())?)
+    }
+
+    /// Issue `get_subscription_usage` with `{}` or exactly `{ provider }`.
+    pub fn issue_get_subscription_usage(
+        &mut self,
+        provider: Option<&str>,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_with(
+            DesktopMethod::GetSubscriptionUsage,
+            subscription_usage_params(provider)?,
+        )
+    }
+
+    /// Issue `refresh_subscription_usage` with `{}` or exactly `{ provider }`.
+    pub fn issue_refresh_subscription_usage(
+        &mut self,
+        provider: Option<&str>,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_with(
+            DesktopMethod::RefreshSubscriptionUsage,
+            subscription_usage_params(provider)?,
+        )
     }
 
     /// A new request with a fresh id; `params` is built by the typed callers
@@ -1440,6 +1970,16 @@ pub enum DesktopRpcError {
     InvalidPermissionMode(String),
     /// A cancel request named an empty id.
     InvalidCancelId,
+    /// A subscription usage request named an empty provider.
+    InvalidProvider,
+    /// A provider usage `status` outside the closed vocabulary.
+    InvalidUsageStatus(String),
+    /// A provider usage `refresh` disposition outside the closed vocabulary.
+    InvalidUsageRefresh(String),
+    /// A usage limit `scope` outside the closed vocabulary.
+    InvalidUsageScope(String),
+    /// A `rate_limit` `source` outside the closed vocabulary.
+    InvalidRateLimitSource(String),
     /// A subagent `lastStep` label outside the closed vocabulary.
     InvalidLastStep(String),
     /// An event was decoded through an accessor for another event name.
@@ -1498,6 +2038,24 @@ impl fmt::Display for DesktopRpcError {
             }
             Self::InvalidCancelId => {
                 formatter.write_str("desktop cancel id must be a non-empty string")
+            }
+            Self::InvalidProvider => {
+                formatter.write_str("desktop subscription provider must be a non-empty string")
+            }
+            Self::InvalidUsageStatus(status) => {
+                write!(formatter, "unknown desktop usage status: {status}")
+            }
+            Self::InvalidUsageRefresh(refresh) => {
+                write!(
+                    formatter,
+                    "unknown desktop usage refresh disposition: {refresh}"
+                )
+            }
+            Self::InvalidUsageScope(scope) => {
+                write!(formatter, "unknown desktop usage limit scope: {scope}")
+            }
+            Self::InvalidRateLimitSource(source) => {
+                write!(formatter, "unknown desktop rate_limit source: {source}")
             }
             Self::InvalidLastStep(step) => {
                 write!(formatter, "unknown desktop subagent last step: {step}")

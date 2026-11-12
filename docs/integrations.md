@@ -14,7 +14,7 @@ How Gentle Shell GPUI connects to Gentle Shell (the `gentle-shell --mode rpc` ba
 | Engram (memory) | `features/memory/client.rs`, `gentle_core::engram` | Local HTTP |
 | Maestro (UI testing tools for the agent) | `features/settings/maestro.rs` (the section), `features/setup/maestro.rs`, `setup/fetch.rs` | Downloads into the toolchain; `gentle-shell mcp add` |
 | Music (gentle-stream) | `features/music/`, `features/settings/music.rs`, `features/setup/music.rs`, `gentle_core::music` | Unix socket (`multiprocessing.connection`); a Python helper in the player's environment |
-| Subscription usage | `features/usage/` | HTTPS |
+| Subscription usage | `features/usage/`, `state::desktop::subscription` | Gentle Desktop RPC when the backend advertises `get_subscription_usage`; HTTPS fallback (legacy) |
 | Gentle Shell update | `features/updates/` | HTTPS (npm registry) |
 | App update | `features/app_update/` | HTTPS (GitHub releases) |
 | First-run installers | `features/setup/`, `features/onboarding/` | Processes, HTTPS |
@@ -164,6 +164,16 @@ When the backend's `capabilities` advertise `list_subagents` and/or `list_jobs`,
 A new/open session (`new_session`/`switch_session`) resets the Desktop channel: it forgets the pending request and the event baseline without rewinding request ids and returns to Idle, so the following `refresh_state` re-probes capabilities and the supervision lists re-seed exactly once behind it. Late answers from the previous session are uncorrelated and benign.
 
 The Agents panel's Stop button uses `cancel_subagent` when the peer offers it; a peer without the method (or a server `unsupported_method` answer) keeps the legacy "ask the agent to run `subagent_cancel`" prompt exactly once. Jobs cancel over `cancel_job` with no legacy prompt. Model, tokens and cost are shown per helper from the typed `usage` window, with an honest "unavailable" marker where the input/output/cache/reasoning breakdown is not recorded; prompt, tool output, paths and error text never cross the wire.
+
+### Subscription usage (`state::desktop::subscription`)
+
+When the backend's `capabilities` advertise `get_subscription_usage`, the Usage screen reads the whole-account snapshot through this slice instead of `auth.json` and provider APIs, and its Refresh button re-reads with `refresh_subscription_usage`. The slice is pure RPC state: it never reads `auth.json`, resolves `$VAR`/`!command`, builds a bearer header, or calls ChatGPT/NaN. `rate_limit` events reconcile per-provider snapshots — Claude's 5h/week response headers included — so those windows finally arrive in the app.
+
+- `get_subscription_usage` / `refresh_subscription_usage`: empty params for the whole account (or `{ provider }` for one). Both answer the same typed `providers` projection: `provider`, the closed `status` (`ok`/`pending`/`stale`/`failed`/`unavailable`), optional `fetchedAt`/`plan`/`refresh` (`unsupported`/`out_of_scope`), and `limits` → `windows`. No credential, account or URL field is part of the projection.
+- `rate_limit`: `{ source: "refresh" | "response", snapshots }`. The snapshots are full provider projections, upserted by provider id; `source: response` is the per-turn response-header path (Claude), `source: refresh` the refresh path. The event only applies when the capabilities `emits` the exact name, and it never marks the seed fetched.
+- One request in flight at a time, with the same timeout/rollback discipline as permission changes. A `pending`/`stale` entry with no limits keeps the last good limits (the data is still valid, just not fresh); `failed`/`unavailable` are shown honestly with no invented data.
+- The legacy `auth.json` + provider API path runs only when the capabilities are known not to offer `get_subscription_usage`, or the server answers `unsupported_method` for a method it advertised. Any other RPC failure (timeout, transport, malformed, event gap) is shown honestly and never falls back to direct API calls. Without an agent tab, the screen keeps the legacy path.
+- Per-turn limit notices (`notify`, "`N% used (window)`") stay a separate legacy chip path and never overwrite the structured provider windows.
 
 ### Commands the app sends
 
@@ -340,6 +350,8 @@ Blocking HTTP GET (ureq, 8 s, no redirects) on the background executor. Base URL
 
 ### Subscription usage (`features/usage/`)
 
+The preferred path is the Gentle Desktop RPC slice (see "Subscription usage" under RPC protocol). The legacy path below runs only when there is no agent tab, or the backend's `capabilities` are known not to offer `get_subscription_usage` (or answered `unsupported_method`).
+
 `credentials.rs` reads `<agent>/auth.json` and resolves keys the way Pi does (`$VAR`, `!command`); `fetch.rs` makes one GET per card (20 s, no redirects so the token never leaves the origin, `User-Agent: gentle-pi`): Codex at `https://chatgpt.com/backend-api/wham/usage` and NaN at `https://cloud-api.nan.builders/api/usage/quota`. The parsers are `gentle_core::usage::subscription`.
 
 ### Gentle Shell update (`features/updates/`)
@@ -389,7 +401,7 @@ The canvas is detected from the `gentle_design` result (`details.url`, `refreshe
 ## Limits of an RPC host
 
 - Helpers' model, tokens and cost arrive only from backends whose `capabilities` offer `list_subagents`; the token breakdown is unavailable while a helper is in flight. Older Shells keep the legacy `gentle-agents` widget without model/usage/cost.
-- Claude subscription windows only arrive as response headers inside the TUI; the app sees the limit notices (`notify`) but not the full windows.
+- Claude subscription windows arrive through the `rate_limit` event when the backend advertises `get_subscription_usage`; without it the app sees only the legacy limit notices (`notify`), not the full windows.
 - Helpers and background jobs stop directly only when the backend offers `cancel_subagent`/`cancel_job`; without them the Agents panel keeps the legacy "ask the agent to run `subagent_cancel`" prompt, and jobs have no cancel.
 - Auto mode may reject actions: input over RPC does not count as a live human decision.
 - The permission mode of a live session changes over the Gentle Desktop RPC channel when the backend advertises `set_permission_mode`; a backend without that method keeps the legacy path (save `permission-mode.json` and restart). See “Permission mode” under RPC protocol.
