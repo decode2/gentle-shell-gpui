@@ -321,6 +321,7 @@ impl SessionView {
                 if !legacy_fallback {
                     self.sync_supervision(cx);
                     self.sync_design(cx);
+                    self.sync_config(cx);
                 }
             }
             DesktopRoute::Supervision => {
@@ -345,6 +346,7 @@ impl SessionView {
                 }
                 self.sync_supervision(cx);
                 self.sync_design(cx);
+                self.sync_config(cx);
             }
             DesktopRoute::Subscription => {
                 let applied = self.desktop.subscription_apply(request);
@@ -359,6 +361,7 @@ impl SessionView {
                     _ => self.apply_subscription(applied, cx),
                 }
                 self.sync_design(cx);
+                self.sync_config(cx);
             }
             DesktopRoute::Design => {
                 let applied = self.desktop.design_apply(request);
@@ -373,6 +376,25 @@ impl SessionView {
                 }
                 self.sync_supervision(cx);
                 self.sync_design(cx);
+                self.sync_config(cx);
+            }
+            DesktopRoute::Config => {
+                let applied = self.desktop.config_apply(request);
+                match applied.report.as_ref() {
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync, and the Profiles screen re-reads every store
+                    // behind it. The record was already accepted, so it is
+                    // never accepted again.
+                    Some(desktop::config::Report::OutOfOrderSequence) => {
+                        let sends = self.desktop.resync();
+                        self.send_desktop(sends, cx);
+                        cx.notify();
+                    }
+                    _ => self.apply_config(applied, cx),
+                }
+                self.sync_supervision(cx);
+                self.sync_design(cx);
+                self.sync_config(cx);
             }
             DesktopRoute::Channel => {
                 let applied = self.desktop.ui(request);
@@ -380,6 +402,7 @@ impl SessionView {
                 self.sync_permission_capabilities(cx);
                 self.sync_supervision(cx);
                 self.sync_design(cx);
+                self.sync_config(cx);
             }
         }
     }
@@ -542,7 +565,8 @@ impl SessionView {
 /// permission slice only when it is a permission response or the advertised
 /// permission event; supervision owns its responses and events; subscription
 /// owns its responses and `rate_limit`; design owns `get_design_canvas` and
-/// `design_canvas`; everything else belongs to the channel
+/// `design_canvas`; config owns `get_config`/`set_config` and
+/// `config_changed`; everything else belongs to the channel
 /// (probe, resync, and every benign foreign/late record). The shared session
 /// then accepts the record exactly once, in the slice that owns it.
 enum DesktopRoute {
@@ -550,6 +574,7 @@ enum DesktopRoute {
     Supervision,
     Subscription,
     Design,
+    Config,
     Channel,
 }
 
@@ -600,6 +625,11 @@ fn route_desktop_widget(
                 DesktopRoute::Subscription
             } else if pending == Some(DesktopMethod::GetDesignCanvas) {
                 DesktopRoute::Design
+            } else if matches!(
+                pending,
+                Some(DesktopMethod::GetConfig) | Some(DesktopMethod::SetConfig)
+            ) {
+                DesktopRoute::Config
             } else {
                 DesktopRoute::Channel
             }
@@ -622,6 +652,9 @@ fn route_desktop_widget(
         }
         Ok(Some(DesktopRecord::Event(event))) if event.event == desktop::design::DESIGN_CANVAS => {
             DesktopRoute::Design
+        }
+        Ok(Some(DesktopRecord::Event(event))) if event.event == desktop::config::CONFIG_CHANGED => {
+            DesktopRoute::Config
         }
         _ => DesktopRoute::Channel,
     }
@@ -1046,6 +1079,62 @@ mod tests {
         let broken = decode_widget(&widget(Some(vec!["not json".into()])));
         assert!(matches!(
             route_desktop_widget(&broken, None),
+            DesktopRoute::Channel
+        ));
+    }
+
+    #[test]
+    fn config_records_route_to_the_config_slice_only() {
+        // A config answer goes to the config slice only while its request is
+        // the pending one; the same record answers nothing else.
+        let answer = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": "desktop-3",
+            "ok": false,
+            "error": {"code": "revision_conflict", "message": "changed"},
+        }))));
+        let decoded = decode_widget(&answer);
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::GetConfig)),
+            DesktopRoute::Config
+        ));
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::SetConfig)),
+            DesktopRoute::Config
+        ));
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::GetSnapshot)),
+            DesktopRoute::Channel
+        ));
+        assert!(matches!(
+            route_desktop_widget(&decoded, None),
+            DesktopRoute::Channel
+        ));
+
+        // Exactly `config_changed`; a look-alike name stays on the channel.
+        let changed = |event: &str| {
+            decode_widget(&widget(Some(record(json!({
+                "schema": SCHEMA,
+                "kind": "event",
+                "seq": 1,
+                "event": event,
+                "data": {
+                    "store": "profiles",
+                    "scope": "global",
+                    "writeTarget": "global",
+                    "revision": "sha256:1",
+                    "writeRevision": "sha256:2",
+                    "source": "desktop",
+                },
+            })))))
+        };
+        assert!(matches!(
+            route_desktop_widget(&changed("config_changed"), None),
+            DesktopRoute::Config
+        ));
+        assert!(matches!(
+            route_desktop_widget(&changed("config_changed_v2"), None),
             DesktopRoute::Channel
         ));
     }

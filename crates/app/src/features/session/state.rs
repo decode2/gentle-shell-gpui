@@ -233,8 +233,13 @@ pub(in crate::features::session) mod desktop {
     use pi_rpc::UiMethod;
     use pi_rpc::UiRequest;
     use pi_rpc::desktop_rpc::{
-        Capabilities, DesktopAgent, DesktopJob, DesktopMethod, DesktopRecord, DesktopRequest,
-        DesktopRpcError, DesktopSession, PROMPT_COMMAND, Snapshot, WIDGET_KEY,
+        Capabilities, ConfigStore, ConfigWrite, DesktopAgent, DesktopJob, DesktopMethod,
+        DesktopRecord, DesktopRequest, DesktopRpcError, DesktopSession, PROMPT_COMMAND, Snapshot,
+        WIDGET_KEY,
+    };
+
+    use crate::features::profiles::{
+        ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport, ConfigTicket,
     };
 
     /// A request the tab must hand to its backend, with the generation of the
@@ -318,6 +323,9 @@ pub(in crate::features::session) mod desktop {
     pub(in crate::features::session) struct Desktop {
         session: DesktopSession,
         capabilities: Option<Capabilities>,
+        /// Pi listed no `gentle:desktop` command: the extension is absent, as
+        /// opposed to a channel that failed while probing.
+        missing_extension: bool,
         snapshot: Option<Snapshot>,
         /// The newest sequence the tab's state accounts for: a snapshot covers
         /// its own, and each accepted event advances it. What an event means
@@ -336,6 +344,8 @@ pub(in crate::features::session) mod desktop {
         subscription: subscription::Subscription,
         /// The design canvas over the same channel.
         design: design::Design,
+        /// The config stores the Profiles screen reads and writes.
+        config: config::Config,
     }
 
     impl Default for Desktop {
@@ -349,6 +359,7 @@ pub(in crate::features::session) mod desktop {
             Self {
                 session: DesktopSession::new(),
                 capabilities: None,
+                missing_extension: false,
                 snapshot: None,
                 covered: None,
                 step: Step::Idle,
@@ -357,6 +368,7 @@ pub(in crate::features::session) mod desktop {
                 supervision: supervision::Agents::default(),
                 subscription: subscription::Subscription::default(),
                 design: design::Design::new(),
+                config: config::Config::default(),
             }
         }
 
@@ -366,6 +378,7 @@ pub(in crate::features::session) mod desktop {
         pub(in crate::features::session) fn reset(&mut self) {
             self.session.reset();
             self.capabilities = None;
+            self.missing_extension = false;
             self.snapshot = None;
             self.covered = None;
             self.step = Step::Idle;
@@ -374,6 +387,7 @@ pub(in crate::features::session) mod desktop {
             self.supervision.reset();
             self.subscription.reset(&mut self.session);
             self.design.reset(&mut self.session);
+            self.config.reset(&mut self.session);
         }
 
         /// The backend is ready and Pi listed (or did not list) the extension's
@@ -389,6 +403,7 @@ pub(in crate::features::session) mod desktop {
             }
             if !registered {
                 self.step = Step::Unavailable;
+                self.missing_extension = true;
                 return Applied {
                     sends: Vec::new(),
                     report: Some(Report::MissingExtension),
@@ -435,6 +450,7 @@ pub(in crate::features::session) mod desktop {
                             self.capabilities = Some(capabilities.clone());
                             self.supervision.set_capabilities(capabilities.clone());
                             self.subscription.set_capabilities(capabilities.clone());
+                            self.config.set_capabilities(capabilities.clone());
                             self.design.set_capabilities(capabilities);
                             Applied {
                                 sends: self.issue(DesktopMethod::GetSnapshot, Step::Snapshot),
@@ -456,9 +472,9 @@ pub(in crate::features::session) mod desktop {
                         }
                         Err(error) => self.unavailable(Report::Snapshot(error)),
                     },
-                    // The permission, supervision, subscription and design
-                    // methods are served by their own slices; this channel only
-                    // probes and sequences.
+                    // The permission, supervision, subscription, design and
+                    // config methods are served by their own slices; this
+                    // channel only probes and sequences.
                     Some(DesktopMethod::GetPermissionMode)
                     | Some(DesktopMethod::SetPermissionMode)
                     | Some(DesktopMethod::ListSubagents)
@@ -467,7 +483,9 @@ pub(in crate::features::session) mod desktop {
                     | Some(DesktopMethod::CancelJob)
                     | Some(DesktopMethod::GetSubscriptionUsage)
                     | Some(DesktopMethod::RefreshSubscriptionUsage)
-                    | Some(DesktopMethod::GetDesignCanvas) => Applied::default(),
+                    | Some(DesktopMethod::GetDesignCanvas)
+                    | Some(DesktopMethod::GetConfig)
+                    | Some(DesktopMethod::SetConfig) => Applied::default(),
                     None => Applied::default(),
                 },
                 Ok(Some(DesktopRecord::Event(event))) => {
@@ -729,10 +747,92 @@ pub(in crate::features::session) mod desktop {
             self.design.outer(&mut self.session, generation, handled)
         }
 
+        /// Whether this backend serves the config stores over the channel.
+        /// Only a missing extension or capabilities without the methods mean
+        /// the direct-file path; a channel that failed here is neither.
+        pub(in crate::features::session) fn config_support(&self) -> ConfigSupport {
+            if self.step == Step::Unavailable {
+                return if self.missing_extension {
+                    ConfigSupport::Legacy
+                } else {
+                    ConfigSupport::Unavailable
+                };
+            }
+            match self.config.offers_config() {
+                None => ConfigSupport::NotReady,
+                Some(true) => ConfigSupport::Rpc,
+                Some(false) => ConfigSupport::Legacy,
+            }
+        }
+
+        /// Queue a `get_config`; [`Self::config_pump`] sends it.
+        pub(in crate::features::session) fn config_get(
+            &mut self,
+            store: ConfigStore,
+        ) -> Result<ConfigTicket, ConfigFailure> {
+            self.config.get(store)
+        }
+
+        /// Queue a `set_config`; [`Self::config_pump`] sends it.
+        pub(in crate::features::session) fn config_set(
+            &mut self,
+            write: ConfigWrite,
+            expected_revision: String,
+        ) -> Result<ConfigTicket, ConfigFailure> {
+            self.config.set(write, expected_revision)
+        }
+
+        /// Send the next queued config request once the probe has landed, no
+        /// resync is owed and no other request is in flight.
+        pub(in crate::features::session) fn config_pump(&mut self) -> config::Applied {
+            if self.step != Step::Ready || self.pending_resync {
+                return config::Applied::default();
+            }
+            self.config.pump(&mut self.session)
+        }
+
+        /// One incoming UI request for the config slice.
+        pub(in crate::features::session) fn config_apply(
+            &mut self,
+            request: &UiRequest,
+        ) -> config::Applied {
+            self.config.apply(&mut self.session, request)
+        }
+
+        /// The pending timeout for a config request.
+        pub(in crate::features::session) fn config_expire(
+            &mut self,
+            generation: u64,
+        ) -> config::Applied {
+            self.config.expire(&mut self.session, generation)
+        }
+
+        /// Pi answered the outer prompt of a config request.
+        pub(in crate::features::session) fn config_outer(
+            &mut self,
+            generation: u64,
+            handled: bool,
+        ) -> config::Applied {
+            self.config.outer(&mut self.session, generation, handled)
+        }
+
+        /// The answers to config tickets since the last call.
+        pub(in crate::features::session) fn take_config_outcomes(
+            &mut self,
+        ) -> Vec<(ConfigTicket, ConfigOutcome)> {
+            self.config.take_outcomes()
+        }
+
+        /// The stores that changed (or may have) since the last call.
+        pub(in crate::features::session) fn take_config_changes(&mut self) -> Vec<ConfigChange> {
+            self.config.take_changes()
+        }
+
         /// Stop asking this backend and say why once: the channel is unusable
         /// here until the backend is replaced.
         fn unavailable(&mut self, report: Report) -> Applied {
             self.session.abandon();
+            self.config.drop_queued();
             self.step = Step::Unavailable;
             Applied {
                 sends: Vec::new(),
@@ -744,8 +844,10 @@ pub(in crate::features::session) mod desktop {
         pub(in crate::features::session) fn resync(&mut self) -> Vec<Send> {
             // Whichever record showed the gap, a `design_canvas` transition may
             // be among the lost events: the canvas re-seeds behind the
-            // snapshot.
+            // snapshot. Lost `config_changed` events mean any store may have
+            // moved: the screen re-reads them behind it.
             self.design.rearm();
+            self.config.rearm();
             if self.session.pending().is_some() {
                 // A request is in flight. A channel probe or resync already
                 // covers the gap; a permission request owes one resync once it
@@ -783,6 +885,9 @@ pub(in crate::features::session) mod desktop {
             self.session.abandon();
             self.step = Step::Idle;
             self.generation += 1;
+            // Nothing pumps the config queue until the channel is probed
+            // again, so its waiting tickets are answered now.
+            self.config.drop_queued();
         }
 
         /// One request; the step follows only when the channel really asked.
@@ -2693,17 +2798,418 @@ pub(in crate::features::session) mod desktop {
             session.pending().map(|(_, method)| method) == Some(DesktopMethod::GetDesignCanvas)
         }
     }
+
+    /// Gentle Desktop's config stores in one tab.
+    ///
+    /// When the backend's `capabilities` advertise `get_config` and
+    /// `set_config`, the Profiles screen reads and writes its stores through
+    /// this slice by name, never by path: `profiles`, `profile_fallbacks` and
+    /// `pins` are writable, `models`, `subagents` and `managed_assets` are
+    /// read-only. The screen holds tickets; the slice queues its requests and
+    /// sends one at a time on the shared [`DesktopSession`], so probe and the
+    /// other slices keep one id space, one pending slot and one event
+    /// baseline. Each ticket gets exactly one outcome: the answer, the failure,
+    /// or `Dropped` when the backend went away first. `config_changed` events
+    /// and gaps in the sequence become store changes the screen re-reads.
+    ///
+    /// The slice never retries a write and never touches a file: a
+    /// `revision_conflict` is reported to the screen, which re-reads.
+    pub(in crate::features::session) mod config {
+        use std::collections::VecDeque;
+
+        use pi_rpc::UiRequest;
+        use pi_rpc::desktop_rpc::{
+            Capabilities, ConfigStore, ConfigWrite, DesktopEvent, DesktopMethod, DesktopRecord,
+            DesktopResponse, DesktopRpcError, DesktopSession,
+        };
+
+        use super::Send;
+        use crate::features::profiles::{ConfigChange, ConfigFailure, ConfigOutcome, ConfigTicket};
+
+        /// The wire name of the only event this slice applies.
+        pub(in crate::features::session) const CONFIG_CHANGED: &str = "config_changed";
+
+        /// What one decision produced: the requests to send, and a failure the
+        /// tab shows through its report path. Outcomes for the screen are
+        /// kept in the slice until it takes them.
+        #[derive(Debug, Default)]
+        pub(in crate::features::session) struct Applied {
+            pub(in crate::features::session) sends: Vec<Send>,
+            pub(in crate::features::session) report: Option<Report>,
+        }
+
+        /// Why a config request stopped, for the conversation. A documented
+        /// config failure (`revision_conflict`, `invalid_data`…) is not here:
+        /// it is the screen's to show, as an outcome. Asking before the probe
+        /// (`NotReady`) or of a peer without the method (`Unsupported`) is
+        /// refused at once, as the [`ConfigFailure`] the caller gets back.
+        #[derive(Debug, Clone, PartialEq, Eq)]
+        pub(in crate::features::session) enum Report {
+            /// The server answered `unsupported_method` for an advertised
+            /// method.
+            UnsupportedMethod,
+            /// The request timed out before the server answered.
+            Timeout,
+            /// A transport, server or decoding failure.
+            Failure(DesktopRpcError),
+            /// A gap in the event sequence: the record was already accepted,
+            /// so the wiring resyncs instead of accepting it again.
+            OutOfOrderSequence,
+        }
+
+        impl Report {
+            /// What the conversation says about it.
+            pub(in crate::features::session) fn message(&self) -> String {
+                match self {
+                    Self::UnsupportedMethod => {
+                        "This Gentle Shell does not serve its configuration to Desktop.".to_string()
+                    }
+                    Self::Timeout => "The configuration request timed out.".to_string(),
+                    Self::Failure(error) => {
+                        format!("The configuration request failed ({error}).")
+                    }
+                    Self::OutOfOrderSequence => {
+                        "Gentle Desktop events were lost; re-reading the configuration.".to_string()
+                    }
+                }
+            }
+
+            /// Whether the Profiles screen keeps its direct-file path: the
+            /// peer lacks the method. That is silent in the conversation.
+            pub(in crate::features::session) fn is_legacy(&self) -> bool {
+                matches!(self, Self::UnsupportedMethod)
+            }
+        }
+
+        /// One queued request.
+        #[derive(Debug)]
+        enum Op {
+            Get(ConfigStore),
+            Set(ConfigWrite, String),
+        }
+
+        #[derive(Debug, Default)]
+        pub(in crate::features::session) struct Config {
+            capabilities: Option<Capabilities>,
+            /// Requests waiting for the shared slot, in the order asked.
+            queue: VecDeque<(ConfigTicket, Op)>,
+            /// The ticket whose request is on the wire.
+            in_flight: Option<ConfigTicket>,
+            /// Never rewound, so a ticket from before a reset never matches.
+            next_ticket: ConfigTicket,
+            /// Bumped per request, so an old timer cannot drop a newer one.
+            generation: u64,
+            outcomes: Vec<(ConfigTicket, ConfigOutcome)>,
+            changes: Vec<ConfigChange>,
+        }
+
+        impl Config {
+            /// Adopt the peer's capabilities once the probe completes.
+            pub(in crate::features::session) fn set_capabilities(
+                &mut self,
+                capabilities: Capabilities,
+            ) {
+                self.capabilities = Some(capabilities);
+            }
+
+            /// Whether the peer offers both config methods; `None` until the
+            /// probe has said. Reading without writing cannot back an editor.
+            pub(in crate::features::session) fn offers_config(&self) -> Option<bool> {
+                self.capabilities.as_ref().map(|capabilities| {
+                    capabilities.supports(DesktopMethod::GetConfig)
+                        && capabilities.supports(DesktopMethod::SetConfig)
+                })
+            }
+
+            /// Queue a read of one store.
+            pub(in crate::features::session) fn get(
+                &mut self,
+                store: ConfigStore,
+            ) -> Result<ConfigTicket, ConfigFailure> {
+                self.check(DesktopMethod::GetConfig)?;
+                Ok(self.enqueue(Op::Get(store)))
+            }
+
+            /// Queue a write guarded by `expected_revision`.
+            pub(in crate::features::session) fn set(
+                &mut self,
+                write: ConfigWrite,
+                expected_revision: String,
+            ) -> Result<ConfigTicket, ConfigFailure> {
+                self.check(DesktopMethod::SetConfig)?;
+                Ok(self.enqueue(Op::Set(write, expected_revision)))
+            }
+
+            fn check(&self, method: DesktopMethod) -> Result<(), ConfigFailure> {
+                match &self.capabilities {
+                    None => Err(ConfigFailure::NotReady),
+                    Some(capabilities) if !capabilities.supports(method) => {
+                        Err(ConfigFailure::Unsupported)
+                    }
+                    Some(_) => Ok(()),
+                }
+            }
+
+            fn enqueue(&mut self, op: Op) -> ConfigTicket {
+                self.next_ticket += 1;
+                self.queue.push_back((self.next_ticket, op));
+                self.next_ticket
+            }
+
+            /// Send the next queued request when nothing is in flight on the
+            /// shared session. A request that fails validation is answered at
+            /// once and the next one is tried.
+            pub(in crate::features::session) fn pump(
+                &mut self,
+                session: &mut DesktopSession,
+            ) -> Applied {
+                while self.in_flight.is_none() && session.pending().is_none() {
+                    let Some((ticket, op)) = self.queue.pop_front() else {
+                        break;
+                    };
+                    let request = match op {
+                        Op::Get(store) => session.issue_get_config(store),
+                        Op::Set(write, expected) => session.issue_set_config(write, expected),
+                    };
+                    match request {
+                        Ok(request) => {
+                            self.in_flight = Some(ticket);
+                            self.generation += 1;
+                            return Applied {
+                                sends: vec![Send {
+                                    request,
+                                    generation: self.generation,
+                                }],
+                                report: None,
+                            };
+                        }
+                        Err(error) => self.answer(
+                            ticket,
+                            ConfigOutcome::Failed(ConfigFailure::Failure(error.to_string())),
+                        ),
+                    }
+                }
+                Applied::default()
+            }
+
+            /// Pi answered the outer `prompt` of the config request.
+            pub(in crate::features::session) fn outer(
+                &mut self,
+                session: &mut DesktopSession,
+                generation: u64,
+                handled: bool,
+            ) -> Applied {
+                if handled || generation != self.generation || !owns_pending(session) {
+                    return Applied::default();
+                }
+                let error = DesktopRpcError::UnexpectedDisposition { disposition: None };
+                self.rollback(
+                    session,
+                    ConfigOutcome::Failed(ConfigFailure::Failure(error.to_string())),
+                );
+                report(Report::Failure(error))
+            }
+
+            /// One incoming UI request; applies only the records this slice
+            /// owns (the config answers and `config_changed`).
+            pub(in crate::features::session) fn apply(
+                &mut self,
+                session: &mut DesktopSession,
+                request: &UiRequest,
+            ) -> Applied {
+                // The session clears the pending request while correlating, so
+                // the method it answered is read first.
+                let awaiting = session.pending().map(|(_, method)| method);
+                match session.accept(request) {
+                    Ok(Some(DesktopRecord::Response(response))) => match awaiting {
+                        Some(method @ (DesktopMethod::GetConfig | DesktopMethod::SetConfig)) => {
+                            self.apply_response(method, response)
+                        }
+                        _ => Applied::default(),
+                    },
+                    Ok(Some(DesktopRecord::Event(event))) => self.apply_event(event),
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync, and every store is re-read behind it.
+                    Err(DesktopRpcError::OutOfOrderSequence { .. }) => {
+                        report(Report::OutOfOrderSequence)
+                    }
+                    // Not this protocol's widget, or a late, repeated or
+                    // malformed record: never an outcome.
+                    _ => Applied::default(),
+                }
+            }
+
+            /// The pending timeout for `generation` fired.
+            pub(in crate::features::session) fn expire(
+                &mut self,
+                session: &mut DesktopSession,
+                generation: u64,
+            ) -> Applied {
+                if generation != self.generation || !owns_pending(session) {
+                    return Applied::default();
+                }
+                self.rollback(session, ConfigOutcome::Failed(ConfigFailure::Timeout));
+                report(Report::Timeout)
+            }
+
+            /// The backend was replaced or exited: every ticket still open is
+            /// answered `Dropped`, and nothing it said or numbered applies.
+            pub(in crate::features::session) fn reset(&mut self, session: &mut DesktopSession) {
+                session.reset();
+                self.capabilities = None;
+                if let Some(ticket) = self.in_flight.take() {
+                    self.answer(ticket, ConfigOutcome::Failed(ConfigFailure::Dropped));
+                }
+                self.drop_queued();
+                self.changes.clear();
+                self.generation += 1;
+            }
+
+            /// Answer every queued (not yet sent) ticket `Dropped`: the
+            /// channel stopped and nothing will send them.
+            pub(in crate::features::session) fn drop_queued(&mut self) {
+                while let Some((ticket, _)) = self.queue.pop_front() {
+                    self.answer(ticket, ConfigOutcome::Failed(ConfigFailure::Dropped));
+                }
+            }
+
+            /// Events were lost somewhere on the shared channel: any store may
+            /// have changed without its `config_changed`.
+            pub(in crate::features::session) fn rearm(&mut self) {
+                if self.offers_config() != Some(true) {
+                    return;
+                }
+                for store in ConfigStore::ALL {
+                    let change = ConfigChange {
+                        store,
+                        revision: None,
+                    };
+                    if !self.changes.contains(&change) {
+                        self.changes.push(change);
+                    }
+                }
+            }
+
+            pub(in crate::features::session) fn take_outcomes(
+                &mut self,
+            ) -> Vec<(ConfigTicket, ConfigOutcome)> {
+                std::mem::take(&mut self.outcomes)
+            }
+
+            pub(in crate::features::session) fn take_changes(&mut self) -> Vec<ConfigChange> {
+                std::mem::take(&mut self.changes)
+            }
+
+            fn answer(&mut self, ticket: ConfigTicket, outcome: ConfigOutcome) {
+                self.outcomes.push((ticket, outcome));
+            }
+
+            /// Drop the request in flight and answer its ticket. The
+            /// generation moves, so a late timer or disposition is stale.
+            fn rollback(&mut self, session: &mut DesktopSession, outcome: ConfigOutcome) {
+                session.abandon();
+                self.generation += 1;
+                if let Some(ticket) = self.in_flight.take() {
+                    self.answer(ticket, outcome);
+                }
+            }
+
+            fn apply_response(
+                &mut self,
+                method: DesktopMethod,
+                response: DesktopResponse,
+            ) -> Applied {
+                let Some(ticket) = self.in_flight.take() else {
+                    return Applied::default();
+                };
+                let decoded = if method == DesktopMethod::GetConfig {
+                    response.config().map(ConfigOutcome::Read)
+                } else {
+                    response.set_config().map(ConfigOutcome::Written)
+                };
+                let (outcome, reported) = match decoded {
+                    Ok(outcome) => (outcome, None),
+                    Err(DesktopRpcError::RemoteError(info))
+                        if info.code == "unsupported_method" =>
+                    {
+                        (
+                            ConfigOutcome::Failed(ConfigFailure::UnsupportedMethod),
+                            Some(Report::UnsupportedMethod),
+                        )
+                    }
+                    Err(DesktopRpcError::RemoteError(info)) if info.config_error().is_some() => {
+                        let code = info.config_error().expect("checked by the guard");
+                        (
+                            ConfigOutcome::Failed(ConfigFailure::Rejected {
+                                code,
+                                message: info.message,
+                            }),
+                            None,
+                        )
+                    }
+                    Err(error) => (
+                        ConfigOutcome::Failed(ConfigFailure::Failure(error.to_string())),
+                        Some(Report::Failure(error)),
+                    ),
+                };
+                self.answer(ticket, outcome);
+                Applied {
+                    report: reported,
+                    ..Applied::default()
+                }
+            }
+
+            /// A `config_changed` event, applied only when the peer advertised
+            /// that exact name.
+            fn apply_event(&mut self, event: DesktopEvent) -> Applied {
+                let advertised = self
+                    .capabilities
+                    .as_ref()
+                    .is_some_and(|capabilities| capabilities.emits(CONFIG_CHANGED));
+                if event.event != CONFIG_CHANGED || !advertised {
+                    return Applied::default();
+                }
+                match event.config_changed() {
+                    Ok(changed) => {
+                        self.changes.push(ConfigChange {
+                            store: changed.store,
+                            revision: Some(changed.revision),
+                        });
+                        Applied::default()
+                    }
+                    Err(error) => report(Report::Failure(error)),
+                }
+            }
+        }
+
+        fn report(report: Report) -> Applied {
+            Applied {
+                report: Some(report),
+                ..Applied::default()
+            }
+        }
+
+        /// Whether the pending request is this slice's: the other slices
+        /// share the session, so a stale config timer must not drop theirs.
+        fn owns_pending(session: &DesktopSession) -> bool {
+            matches!(
+                session.pending().map(|(_, method)| method),
+                Some(DesktopMethod::GetConfig) | Some(DesktopMethod::SetConfig)
+            )
+        }
+    }
 }
 #[cfg(test)]
 mod tests {
     use pi_rpc::UiMethod;
     use pi_rpc::UiRequest;
     use pi_rpc::desktop_rpc::{
-        Capabilities, DesktopMethod, DesktopSession, PROMPT_COMMAND, PermissionMode, SCHEMA,
-        UsageStatus, WIDGET_KEY,
+        Capabilities, ConfigErrorCode, ConfigStore, ConfigWrite, DesktopMethod, DesktopSession,
+        PROMPT_COMMAND, PermissionMode, ProfilesData, SCHEMA, UsageStatus, WIDGET_KEY,
     };
     use serde_json::{Value, json};
 
+    use super::desktop::config::Report as ConfigReport;
     use super::desktop::design::{Applied as DesignApplied, Design, Report as DesignReport};
     use super::desktop::permission::{self, Permission, Report as PermissionReport};
     use super::desktop::subscription::{Report as SubscriptionReport, Subscription};
@@ -2711,6 +3217,7 @@ mod tests {
     use super::desktop::{self, Desktop, Report, Step};
     use super::{ExtensionUi, ModelInfo, TodoIsland};
     use crate::features::browser::CanvasNotice;
+    use crate::features::profiles::{ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport};
     use gentle_core::tools::TodoTask;
 
     #[test]
@@ -5609,5 +6116,375 @@ mod tests {
         // A peer that does not advertise the event keeps the legacy path.
         let legacy = probed(1);
         assert!(!legacy.design_events_ready());
+    }
+
+    // ── Config ──────────────────────────────────────────────────────────────
+
+    /// A Ready channel at `sequence` whose peer offers `methods` and `events`
+    /// besides the probe's own.
+    fn config_probed(sequence: u64, methods: &[&str], events: &[&str]) -> Desktop {
+        let mut desktop = Desktop::new();
+        let probe = desktop.ready(true);
+        let _ = desktop.outer(probe.sends[0].generation, true);
+        let mut all = vec!["capabilities", "get_snapshot"];
+        all.extend_from_slice(methods);
+        let applied = desktop.ui(&desktop_widget(record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": probe.sends[0].request.request_id(),
+            "ok": true,
+            "data": {
+                "schema": SCHEMA,
+                "command": PROMPT_COMMAND,
+                "widget": WIDGET_KEY,
+                "methods": all,
+                "events": events,
+            },
+        }))));
+        let snapshot_id = applied.sends[0].request.request_id().to_string();
+        let _ = desktop.ui(&desktop_widget(snapshot_lines(&snapshot_id, sequence)));
+        desktop
+    }
+
+    fn config_ready() -> Desktop {
+        config_probed(1, &["get_config", "set_config"], &["config_changed"])
+    }
+
+    fn params(send: &desktop::Send) -> Value {
+        serde_json::from_str::<Value>(send.request.payload()).unwrap()["params"].clone()
+    }
+
+    fn profiles_state_json(revision: &str, write_revision: &str) -> Value {
+        json!({
+            "store": "profiles",
+            "scope": "global",
+            "readOnly": false,
+            "status": "ok",
+            "revision": revision,
+            "value": {"kind": "gentle-pi.agent_model_profiles", "version": 1, "profiles": {}},
+            "layers": [{"source": "global", "status": "ok"}],
+            "writeTargets": [{"target": "global", "status": "ok", "writeRevision": write_revision}],
+        })
+    }
+
+    fn config_response_lines(request_id: &str, data: Value) -> Vec<String> {
+        record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": request_id,
+            "ok": true,
+            "data": data,
+        }))
+    }
+
+    fn config_error_lines(request_id: &str, code: &str) -> Vec<String> {
+        record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": request_id,
+            "ok": false,
+            "error": {"code": code, "message": format!("{code} from the server")},
+        }))
+    }
+
+    fn config_changed_lines(seq: u64, event: &str, store: &str, revision: &str) -> Vec<String> {
+        let (scope, target) = match store {
+            "pins" => ("local+repo", "local"),
+            _ => ("global", "global"),
+        };
+        record(json!({
+            "schema": SCHEMA,
+            "kind": "event",
+            "seq": seq,
+            "event": event,
+            "data": {
+                "store": store,
+                "scope": scope,
+                "writeTarget": target,
+                "revision": revision,
+                "writeRevision": "sha256:w",
+                "source": "desktop",
+            },
+        }))
+    }
+
+    fn profiles_write() -> ConfigWrite {
+        ConfigWrite::Profiles(
+            ProfilesData::new(json!({
+                "kind": "gentle-pi.agent_model_profiles",
+                "version": 1,
+                "profiles": {"deep": {}},
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn config_support_follows_the_probe() {
+        // Nothing probed yet: wait, never guess.
+        let mut desktop = Desktop::new();
+        assert_eq!(desktop.config_support(), ConfigSupport::NotReady);
+        assert_eq!(
+            desktop.config_get(ConfigStore::Profiles),
+            Err(ConfigFailure::NotReady)
+        );
+
+        // No extension at all: the direct-file path.
+        let _ = desktop.ready(false);
+        assert_eq!(desktop.config_support(), ConfigSupport::Legacy);
+
+        // Capabilities without the config methods confirm their absence.
+        let mut old = probed(1);
+        assert_eq!(old.config_support(), ConfigSupport::Legacy);
+        assert_eq!(
+            old.config_get(ConfigStore::Profiles),
+            Err(ConfigFailure::Unsupported)
+        );
+        assert_eq!(
+            old.config_set(profiles_write(), "sha256:a".into()),
+            Err(ConfigFailure::Unsupported)
+        );
+
+        // Reading without writing is not enough for the screen to edit.
+        let read_only = config_probed(1, &["get_config"], &[]);
+        assert_eq!(read_only.config_support(), ConfigSupport::Legacy);
+
+        assert_eq!(config_ready().config_support(), ConfigSupport::Rpc);
+    }
+
+    #[test]
+    fn config_sends_one_request_at_a_time_in_order() {
+        let mut desktop = config_ready();
+        let first = desktop.config_get(ConfigStore::Profiles).unwrap();
+        let second = desktop.config_get(ConfigStore::Pins).unwrap();
+        assert_ne!(first, second);
+
+        let pumped = desktop.config_pump();
+        assert_eq!(pumped.sends.len(), 1);
+        assert_eq!(pumped.sends[0].request.method(), DesktopMethod::GetConfig);
+        assert_eq!(params(&pumped.sends[0]), json!({"store": "profiles"}));
+        // One in flight: nothing more goes out until it is answered.
+        assert!(desktop.config_pump().sends.is_empty());
+
+        let id = pumped.sends[0].request.request_id().to_string();
+        let applied = desktop.config_apply(&desktop_widget(config_response_lines(
+            &id,
+            profiles_state_json("sha256:r1", "sha256:w1"),
+        )));
+        assert!(applied.report.is_none());
+        let outcomes = desktop.take_config_outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0, first);
+        assert!(matches!(
+            &outcomes[0].1,
+            ConfigOutcome::Read(state) if state.store == ConfigStore::Profiles && state.revision == "sha256:r1"
+        ));
+        assert!(desktop.take_config_outcomes().is_empty(), "drained once");
+
+        let pumped = desktop.config_pump();
+        assert_eq!(params(&pumped.sends[0]), json!({"store": "pins"}));
+        // The other slices see the shared slot taken.
+        assert!(desktop.session().pending().is_some());
+    }
+
+    #[test]
+    fn config_set_carries_the_expected_revision_and_maps_failures() {
+        let mut desktop = config_ready();
+        let ticket = desktop
+            .config_set(profiles_write(), "sha256:w1".into())
+            .unwrap();
+        let pumped = desktop.config_pump();
+        assert_eq!(pumped.sends[0].request.method(), DesktopMethod::SetConfig);
+        let sent = params(&pumped.sends[0]);
+        assert_eq!(sent["store"], "profiles");
+        assert_eq!(sent["expectedRevision"], "sha256:w1");
+        assert_eq!(sent["data"]["profiles"], json!({"deep": {}}));
+
+        let mut written = profiles_state_json("sha256:r2", "sha256:w2");
+        written["writeTarget"] = json!("global");
+        written["writeRevision"] = json!("sha256:w2");
+        written["changed"] = json!(true);
+        let id = pumped.sends[0].request.request_id().to_string();
+        let _ = desktop.config_apply(&desktop_widget(config_response_lines(&id, written)));
+        let outcomes = desktop.take_config_outcomes();
+        assert!(matches!(
+            &outcomes[..],
+            [(t, ConfigOutcome::Written(result))] if *t == ticket && result.write_revision == "sha256:w2" && result.changed
+        ));
+
+        // Every documented config failure reaches the screen as itself.
+        for (code, expected) in [
+            ("revision_conflict", ConfigErrorCode::RevisionConflict),
+            ("invalid_data", ConfigErrorCode::InvalidData),
+            ("write_failed", ConfigErrorCode::WriteFailed),
+            ("config_unavailable", ConfigErrorCode::ConfigUnavailable),
+            ("read_only", ConfigErrorCode::ReadOnly),
+        ] {
+            let ticket = desktop
+                .config_set(profiles_write(), "sha256:w2".into())
+                .unwrap();
+            let pumped = desktop.config_pump();
+            let id = pumped.sends[0].request.request_id().to_string();
+            let applied = desktop.config_apply(&desktop_widget(config_error_lines(&id, code)));
+            assert!(applied.report.is_none(), "{code}: the screen reports it");
+            let outcomes = desktop.take_config_outcomes();
+            assert!(
+                matches!(
+                    &outcomes[..],
+                    [(t, ConfigOutcome::Failed(ConfigFailure::Rejected { code: c, .. }))]
+                        if *t == ticket && *c == expected
+                ),
+                "{code}"
+            );
+        }
+
+        // `unsupported_method` is the legacy signal, not a rejection.
+        desktop
+            .config_set(profiles_write(), "sha256:w2".into())
+            .unwrap();
+        let pumped = desktop.config_pump();
+        let id = pumped.sends[0].request.request_id().to_string();
+        let applied = desktop.config_apply(&desktop_widget(config_error_lines(
+            &id,
+            "unsupported_method",
+        )));
+        assert!(applied.report.as_ref().is_none_or(ConfigReport::is_legacy));
+        let outcomes = desktop.take_config_outcomes();
+        assert!(matches!(
+            &outcomes[..],
+            [(_, ConfigOutcome::Failed(ConfigFailure::UnsupportedMethod))]
+        ));
+    }
+
+    #[test]
+    fn config_changed_needs_the_exact_advertised_event() {
+        let mut desktop = config_ready();
+        let applied = desktop.config_apply(&desktop_widget(config_changed_lines(
+            2,
+            "config_changed",
+            "profiles",
+            "sha256:r9",
+        )));
+        assert!(applied.sends.is_empty() && applied.report.is_none());
+        assert_eq!(
+            desktop.take_config_changes(),
+            vec![ConfigChange {
+                store: ConfigStore::Profiles,
+                revision: Some("sha256:r9".into()),
+            }]
+        );
+        assert!(desktop.take_config_changes().is_empty(), "drained once");
+
+        // A peer that never advertised the event changes nothing.
+        let mut quiet = config_probed(1, &["get_config", "set_config"], &[]);
+        let _ = quiet.config_apply(&desktop_widget(config_changed_lines(
+            2,
+            "config_changed",
+            "profiles",
+            "sha256:r9",
+        )));
+        assert!(quiet.take_config_changes().is_empty());
+    }
+
+    #[test]
+    fn config_timeout_disposition_and_reset_drop_their_tickets() {
+        let mut desktop = config_ready();
+        let ticket = desktop.config_get(ConfigStore::Models).unwrap();
+        let pumped = desktop.config_pump();
+        let generation = pumped.sends[0].generation;
+        // A stale timer is not this request's.
+        assert!(
+            desktop
+                .config_expire(generation.wrapping_sub(1))
+                .report
+                .is_none()
+        );
+        assert!(desktop.take_config_outcomes().is_empty());
+        let expired = desktop.config_expire(generation);
+        assert_eq!(expired.report, Some(ConfigReport::Timeout));
+        assert_eq!(
+            desktop.take_config_outcomes(),
+            vec![(ticket, ConfigOutcome::Failed(ConfigFailure::Timeout))]
+        );
+        assert!(desktop.session().pending().is_none());
+
+        // An outer prompt Pi did not handle drops the request too.
+        let ticket = desktop.config_get(ConfigStore::Models).unwrap();
+        let pumped = desktop.config_pump();
+        let generation = pumped.sends[0].generation;
+        assert!(desktop.config_outer(generation, true).report.is_none());
+        let dropped = desktop.config_outer(generation, false);
+        assert!(matches!(dropped.report, Some(ConfigReport::Failure(_))));
+        assert!(matches!(
+            &desktop.take_config_outcomes()[..],
+            [(t, ConfigOutcome::Failed(ConfigFailure::Failure(_)))] if *t == ticket
+        ));
+
+        // A backend reset drops what was in flight and what was queued; a late
+        // answer to the old request is benign.
+        let in_flight = desktop.config_get(ConfigStore::Profiles).unwrap();
+        let queued = desktop.config_get(ConfigStore::Pins).unwrap();
+        let pumped = desktop.config_pump();
+        let old_id = pumped.sends[0].request.request_id().to_string();
+        desktop.reset();
+        let outcomes = desktop.take_config_outcomes();
+        assert_eq!(
+            outcomes,
+            vec![
+                (in_flight, ConfigOutcome::Failed(ConfigFailure::Dropped)),
+                (queued, ConfigOutcome::Failed(ConfigFailure::Dropped)),
+            ]
+        );
+        assert_eq!(desktop.config_support(), ConfigSupport::NotReady);
+        let late = desktop.config_apply(&desktop_widget(config_response_lines(
+            &old_id,
+            profiles_state_json("sha256:old", "sha256:old"),
+        )));
+        assert!(late.sends.is_empty());
+        assert!(desktop.take_config_outcomes().is_empty());
+    }
+
+    #[test]
+    fn config_gap_resyncs_once_and_marks_every_store_changed() {
+        let mut desktop = config_ready();
+        let gap = desktop.config_apply(&desktop_widget(config_changed_lines(
+            5,
+            "config_changed",
+            "profiles",
+            "sha256:r5",
+        )));
+        assert_eq!(gap.report, Some(ConfigReport::OutOfOrderSequence));
+        // The wiring hands the gap to the shared resync.
+        let sends = desktop.resync();
+        assert_eq!(sends.len(), 1);
+        assert_eq!(sends[0].request.method(), DesktopMethod::GetSnapshot);
+        let changes = desktop.take_config_changes();
+        assert_eq!(changes.len(), ConfigStore::ALL.len());
+        assert!(changes.iter().all(|change| change.revision.is_none()));
+
+        // Config requests wait behind the snapshot.
+        desktop.config_get(ConfigStore::Profiles).unwrap();
+        assert!(desktop.config_pump().sends.is_empty());
+        land_resync(&mut desktop, &sends, 5);
+        assert_eq!(desktop.config_pump().sends.len(), 1);
+
+        // A gap while a config request is in flight defers the snapshot until
+        // that request settles.
+        assert!(desktop.resync().is_empty());
+        assert!(desktop.flush_resync().is_empty(), "still in flight");
+    }
+
+    #[test]
+    fn config_requests_fail_instead_of_hanging_when_the_channel_stops() {
+        let mut desktop = config_ready();
+        let queued = desktop.config_get(ConfigStore::Profiles).unwrap();
+        // A resync snapshot that times out leaves the channel idle: nothing
+        // will pump the queue, so its tickets are answered now.
+        let sends = desktop.resync();
+        let _ = desktop.expire(sends[0].generation);
+        assert_eq!(
+            desktop.take_config_outcomes(),
+            vec![(queued, ConfigOutcome::Failed(ConfigFailure::Dropped))]
+        );
     }
 }

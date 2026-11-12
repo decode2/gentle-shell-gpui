@@ -9,9 +9,10 @@ use anyhow::Result;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 use pi_rpc::PiProcess;
-use pi_rpc::desktop_rpc::DesktopMethod;
+use pi_rpc::desktop_rpc::{ConfigStore, ConfigWrite, DesktopMethod};
 use serde_json::{Value, json};
 
+use super::state::desktop::config::Applied as ConfigApplied;
 use super::state::desktop::design::Applied as DesignApplied;
 use super::state::desktop::permission::Applied as PermissionApplied;
 use super::state::desktop::subscription::Applied as SubscriptionApplied;
@@ -19,6 +20,9 @@ use super::state::desktop::supervision::Applied as SupervisionApplied;
 use super::state::desktop::{self, Applied as DesktopApplied, Send as DesktopSend};
 use super::state::{BackendStatus, ModelInfo};
 use super::{SessionEvent, SessionView, attachments, builtins};
+use crate::features::profiles::{
+    ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport, ConfigTicket,
+};
 use gentle_core::transcript::NoticeLevel;
 
 /// How long a Desktop request may stay unanswered before the tab drops it.
@@ -163,6 +167,80 @@ impl SessionView {
         if let Some(canvas) = applied.notice {
             cx.emit(SessionEvent::DesignCanvas(canvas));
         }
+    }
+
+    /// Act on a config decision: say what failed (old Shells without the
+    /// methods stay silent, the Profiles screen keeps its direct-file path),
+    /// send what the slice asked for, and wake the screen, which takes its
+    /// outcomes and changes from the session.
+    pub(super) fn apply_config(&mut self, applied: ConfigApplied, cx: &mut Context<Self>) {
+        if let Some(report) = &applied.report
+            && !report.is_legacy()
+        {
+            self.transcript
+                .notice(NoticeLevel::Warning, report.message());
+        }
+        self.send_desktop(applied.sends, cx);
+        // A gap seen while the config request was in flight is due now that it
+        // settled or rolled back.
+        let resync = self.desktop.flush_resync();
+        self.send_desktop(resync, cx);
+        cx.notify();
+    }
+
+    /// Send the next queued config request once the channel is free.
+    pub(super) fn sync_config(&mut self, cx: &mut Context<Self>) {
+        let applied = self.desktop.config_pump();
+        if !applied.sends.is_empty() || applied.report.is_some() {
+            self.apply_config(applied, cx);
+        }
+    }
+
+    /// Whether the Profiles screen edits this tab's config over Desktop RPC,
+    /// waits for the probe, or keeps its direct-file path. No backend to ask
+    /// (it failed or exited) is the direct-file path too: there is no writer
+    /// to race.
+    pub(crate) fn config_support(&self) -> ConfigSupport {
+        match self.backend.status {
+            BackendStatus::Failed(_) | BackendStatus::Exited(_) => ConfigSupport::Legacy,
+            BackendStatus::Starting | BackendStatus::Ready(_) => self.desktop.config_support(),
+        }
+    }
+
+    /// Read one config store over the channel; the answer arrives as an
+    /// outcome for the returned ticket.
+    pub(crate) fn config_get(
+        &mut self,
+        store: ConfigStore,
+        cx: &mut Context<Self>,
+    ) -> Result<ConfigTicket, ConfigFailure> {
+        let ticket = self.desktop.config_get(store)?;
+        self.sync_config(cx);
+        Ok(ticket)
+    }
+
+    /// Replace one config store (or pin layer) guarded by the `writeRevision`
+    /// last read; the answer arrives as an outcome for the returned ticket.
+    pub(crate) fn config_set(
+        &mut self,
+        write: ConfigWrite,
+        expected_revision: String,
+        cx: &mut Context<Self>,
+    ) -> Result<ConfigTicket, ConfigFailure> {
+        let ticket = self.desktop.config_set(write, expected_revision)?;
+        self.sync_config(cx);
+        Ok(ticket)
+    }
+
+    /// The answers to config tickets since the last call (the Profiles
+    /// screen's to take).
+    pub(crate) fn take_config_outcomes(&mut self) -> Vec<(ConfigTicket, ConfigOutcome)> {
+        self.desktop.take_config_outcomes()
+    }
+
+    /// The stores that changed (or may have) since the last call.
+    pub(crate) fn take_config_changes(&mut self) -> Vec<ConfigChange> {
+        self.desktop.take_config_changes()
     }
 
     /// The Usage screen's snapshot of this session's subscription usage. Pure
@@ -311,7 +389,14 @@ impl SessionView {
                 let applied = self.desktop.design_expire(generation);
                 self.apply_design(applied, cx);
             }
+            DesktopMethod::GetConfig | DesktopMethod::SetConfig => {
+                let applied = self.desktop.config_expire(generation);
+                self.apply_config(applied, cx);
+            }
         }
+        // Whichever request was dropped, the shared slot may be free for the
+        // next queued config request.
+        self.sync_config(cx);
     }
 
     /// Pi answered the outer prompt: hand the disposition to the slice that
@@ -349,7 +434,12 @@ impl SessionView {
                 let applied = self.desktop.design_outer(generation, handled);
                 self.apply_design(applied, cx);
             }
+            DesktopMethod::GetConfig | DesktopMethod::SetConfig => {
+                let applied = self.desktop.config_outer(generation, handled);
+                self.apply_config(applied, cx);
+            }
         }
+        self.sync_config(cx);
     }
 
     /// Pi's command list: what the `/` menu offers, and the discovery that

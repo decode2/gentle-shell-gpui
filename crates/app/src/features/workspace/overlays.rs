@@ -246,7 +246,8 @@ impl Workspace {
                 reasoning,
             })
             .collect();
-        let view = cx.new(|cx| ProfilesView::new(cwd, models, window, cx));
+        let session = self.active_session();
+        let view = cx.new(|cx| ProfilesView::new(cwd, models, session, window, cx));
         let subscription = cx.subscribe_in(&view, window, |this, _, event: &ProfilesEvent, window, cx| {
             let tab = this.active_session();
             match event {
