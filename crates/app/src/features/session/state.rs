@@ -239,7 +239,7 @@ pub(in crate::features::session) mod desktop {
     };
 
     use crate::features::profiles::{
-        ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport, ConfigTicket,
+        ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport, ConfigTicket, ProfileApply,
     };
 
     /// A request the tab must hand to its backend, with the generation of the
@@ -485,7 +485,8 @@ pub(in crate::features::session) mod desktop {
                     | Some(DesktopMethod::RefreshSubscriptionUsage)
                     | Some(DesktopMethod::GetDesignCanvas)
                     | Some(DesktopMethod::GetConfig)
-                    | Some(DesktopMethod::SetConfig) => Applied::default(),
+                    | Some(DesktopMethod::SetConfig)
+                    | Some(DesktopMethod::ApplyProfile) => Applied::default(),
                     None => Applied::default(),
                 },
                 Ok(Some(DesktopRecord::Event(event))) => {
@@ -780,6 +781,21 @@ pub(in crate::features::session) mod desktop {
             expected_revision: String,
         ) -> Result<ConfigTicket, ConfigFailure> {
             self.config.set(write, expected_revision)
+        }
+
+        /// Whether this backend applies saved profiles itself
+        /// (`apply_profile`). Until the probe says so, or on a channel that
+        /// stopped, it does not.
+        pub(in crate::features::session) fn profile_apply_supported(&self) -> bool {
+            self.step != Step::Unavailable && self.config.offers_apply() == Some(true)
+        }
+
+        /// Queue an `apply_profile`; [`Self::config_pump`] sends it.
+        pub(in crate::features::session) fn config_apply_profile(
+            &mut self,
+            request: ProfileApply,
+        ) -> Result<ConfigTicket, ConfigFailure> {
+            self.config.apply_profile(request)
         }
 
         /// Send the next queued config request once the probe has landed, no
@@ -2819,23 +2835,41 @@ pub(in crate::features::session) mod desktop {
 
         use pi_rpc::UiRequest;
         use pi_rpc::desktop_rpc::{
-            Capabilities, ConfigStore, ConfigWrite, DesktopEvent, DesktopMethod, DesktopRecord,
-            DesktopResponse, DesktopRpcError, DesktopSession,
+            ApplyProfileOutcome, Capabilities, ConfigStore, ConfigWrite, DesktopEvent,
+            DesktopMethod, DesktopRecord, DesktopResponse, DesktopRpcError, DesktopSession,
         };
 
         use super::Send;
-        use crate::features::profiles::{ConfigChange, ConfigFailure, ConfigOutcome, ConfigTicket};
+        use crate::features::profiles::{
+            ConfigChange, ConfigFailure, ConfigOutcome, ConfigTicket, ProfileApply,
+        };
 
-        /// The wire name of the only event this slice applies.
+        /// The wire name of the store change event this slice applies.
         pub(in crate::features::session) const CONFIG_CHANGED: &str = "config_changed";
+        /// The wire name of the profile apply event this slice applies.
+        pub(in crate::features::session) const PROFILE_APPLIED: &str = "profile_applied";
+
+        /// The stores an `apply_profile` may have written (the profile claim,
+        /// a re-pinned clone, materialized routing and agent files): the
+        /// screen re-reads them after a `profile_applied` event.
+        const APPLIED_STORES: [ConfigStore; 5] = [
+            ConfigStore::Profiles,
+            ConfigStore::Pins,
+            ConfigStore::Models,
+            ConfigStore::Subagents,
+            ConfigStore::ManagedAssets,
+        ];
 
         /// What one decision produced: the requests to send, and a failure the
         /// tab shows through its report path. Outcomes for the screen are
-        /// kept in the slice until it takes them.
+        /// kept in the slice until it takes them. `profile_applied` is set when
+        /// Gentle Shell answered `applied`, which may have moved this session's
+        /// model.
         #[derive(Debug, Default)]
         pub(in crate::features::session) struct Applied {
             pub(in crate::features::session) sends: Vec<Send>,
             pub(in crate::features::session) report: Option<Report>,
+            pub(in crate::features::session) profile_applied: bool,
         }
 
         /// Why a config request stopped, for the conversation. A documented
@@ -2886,6 +2920,7 @@ pub(in crate::features::session) mod desktop {
         enum Op {
             Get(ConfigStore),
             Set(ConfigWrite, String),
+            Apply(ProfileApply),
         }
 
         #[derive(Debug, Default)]
@@ -2940,6 +2975,23 @@ pub(in crate::features::session) mod desktop {
                 Ok(self.enqueue(Op::Set(write, expected_revision)))
             }
 
+            /// Whether the peer advertised `apply_profile`; `None` until the
+            /// probe has said. Without it the screen applies on its own.
+            pub(in crate::features::session) fn offers_apply(&self) -> Option<bool> {
+                self.capabilities
+                    .as_ref()
+                    .map(|capabilities| capabilities.supports(DesktopMethod::ApplyProfile))
+            }
+
+            /// Queue an `apply_profile`.
+            pub(in crate::features::session) fn apply_profile(
+                &mut self,
+                request: ProfileApply,
+            ) -> Result<ConfigTicket, ConfigFailure> {
+                self.check(DesktopMethod::ApplyProfile)?;
+                Ok(self.enqueue(Op::Apply(request)))
+            }
+
             fn check(&self, method: DesktopMethod) -> Result<(), ConfigFailure> {
                 match &self.capabilities {
                     None => Err(ConfigFailure::NotReady),
@@ -2970,6 +3022,11 @@ pub(in crate::features::session) mod desktop {
                     let request = match op {
                         Op::Get(store) => session.issue_get_config(store),
                         Op::Set(write, expected) => session.issue_set_config(write, expected),
+                        Op::Apply(apply) => session.issue_apply_profile(
+                            &apply.profile,
+                            apply.mode,
+                            apply.confirmation.as_deref(),
+                        ),
                     };
                     match request {
                         Ok(request) => {
@@ -2980,7 +3037,7 @@ pub(in crate::features::session) mod desktop {
                                     request,
                                     generation: self.generation,
                                 }],
-                                report: None,
+                                ..Applied::default()
                             };
                         }
                         Err(error) => self.answer(
@@ -3022,9 +3079,11 @@ pub(in crate::features::session) mod desktop {
                 let awaiting = session.pending().map(|(_, method)| method);
                 match session.accept(request) {
                     Ok(Some(DesktopRecord::Response(response))) => match awaiting {
-                        Some(method @ (DesktopMethod::GetConfig | DesktopMethod::SetConfig)) => {
-                            self.apply_response(method, response)
-                        }
+                        Some(
+                            method @ (DesktopMethod::GetConfig
+                            | DesktopMethod::SetConfig
+                            | DesktopMethod::ApplyProfile),
+                        ) => self.apply_response(method, response),
                         _ => Applied::default(),
                     },
                     Ok(Some(DesktopRecord::Event(event))) => self.apply_event(event),
@@ -3122,13 +3181,31 @@ pub(in crate::features::session) mod desktop {
                 let Some(ticket) = self.in_flight.take() else {
                     return Applied::default();
                 };
-                let decoded = if method == DesktopMethod::GetConfig {
-                    response.config().map(ConfigOutcome::Read)
-                } else {
-                    response.set_config().map(ConfigOutcome::Written)
+                let decoded = match method {
+                    DesktopMethod::GetConfig => response.config().map(ConfigOutcome::Read),
+                    DesktopMethod::ApplyProfile => {
+                        response.apply_profile().map(ConfigOutcome::Applied)
+                    }
+                    _ => response.set_config().map(ConfigOutcome::Written),
                 };
                 let (outcome, reported) = match decoded {
                     Ok(outcome) => (outcome, None),
+                    // An advertised apply the server then refused is said by
+                    // the screen; it never means the direct-file path.
+                    Err(DesktopRpcError::RemoteError(info))
+                        if method == DesktopMethod::ApplyProfile =>
+                    {
+                        let failure = match info.profile_apply_error() {
+                            Some(code) => ConfigFailure::ApplyRefused {
+                                code,
+                                message: info.message,
+                            },
+                            None => ConfigFailure::Failure(
+                                DesktopRpcError::RemoteError(info).to_string(),
+                            ),
+                        };
+                        (ConfigOutcome::Failed(failure), None)
+                    }
                     Err(DesktopRpcError::RemoteError(info))
                         if info.code == "unsupported_method" =>
                     {
@@ -3152,32 +3229,58 @@ pub(in crate::features::session) mod desktop {
                         Some(Report::Failure(error)),
                     ),
                 };
+                let profile_applied = matches!(
+                    &outcome,
+                    ConfigOutcome::Applied(result)
+                        if matches!(result.outcome, ApplyProfileOutcome::Applied(_))
+                );
                 self.answer(ticket, outcome);
                 Applied {
                     report: reported,
+                    profile_applied,
                     ..Applied::default()
                 }
             }
 
-            /// A `config_changed` event, applied only when the peer advertised
-            /// that exact name.
+            /// A `config_changed` or `profile_applied` event, applied only when
+            /// the peer advertised that exact name.
             fn apply_event(&mut self, event: DesktopEvent) -> Applied {
                 let advertised = self
                     .capabilities
                     .as_ref()
-                    .is_some_and(|capabilities| capabilities.emits(CONFIG_CHANGED));
-                if event.event != CONFIG_CHANGED || !advertised {
+                    .is_some_and(|capabilities| capabilities.emits(&event.event));
+                if !advertised {
                     return Applied::default();
                 }
-                match event.config_changed() {
-                    Ok(changed) => {
-                        self.changes.push(ConfigChange {
-                            store: changed.store,
-                            revision: Some(changed.revision),
-                        });
-                        Applied::default()
-                    }
-                    Err(error) => report(Report::Failure(error)),
+                match event.event.as_str() {
+                    CONFIG_CHANGED => match event.config_changed() {
+                        Ok(changed) => {
+                            self.changes.push(ConfigChange {
+                                store: changed.store,
+                                revision: Some(changed.revision),
+                            });
+                            Applied::default()
+                        }
+                        Err(error) => report(Report::Failure(error)),
+                    },
+                    // The apply may have written any of these stores, and the
+                    // event carries no revision: each is re-read.
+                    PROFILE_APPLIED => match event.profile_applied() {
+                        Ok(_) => {
+                            for store in APPLIED_STORES {
+                                let change = ConfigChange {
+                                    store,
+                                    revision: None,
+                                };
+                                if !self.changes.contains(&change) {
+                                    self.changes.push(change);
+                                }
+                            }
+                            Applied::default()
+                        }
+                        Err(error) => report(Report::Failure(error)),
+                    },
+                    _ => Applied::default(),
                 }
             }
         }
@@ -3194,7 +3297,9 @@ pub(in crate::features::session) mod desktop {
         fn owns_pending(session: &DesktopSession) -> bool {
             matches!(
                 session.pending().map(|(_, method)| method),
-                Some(DesktopMethod::GetConfig) | Some(DesktopMethod::SetConfig)
+                Some(DesktopMethod::GetConfig)
+                    | Some(DesktopMethod::SetConfig)
+                    | Some(DesktopMethod::ApplyProfile)
             )
         }
     }
@@ -3204,8 +3309,9 @@ mod tests {
     use pi_rpc::UiMethod;
     use pi_rpc::UiRequest;
     use pi_rpc::desktop_rpc::{
-        Capabilities, ConfigErrorCode, ConfigStore, ConfigWrite, DesktopMethod, DesktopSession,
-        PROMPT_COMMAND, PermissionMode, ProfilesData, SCHEMA, UsageStatus, WIDGET_KEY,
+        ApplyProfileOutcome, Capabilities, ConfigErrorCode, ConfigStore, ConfigWrite,
+        DesktopMethod, DesktopSession, PROMPT_COMMAND, PermissionMode, ProfileApplyErrorCode,
+        ProfileApplyMode, ProfilesData, SCHEMA, UsageStatus, WIDGET_KEY,
     };
     use serde_json::{Value, json};
 
@@ -3217,7 +3323,9 @@ mod tests {
     use super::desktop::{self, Desktop, Report, Step};
     use super::{ExtensionUi, ModelInfo, TodoIsland};
     use crate::features::browser::CanvasNotice;
-    use crate::features::profiles::{ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport};
+    use crate::features::profiles::{
+        ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport, ProfileApply,
+    };
     use gentle_core::tools::TodoTask;
 
     #[test]
@@ -6486,5 +6594,219 @@ mod tests {
             desktop.take_config_outcomes(),
             vec![(queued, ConfigOutcome::Failed(ConfigFailure::Dropped))]
         );
+    }
+
+    // ── Profile apply ───────────────────────────────────────────────────────
+
+    fn apply_ready() -> Desktop {
+        config_probed(
+            1,
+            &["get_config", "set_config", "apply_profile"],
+            &["config_changed", "profile_applied"],
+        )
+    }
+
+    /// Send the queued apply and answer it with `lines`.
+    fn answer_apply(
+        desktop: &mut Desktop,
+        lines: impl FnOnce(&str) -> Vec<String>,
+    ) -> desktop::config::Applied {
+        let pumped = desktop.config_pump();
+        assert_eq!(
+            pumped.sends[0].request.method(),
+            DesktopMethod::ApplyProfile
+        );
+        let id = pumped.sends[0].request.request_id().to_string();
+        desktop.config_apply(&desktop_widget(lines(&id)))
+    }
+
+    #[test]
+    fn profile_apply_follows_the_advertised_method() {
+        // An older Shell without `apply_profile`: the screen applies on its
+        // own, and nothing can be queued.
+        let mut older = config_ready();
+        assert!(!older.profile_apply_supported());
+        assert_eq!(
+            older.config_apply_profile(ProfileApply::new("deep", ProfileApplyMode::Default)),
+            Err(ConfigFailure::Unsupported)
+        );
+        assert!(older.config_pump().sends.is_empty());
+
+        // Not probed yet: never guessed.
+        let mut fresh = Desktop::new();
+        assert!(!fresh.profile_apply_supported());
+        assert_eq!(
+            fresh.config_apply_profile(ProfileApply::new("deep", ProfileApplyMode::Default)),
+            Err(ConfigFailure::NotReady)
+        );
+
+        let mut desktop = apply_ready();
+        assert!(desktop.profile_apply_supported());
+        desktop
+            .config_apply_profile(ProfileApply::new("deep", ProfileApplyMode::Default))
+            .unwrap();
+        let pumped = desktop.config_pump();
+        assert_eq!(
+            params(&pumped.sends[0]),
+            json!({"profile": "deep", "mode": "default"})
+        );
+        let id = pumped.sends[0].request.request_id().to_string();
+        let _ = desktop.config_apply(&desktop_widget(config_error_lines(&id, "internal_error")));
+        desktop
+            .config_apply_profile(
+                ProfileApply::new("deep", ProfileApplyMode::Default).confirmed("t1"),
+            )
+            .unwrap();
+        let pumped = desktop.config_pump();
+        assert_eq!(
+            params(&pumped.sends[0]),
+            json!({"profile": "deep", "mode": "default", "confirmation": "t1"})
+        );
+    }
+
+    #[test]
+    fn profile_apply_answers_reach_the_screen_as_outcomes() {
+        let mut desktop = apply_ready();
+        let ticket = desktop
+            .config_apply_profile(ProfileApply::new("deep", ProfileApplyMode::Default))
+            .unwrap();
+        let asked = answer_apply(&mut desktop, |id| {
+            config_response_lines(
+                id,
+                json!({
+                    "profile": "deep",
+                    "mode": "default",
+                    "status": "confirmation_required",
+                    "confirmation": {"title": "Apply profile \"deep\"?", "message": "Continue?", "token": "t1"},
+                }),
+            )
+        });
+        assert!(asked.report.is_none());
+        assert!(!asked.profile_applied, "asking moves nothing");
+        assert!(matches!(
+            &desktop.take_config_outcomes()[..],
+            [(t, ConfigOutcome::Applied(result))]
+                if *t == ticket
+                    && matches!(&result.outcome, ApplyProfileOutcome::ConfirmationRequired(c) if c.token == "t1")
+        ));
+
+        desktop
+            .config_apply_profile(ProfileApply::new("deep", ProfileApplyMode::Session))
+            .unwrap();
+        let applied = answer_apply(&mut desktop, |id| {
+            config_response_lines(
+                id,
+                json!({
+                    "profile": "deep",
+                    "mode": "session",
+                    "status": "applied",
+                    "notes": [{"level": "info", "text": "Using \"deep\"."}],
+                }),
+            )
+        });
+        assert!(
+            applied.profile_applied,
+            "the session's model may have moved"
+        );
+        assert!(matches!(
+            &desktop.take_config_outcomes()[..],
+            [(_, ConfigOutcome::Applied(result))]
+                if matches!(&result.outcome, ApplyProfileOutcome::Applied(notes) if notes.len() == 1)
+        ));
+
+        // Documented refusals reach the screen as themselves, silently here.
+        for (code, expected) in [
+            ("unknown_profile", ProfileApplyErrorCode::UnknownProfile),
+            (
+                "profile_apply_busy",
+                ProfileApplyErrorCode::ProfileApplyBusy,
+            ),
+            (
+                "profiles_unavailable",
+                ProfileApplyErrorCode::ProfilesUnavailable,
+            ),
+        ] {
+            desktop
+                .config_apply_profile(ProfileApply::new("deep", ProfileApplyMode::Default))
+                .unwrap();
+            let refused = answer_apply(&mut desktop, |id| config_error_lines(id, code));
+            assert!(refused.report.is_none(), "{code}");
+            assert!(!refused.profile_applied, "{code}");
+            assert!(
+                matches!(
+                    &desktop.take_config_outcomes()[..],
+                    [(_, ConfigOutcome::Failed(ConfigFailure::ApplyRefused { code: c, .. }))] if *c == expected
+                ),
+                "{code}"
+            );
+        }
+
+        // An advertised apply the server then calls unsupported never means
+        // the direct-file path.
+        desktop
+            .config_apply_profile(ProfileApply::new("deep", ProfileApplyMode::Default))
+            .unwrap();
+        let _ = answer_apply(&mut desktop, |id| {
+            config_error_lines(id, "unsupported_method")
+        });
+        let outcomes = desktop.take_config_outcomes();
+        let [(_, ConfigOutcome::Failed(failure))] = &outcomes[..] else {
+            panic!("one failed outcome")
+        };
+        assert!(!failure.is_legacy());
+    }
+
+    #[test]
+    fn a_profile_store_write_refused_mid_apply_is_a_config_rejection() {
+        let mut desktop = apply_ready();
+        let ticket = desktop
+            .config_set(profiles_write(), "sha256:w1".into())
+            .unwrap();
+        let pumped = desktop.config_pump();
+        let id = pumped.sends[0].request.request_id().to_string();
+        let applied = desktop.config_apply(&desktop_widget(config_error_lines(
+            &id,
+            "profile_apply_busy",
+        )));
+        assert!(applied.report.is_none(), "the screen says it");
+        assert!(matches!(
+            &desktop.take_config_outcomes()[..],
+            [(t, ConfigOutcome::Failed(ConfigFailure::Rejected { code: ConfigErrorCode::ProfileApplyBusy, .. }))]
+                if *t == ticket
+        ));
+    }
+
+    #[test]
+    fn profile_applied_rereads_what_an_apply_may_have_written() {
+        let event = |seq: u64, name: &str| {
+            desktop_widget(record(json!({
+                "schema": SCHEMA,
+                "kind": "event",
+                "seq": seq,
+                "event": name,
+                "data": {"profile": "deep", "mode": "default", "source": "desktop"},
+            })))
+        };
+        let mut desktop = apply_ready();
+        let applied = desktop.config_apply(&event(2, "profile_applied"));
+        assert!(applied.report.is_none());
+        let changes = desktop.take_config_changes();
+        let stores: Vec<ConfigStore> = changes.iter().map(|change| change.store).collect();
+        assert_eq!(
+            stores,
+            [
+                ConfigStore::Profiles,
+                ConfigStore::Pins,
+                ConfigStore::Models,
+                ConfigStore::Subagents,
+                ConfigStore::ManagedAssets,
+            ]
+        );
+        assert!(changes.iter().all(|change| change.revision.is_none()));
+
+        // A peer that never advertised the event changes nothing.
+        let mut quiet = config_ready();
+        let _ = quiet.config_apply(&event(2, "profile_applied"));
+        assert!(quiet.take_config_changes().is_empty());
     }
 }

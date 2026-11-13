@@ -1,7 +1,9 @@
 //! Store actions: writing `profiles.json`, Save, Use in this session, Make
 //! default, the repository pin, Publish, and the name and leave flows. On the
 //! RPC path the same actions are whole-store `set_config` writes guarded by
-//! the last `writeRevision`; Make default stays on the files.
+//! the last `writeRevision`. Make default and Use in this session are Gentle
+//! Shell's `apply_profile` when it advertises it; otherwise Make default
+//! stays on the files.
 
 use gentle_core::profiles::{
     PinRead, ProfilesFile, Routing, create_profile, delete_profile, duplicate_profile,
@@ -9,9 +11,12 @@ use gentle_core::profiles::{
     update_profile,
 };
 use gpui_kit::*;
-use pi_rpc::desktop_rpc::ConfigStore;
+use pi_rpc::desktop_rpc::{
+    ApplyProfileResult, ConfigStore, ProfileApplyMode, ProfileNote, ProfileNoteLevel,
+};
 
 use super::apply::{make_default, plan_make_default};
+use super::env::{ApplyAnswer, ProfileApply};
 use super::files::{
     fallbacks_write, files_job_start, follow_fallbacks, profiles_write, read_orchestrator_settings,
     write_atomic,
@@ -23,6 +28,25 @@ use super::{Backend, Confirm, Leave, NameMode, ProfilesEvent, ProfilesView, Tone
 
 /// The committed declaration, as the RPC path names it.
 const DECLARATION: &str = ".pi/gentle-ai/profile.json";
+
+/// The stores Make default may have written through `apply_profile`.
+const APPLIED_STORES: [ConfigStore; 5] = [
+    ConfigStore::Profiles,
+    ConfigStore::Pins,
+    ConfigStore::Models,
+    ConfigStore::Subagents,
+    ConfigStore::ManagedAssets,
+];
+
+/// Gentle Shell's notes as one status line, in order.
+fn notes_text(notes: &[ProfileNote]) -> String {
+    notes
+        .iter()
+        .map(|note| note.text.trim())
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
 
 impl ProfilesView {
     /// Write `next` to profiles.json (or replace the `profiles` store over
@@ -132,6 +156,15 @@ impl ProfilesView {
         let Some(name) = self.selected.clone() else {
             return;
         };
+        if self.shell_applies(cx) {
+            self.save_then(cx, move |this, saved, cx| {
+                if saved {
+                    this.say(format!("Saved \"{name}\"."), Tone::Good);
+                }
+                this.shell_apply(ProfileApply::new(name, ProfileApplyMode::Session), cx);
+            });
+            return;
+        }
         self.save_then(cx, move |this, saved, cx| {
             let orchestrator = this.draft.orchestrator();
             let model = orchestrator
@@ -165,6 +198,15 @@ impl ProfilesView {
         let Some(name) = self.selected.clone() else {
             return;
         };
+        if self.shell_applies(cx) {
+            self.save_then(cx, move |this, saved, cx| {
+                if saved {
+                    this.say(format!("Saved \"{name}\"."), Tone::Good);
+                }
+                this.shell_apply(ProfileApply::new(name, ProfileApplyMode::Default), cx);
+            });
+            return;
+        }
         self.save_then(cx, move |this, saved, cx| {
             let Some(env) = this.env.clone() else { return };
             let file = this.file.clone();
@@ -247,6 +289,91 @@ impl ProfilesView {
                     }
                 }
             },
+        );
+    }
+
+    /// Ask Gentle Shell to apply a saved profile (`apply_profile`). Every
+    /// store write waits until it answers.
+    pub(super) fn shell_apply(&mut self, request: ProfileApply, cx: &mut Context<Self>) {
+        let name = request.profile.clone();
+        let sent = self.with_remote(cx, |remote, port| remote.apply(port, request));
+        match sent {
+            Some(Ok(_)) => self.say(format!("Applying \"{name}\" in Gentle Shell…"), Tone::Info),
+            Some(Err(failure)) => self.say(
+                format!("\"{name}\" was not applied: {}", failure.message()),
+                Tone::Bad,
+            ),
+            None => {}
+        }
+        self.sync_busy();
+        cx.notify();
+    }
+
+    /// Gentle Shell answered an apply: ask the human with its exact dialog,
+    /// or show its notes. Nothing is ever confirmed here.
+    pub(super) fn apply_answered(
+        &mut self,
+        request: ProfileApply,
+        result: ApplyProfileResult,
+        cx: &mut Context<Self>,
+    ) {
+        let name = request.profile.clone();
+        let mode = request.mode;
+        match ApplyAnswer::new(&request, result) {
+            ApplyAnswer::Confirm {
+                title,
+                message,
+                retry,
+            } => {
+                self.status = None;
+                self.confirm = Some(super::Confirm::ApplyProfile {
+                    title,
+                    message,
+                    retry,
+                });
+            }
+            ApplyAnswer::Done { applied, notes } => {
+                let text = notes_text(&notes);
+                if applied {
+                    let text = if text.is_empty() {
+                        format!("Applied \"{name}\".")
+                    } else {
+                        text
+                    };
+                    self.say(text, Tone::Good);
+                    cx.emit(ProfilesEvent::Changed);
+                    if mode == ProfileApplyMode::Default {
+                        self.refresh_after_shell_apply(cx);
+                    }
+                } else {
+                    let text = if text.is_empty() {
+                        format!("Gentle Shell did not apply \"{name}\".")
+                    } else {
+                        text
+                    };
+                    let failed = notes
+                        .iter()
+                        .any(|note| note.level != ProfileNoteLevel::Info);
+                    self.say(text, if failed { Tone::Bad } else { Tone::Info });
+                    // A rollback may have restored part of what was written.
+                    if mode == ProfileApplyMode::Default {
+                        self.refresh_after_shell_apply(cx);
+                    }
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// Gentle Shell's Make default wrote the stores and Pi's settings: read
+    /// them again, so the screen and the next write follow what it left.
+    fn refresh_after_shell_apply(&mut self, cx: &mut Context<Self>) {
+        self.reread(&APPLIED_STORES, cx);
+        let Some(env) = self.env.clone() else { return };
+        self.run_io(
+            cx,
+            move || read_orchestrator_settings(&env.settings_path()),
+            |this, pi_default, _| this.pi_default = pi_default,
         );
     }
 

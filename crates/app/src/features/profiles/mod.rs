@@ -19,8 +19,12 @@
 //! `pins` stores are read and written through it by name ([`Backend::Rpc`]),
 //! and `models`, `subagents` and `managed_assets` are shown read-only. The
 //! files are written directly only when the Shell confirms it lacks those
-//! methods. Make default (routing materialization and Pi's settings) has no
-//! server method and stays on the direct-file path either way.
+//! methods. When the Shell also advertises `apply_profile`, Make default and
+//! Use in this session are its own `/gentle:profiles` actions: the screen
+//! saves the draft, sends the request, and shows the Shell's confirmation
+//! and notes. An older Shell keeps the screen's own Make default (routing
+//! materialization and Pi's settings on the files) and its `set_model`
+//! switch.
 
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -46,7 +50,8 @@ mod tests;
 mod view;
 
 pub(crate) use env::{
-    ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport, ConfigTicket, gentle_pi_root,
+    ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport, ConfigTicket, ProfileApply,
+    gentle_pi_root,
 };
 pub use gentle_core::profiles::ModelChoice;
 
@@ -92,6 +97,12 @@ impl ConfigPort for SessionPort<'_> {
             session.config_set(write, expected_revision, cx)
         })
     }
+
+    fn apply(&mut self, request: ProfileApply) -> Result<ConfigTicket, ConfigFailure> {
+        self.session.update(self.cx, |session, cx| {
+            session.config_apply_profile(request, cx)
+        })
+    }
 }
 
 pub enum ProfilesEvent {
@@ -99,7 +110,8 @@ pub enum ProfilesEvent {
     /// Apply the profile to the running session: send RPC `set_model` with
     /// `model` (provider, id) and then `set_thinking_level` with `thinking`.
     /// `None` means the profile leaves the orchestrator untouched. The draft
-    /// was saved to `profiles.json` first when it had edits.
+    /// was saved to `profiles.json` first when it had edits. Only for a Shell
+    /// without `apply_profile`, which otherwise switches the session itself.
     UseInSession {
         profile: String,
         model: Option<(String, String)>,
@@ -109,6 +121,7 @@ pub enum ProfilesEvent {
     /// the running session to the new default orchestrator. Send RPC
     /// `set_model` (provider, id) and, when `thinking` is set,
     /// `set_thinking_level`. Files were already written (`Changed` follows).
+    /// Only for a Shell without `apply_profile`.
     SwitchOrchestrator {
         model: (String, String),
         thinking: Option<String>,
@@ -146,6 +159,14 @@ enum Confirm {
     Unsaved(Leave),
     Delete(String),
     MakeDefault(DefaultPlan),
+    /// Gentle Shell's own dialog for an `apply_profile`, shown exactly:
+    /// Apply resends `retry` (the same request with the token), Cancel sends
+    /// nothing.
+    ApplyProfile {
+        title: String,
+        message: String,
+        retry: ProfileApply,
+    },
 }
 
 /// Rows: the orchestrator, "every agent", then each assignment name.
@@ -283,7 +304,7 @@ impl ProfilesView {
     /// Busy while a file job runs or a config request is open.
     fn sync_busy(&mut self) {
         let remote = match &self.backend {
-            Backend::Rpc(remote) => remote.writing() || remote.loading(),
+            Backend::Rpc(remote) => remote.writing() || remote.loading() || remote.applying(),
             _ => false,
         };
         self.busy = self.io_jobs > 0 || remote;
@@ -405,6 +426,17 @@ impl ProfilesView {
         matches!(self.backend, Backend::Rpc(_))
     }
 
+    /// Whether Make default and Use in this session are Gentle Shell's own
+    /// actions (`apply_profile`). Only on the RPC path: a Shell that does not
+    /// serve its config cannot apply it either.
+    fn shell_applies(&self, cx: &App) -> bool {
+        self.is_rpc()
+            && self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.read(cx).profile_apply_supported())
+    }
+
     /// Read every store over RPC, and the agent names and Pi's default from
     /// the files (neither is a config store).
     fn reload_rpc(&mut self, cx: &mut Context<Self>) {
@@ -507,6 +539,22 @@ impl ProfilesView {
                     Tone::Bad,
                 );
             }
+            Landed::Busy(_, store) => {
+                if std::mem::take(&mut self.seeding) {
+                    self.loading = false;
+                    self.error = Some(
+                        "Could not create the profiles store: Gentle Shell is applying a profile right now. Open Profiles again once it finishes."
+                            .into(),
+                    );
+                } else {
+                    self.say(
+                        format!(
+                            "Not saved: Gentle Shell is applying a profile right now, so the {store} store was not written. Your unsaved edits stay; save again once the apply finishes."
+                        ),
+                        Tone::Bad,
+                    );
+                }
+            }
             Landed::Rejected(_, failure) => {
                 if std::mem::take(&mut self.seeding) {
                     self.loading = false;
@@ -519,6 +567,21 @@ impl ProfilesView {
                 }
             }
             Landed::Legacy(failure) => self.fall_back_to_files(&failure, cx),
+            Landed::Applied(request, result) => self.apply_answered(request, result, cx),
+            // A timeout or a restart abandons the wait, not Shell's apply: it may
+            // still finish, so the outcome is unknown rather than "not applied".
+            Landed::ApplyFailed(request, failure) => {
+                let verdict = if matches!(failure, ConfigFailure::Timeout | ConfigFailure::Dropped)
+                {
+                    "is not confirmed"
+                } else {
+                    "was not applied"
+                };
+                self.say(
+                    format!("\"{}\" {verdict}: {}", request.profile, failure.message()),
+                    Tone::Bad,
+                );
+            }
         }
         self.sync_busy();
     }

@@ -536,6 +536,9 @@ pub(super) fn files_job_start<K>(remote: &mut Remote<K>) -> Result<ProfilesFile,
     if remote.held() {
         return Err("Make default is already running; wait for it to finish.".to_string());
     }
+    if remote.applying() {
+        return Err("Gentle Shell is still applying a profile; wait for it to finish.".to_string());
+    }
     if remote.writing() {
         return Err(
             "A profile change is still being saved; Make default again once it lands.".to_string(),

@@ -1,4 +1,5 @@
-//! The confirmation card: unsaved edits, Delete and Make default.
+//! The confirmation card: unsaved edits, Delete, Make default, and Gentle
+//! Shell's own dialog for an `apply_profile`.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -98,9 +99,36 @@ impl ProfilesView {
                     ],
                 )
             }
+            // Gentle Shell's title and message, exactly as it sent them: the
+            // token it resends is bound to this text.
+            Confirm::ApplyProfile {
+                title,
+                message,
+                retry,
+            } => {
+                let retry = retry.clone();
+                (
+                    title.clone(),
+                    message.lines().map(str::to_string).collect(),
+                    vec![
+                        Button::new("apply-ok")
+                            .small()
+                            .primary()
+                            .icon(Icon::new(IconName::Star))
+                            .label("Apply")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.confirm = None;
+                                this.shell_apply(retry.clone(), cx);
+                            }))
+                            .into_any_element(),
+                    ],
+                )
+            }
         };
         let icon = match confirm {
-            Confirm::MakeDefault(_) => Icon::new(IconName::Star).text_color(ui::accent()),
+            Confirm::MakeDefault(_) | Confirm::ApplyProfile { .. } => {
+                Icon::new(IconName::Star).text_color(ui::accent())
+            }
             Confirm::Unsaved(_) => Icon::new(IconName::TriangleAlert).text_color(ui::warning()),
             Confirm::Delete(_) => Icon::new(IconName::Trash).text_color(ui::danger()),
         };
