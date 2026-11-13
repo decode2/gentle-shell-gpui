@@ -13,13 +13,14 @@ How Gentle Shell GPUI connects to Gentle Shell (the `gentle-shell --mode rpc` ba
 | Launcher subcommands (`upgrade`, `install`, `remove`, `setup`) | `features/settings/upgrade.rs`, `settings/packages.rs`, `setup/gentle.rs` | Child process |
 | Engram (memory) | `features/memory/client.rs`, `gentle_core::engram` | Local HTTP |
 | Maestro (UI testing tools for the agent) | `features/settings/maestro.rs` (the section), `features/setup/maestro.rs`, `setup/fetch.rs` | Downloads into the toolchain; `gentle-shell mcp add` |
-| Music (gentle-stream) | `features/music/`, `features/settings/music.rs`, `features/setup/music.rs`, `gentle_core::music` | Unix socket (`multiprocessing.connection`); a Python helper in the player's environment |
-| Subscription usage | `features/usage/` | HTTPS |
+| Music (gentle-stream) | `features/music/`, `features/settings/music.rs`, `features/setup/music.rs`, `gentle_core::music` | `gentle-stream ctl --json` child process |
+| Subscription usage | `features/usage/`, `state::desktop::subscription` | Gentle Desktop RPC when the backend advertises `get_subscription_usage`; HTTPS fallback (legacy) |
 | Gentle Shell update | `features/updates/` | HTTPS (npm registry) |
 | App update | `features/app_update/` | HTTPS (GitHub releases) |
 | First-run installers | `features/setup/`, `features/onboarding/` | Processes, HTTPS |
 | Git | `features/git/` | `git` process |
-| Gentle Design canvas | `features/browser/` | System web view |
+| Gentle Design canvas | `features/browser/`, `state::desktop::design` | Gentle Desktop RPC (`get_design_canvas`, `design_canvas`) when the backend advertises it; legacy `notify` text and `gentle_design` result; system web view |
+| Profiles config stores | `features/profiles/`, `state::desktop::config` | Gentle Desktop RPC (`get_config`, `set_config`, `config_changed`) when the backend advertises both methods; direct files (legacy) otherwise; Make default always on files |
 | Web apps (`gentle-open`, `/web`, dev-server URLs) | `features/browser/`, `gentle_core::web` | Single-instance request, system web view |
 | Devices (Android emulators, iOS simulators) | `features/devices/`, `features/settings/devices.rs`, `features/setup/devices.rs`, `gentle_core::devices` | Expo's device hub (Node child, loopback HTTP and its web viewer), `agent-device`, `gentle-device` |
 
@@ -142,6 +143,65 @@ When stdout closes, pending requests are flushed (their callers get the error "g
 - `restart_when_idle` / `backend.restart_pending`: restarts in the middle of a turn (or with a dialog open) wait for it to finish. Used by `reload` (`/reload`), `reload_models` (after signing in or out of a provider), `restart_for_update` (after `gentle-shell upgrade`) and `choose_mode` (permission change).
 - `retry_start` retries tabs whose backend never started (after onboarding).
 
+### Permission mode (`state::desktop::permission`)
+
+The picker's selection is the consent. When the backend's `capabilities` advertise `set_permission_mode`, the app sends `set_permission_mode` with `persist: true` over the Gentle Desktop RPC channel and switches the live session without writing `permission-mode.json` or restarting. The server's answer is the truth: `changed: false` is a no-op, a `persist_error` is live success plus a "default not saved" warning, and a timeout/transport/server failure reverts and reports. Events move the confirmed state only for the exact `permission_mode_changed` name that the capabilities `emits`; a sequence gap resyncs once through the channel's `get_snapshot`.
+
+Two cases keep the legacy path (save `permission-mode.json` and restart the backend on the same conversation, exactly once):
+
+- the capabilities are known and do not list `set_permission_mode`;
+- the server answers `unsupported_method` for the `set_permission_mode` it advertised.
+
+While capabilities are still loading, a picker click reports "try again" and never writes the default file or restarts. `choose_mode` in `lifecycle.rs` is the only caller of either path; every other restart caller is unchanged.
+
+### Agents and jobs (`state::desktop::supervision`)
+
+When the backend's `capabilities` advertise `list_subagents` and/or `list_jobs`, the app seeds a full list once the probe (capabilities → snapshot) and the permission seed have settled, then reconciles `agents_update`/`jobs_update` events by id. The structured lists are the primary source once seeded; the legacy `gentle-agents` widget and `details.gentleJobs` stay as the fallback for older Shells, and the panel/jobs chip never shows both, so the two sources cannot double a helper or a job.
+
+- `list_subagents` / `list_jobs`: empty params, answered with the typed `agents`/`jobs` arrays. Only these full-list responses mark a list as seeded. A list that cannot be decoded leaves the legacy fallback in place and is never retried in a loop; a malformed record never fabricates an empty list.
+- `agents_update` / `jobs_update`: full bounded projections, so the event replaces the list (ids absent from the projection drop rather than growing forever). They never mark a list as seeded, so a pre-seed event is replaced by the real seed. A sequence gap forgets the seeded markers so the lists re-seed behind the channel's `get_snapshot` resync.
+- `cancel_subagent` / `cancel_job`: params `{ id }`. One cancel in flight at a time, with the same timeout/rollback discipline as permission changes. The server's post-action projection is the truth: `cancel_subagent` answers `requested`/`changed` only when supplied (never defaulted, so an async cancel is not read as unchanged), and `cancel_job` answers `changed`. There is no job start method and no restart.
+
+A new/open session (`new_session`/`switch_session`) resets the Desktop channel: it forgets the pending request and the event baseline without rewinding request ids and returns to Idle, so the following `refresh_state` re-probes capabilities and the supervision lists re-seed exactly once behind it. Late answers from the previous session are uncorrelated and benign.
+
+The Agents panel's Stop button uses `cancel_subagent` when the peer offers it; a peer without the method (or a server `unsupported_method` answer) keeps the legacy "ask the agent to run `subagent_cancel`" prompt exactly once. Jobs cancel over `cancel_job` with no legacy prompt. Model, tokens and cost are shown per helper from the typed `usage` window, with an honest "unavailable" marker where the input/output/cache/reasoning breakdown is not recorded; prompt, tool output, paths and error text never cross the wire.
+
+### Subscription usage (`state::desktop::subscription`)
+
+When the backend's `capabilities` advertise `get_subscription_usage`, the Usage screen reads the whole-account snapshot through this slice instead of `auth.json` and provider APIs, and its Refresh button re-reads with `refresh_subscription_usage`. The slice is pure RPC state: it never reads `auth.json`, resolves `$VAR`/`!command`, builds a bearer header, or calls ChatGPT/NaN. `rate_limit` events reconcile per-provider snapshots — Claude's 5h/week response headers included — so those windows finally arrive in the app.
+
+- `get_subscription_usage` / `refresh_subscription_usage`: empty params for the whole account (or `{ provider }` for one). Both answer the same typed `providers` projection: `provider`, the closed `status` (`ok`/`pending`/`stale`/`failed`/`unavailable`), optional `fetchedAt`/`plan`/`refresh` (`unsupported`/`out_of_scope`), and `limits` → `windows`. No credential, account or URL field is part of the projection.
+- `rate_limit`: `{ source: "refresh" | "response", snapshots }`. The snapshots are full provider projections, upserted by provider id; `source: response` is the per-turn response-header path (Claude), `source: refresh` the refresh path. The event only applies when the capabilities `emits` the exact name, and it never marks the seed fetched.
+- One request in flight at a time, with the same timeout/rollback discipline as permission changes. A `pending`/`stale` entry with no limits keeps the last good limits (the data is still valid, just not fresh); `failed`/`unavailable` are shown honestly with no invented data.
+- The legacy `auth.json` + provider API path runs only when the capabilities are known not to offer `get_subscription_usage`, or the server answers `unsupported_method` for a method it advertised. Any other RPC failure (timeout, transport, malformed, event gap) is shown honestly and never falls back to direct API calls. Without an agent tab, the screen keeps the legacy path.
+- Per-turn limit notices (`notify`, "`N% used (window)`") stay a separate legacy chip path and never overwrite the structured provider windows.
+
+### Design canvas (`state::desktop::design`)
+
+When the backend's `capabilities` advertise `get_design_canvas`, the tab reads the canvas state once after the probe and follows the `design_canvas` events. Both become the same `SessionEvent::DesignCanvas(CanvasNotice)` the legacy paths produce, so the browser card and the stage list are unchanged. There is no open or stop method: the agent owns the canvas, the app only shows it.
+
+- `get_design_canvas` is sent as `{ includeUrl: true }`: the interactive host is the client the server trusts with the tokenized URL. It answers `running`, `slug`, `connectedClients`, `designs` and, when asked, `url`. The seed goes out once per backend, after the channel is Ready and no other request is in flight; a backend reset or any event gap re-arms it. Every gap reaches the channel's `resync()`, whichever record showed it (channel, permission, supervision, subscription, design or config), so the canvas re-seeds exactly once behind the resync snapshot; while a deferred resync is owed, the seed waits for it, and settling the design request flushes that resync.
+- `design_canvas`: `{ transition: "open" | "refresh" | "stop", ...state }`, applied only when the capabilities `emits` the exact name.
+- Mapping: only an event closes the canvas: a `stop` event, or an event with `running: false`, → `Stopped`. The seed (and any re-seed after a gap or reset) never emits `Stopped`, because `Stopped` closes design cards another tab may own; a seed with `running: false` emits nothing. A running canvas with a loopback URL → `Open { url, refreshed }` (`refreshed` only for `refresh`; the seed is never a refresh). The slice remembers the URL it last opened (never printed; cleared by a stop or a backend reset): a seed or `open` with that same URL emits nothing, so a re-seed does not reload the page, while `refresh` always reloads. A running canvas without a URL navigates nowhere. The loopback check is the browser's canvas rule, read back exactly, plus `gentle_core::web::loopback_url` (which refuses a userinfo host such as `localhost:@host`). Any other URL is refused with a warning and nothing opens.
+- The tokenized URL only travels inside the notice to the browser. Report messages, transcript notices and toasts from this slice never carry it, and its `Applied` type has no `Debug`.
+- One request in flight, with the same timeout/rollback and generation discipline as the other slices; a late answer after a timeout or reset navigates nowhere. A peer without the method (or an `unsupported_method` answer) is silent and keeps the legacy path.
+- Legacy paths stay for older Shells: the `notify` "Design canvas…" text and the `gentle_design` tool result. While the channel is Ready and the peer emits `design_canvas`, both are dropped so the canvas does not navigate twice: the `notify` text neither moves the canvas nor falls through to the loopback web opener, and the tool result emits no canvas notice. Otherwise both keep working as before.
+
+### Config stores (`state::desktop::config`, `features/profiles/`)
+
+When the backend's `capabilities` advertise both `get_config` and `set_config`, the Profiles screen reads and writes Gentle Shell's config stores through this slice, by store name: Desktop resolves no config path for them. Readable stores are `profiles`, `profile_fallbacks`, `pins`, `models`, `subagents` and `managed_assets`; only the first three are ever written, and `models`, `subagents` and `managed_assets` are shown read-only (one summary line).
+
+- **Slice.** The screen holds tickets (`config_get`, `config_set` on the session). The slice queues them and sends one request at a time on the shared `DesktopSession`, once the channel is Ready, no resync is owed and no other slice has a request in flight; every Desktop record, timeout and disposition pumps the queue. Each ticket gets exactly one outcome: the decoded state, the failure, `Timeout`, or `Dropped` when the backend resets, the channel goes unavailable or a resync snapshot times out first. One request in flight, with the same generation/timeout/rollback discipline as the other slices; a late answer after a timeout or reset is benign.
+- **Writes.** `set_config` always carries the `writeRevision` of its target as last read (from `get_config` or the previous `set_config` result), never a guess. Save, New, Duplicate, Rename and Delete are whole-store `profiles` replacements; a rename or delete follows `profile_fallbacks` (moved or cleared) and a rename follows the clone pin; "Use in this repo" sets or clears the `local` pin layer (`clear_pin`). The committed declaration is only reported, as before. The pin labels the screen shows (`<Git common dir>/gentle-ai/profile-pin.json`, `.pi/gentle-ai/profile.json`) are names, not resolved paths; a declaration shadowed by a winning clone pin is not reported by the store, so the screen says so instead of showing none.
+- **Missing store.** A missing `profiles` store is seeded with a `set_config` built from the `models` store's routing (the direct-file seed also folds in materialized agent routes; the RPC seed does not read agent files for it).
+- **Failures.** `revision_conflict` re-reads that store once, shows a notice, recomputes the draft against the fresh store (unsaved edits are kept) and never retries or overwrites. `invalid_data`, `write_failed`, `config_unavailable`, timeouts and transport failures are reported and nothing is written to a file. Only `Unsupported` (capabilities without the methods) or an `unsupported_method` answer switch the screen to the direct-file code; any other failure never falls back.
+- **Changes.** `config_changed` (applied only when the capabilities `emit` that exact name) re-reads the store it names unless its revision is already held (a write's own echo). Every event gap reaches the shared `resync()`, which also marks every store changed, so the screen re-reads them behind the resync snapshot.
+- **Choosing the path.** No agent tab, a missing Desktop extension, capabilities without both methods, or a backend that failed or exited mean the direct-file path (there is no writer to race). While the probe has not answered the screen waits (15 s, then says so with Retry); a channel that failed while probing is reported instead of guessing a path.
+- **Make default stays on files.** There is no server method that materializes routing (`models.json`, agent frontmatter, `subagents.json`, the managed-assets manifest) or Pi's `settings.json`, so Make default keeps the guarded multi-file flow in `profiles/apply.rs`, including its own `profiles.json` active-marker write. On the RPC path it is kept from racing the Shell's writer in both directions (`files::files_job_start`, `env::Remote`):
+  - *RPC write → Make default.* It starts only when no store write is open and no read of the `profiles` store is open or owed, and the `profiles.json` it rewrites is built from the store as last read, never from an older copy. Otherwise it refuses with a notice and writes nothing.
+  - *Make default → RPC write.* From that start until its background job finishes, every store write (Save, New, Duplicate, Rename, Delete, the fallbacks follow, pin set/clear) is refused at `Remote::write` with "wait for Make default to finish" and never sent; nothing is adopted, so the unsaved draft stays and can be saved afterwards. The buttons are also disabled while the job runs.
+  - Together these mean no RPC write can land between Make default's start and its file write, so it never writes `profiles.json` from a stale copy. When it finishes, the hold is released and `profiles`, `pins`, `models`, `subagents` and `managed_assets` are re-read through the Shell, so the next RPC write is guarded by the revisions Make default left (a write sent before that re-read lands can only conflict, never overwrite). A re-read asked for while a read of the same store is open does not run alongside it: the store is marked dirty and exactly one more read follows the open one, so the shown state is never older than the request. The agent list (agent files) and Pi's default orchestrator are not config stores and are still read from the files on both paths.
+
 ### Commands the app sends
 
 | `type` | Fields | Where | Use |
@@ -180,7 +240,7 @@ Window screens that need another command use `SessionView::send_command(Value)`,
 | `thinking_level_changed` | Effort level |
 | `bash_execution_update` | Live output of the active `!cmd` |
 | `tool_execution_start` | ODD phase (`gentle_state::infer_phase`); job label for `bash_background` / `monitor`; device launches and device commands of `bash` / `bash_background` → `SessionEvent::Device` / `DeviceCommand` |
-| `tool_execution_end` | Task list (`todo`), jobs (`details.gentleJobs`), `gentle_design` canvas → `SessionEvent::DesignCanvas` |
+| `tool_execution_end` | Task list (`todo`), jobs (`details.gentleJobs`), `gentle_design` canvas → `SessionEvent::DesignCanvas` (unless `design_canvas` events are the source, see Design canvas) |
 | `message_end` with `role: "custom"` | Updates jobs from `gentle-jobs.notice` |
 | Settled turn (`effects.settled`) | Refreshes stats and Git; `TurnEnded` alert unless `aborted` |
 
@@ -240,9 +300,9 @@ Only `http://` and `https://` are accepted by `--open-url` and `/web`. The gener
 | Method | Mapping in the app (`session/events.rs` `handle_ui`) |
 | --- | --- |
 | `select`, `confirm`, `input`, `editor` | `extension.dialogs` queue; the first one is drawn (`session/view/dialogs.rs`) and answered with `answer_dialog` → `respond_ui`. Triggers the `NeedsYou` alert. If it has a `timeout`, it is removed from the queue when it expires (the agent already resolved it). Esc answers `Cancelled`. |
-| `notify` | `notifyType` → `NoticeLevel` (`error`, `warning`, everything else `Info`). "Design canvas…" text → `browser::canvas_notice` → canvas. Usage limit notices (`parse_rate_limit`, "`N% used (window)`") → chip in `extension.rate_limits`. Everything else: capture for the running `/` command (`builtins::Capture`), toast only for warning/error (no repeats, `first_toast`) and `SessionEvent::Notice` to the notification center (`features/notices/`). |
+| `notify` | `notifyType` → `NoticeLevel` (`error`, `warning`, everything else `Info`). "Design canvas…" text → `browser::canvas_notice` → canvas, unless `design_canvas` events are the source (see Design canvas). Usage limit notices (`parse_rate_limit`, "`N% used (window)`") → chip in `extension.rate_limits`. Everything else: capture for the running `/` command (`builtins::Capture`), toast only for warning/error (no repeats, `first_toast`) and `SessionEvent::Notice` to the notification center (`features/notices/`). |
 | `setStatus` | `extension.statuses[key] = text`; empty or missing text removes the key. |
-| `setWidget` | `gentle-agents` → `gentle_core::activity::parse` + `retain_finished` (agents panel, Helpers chip). Any other key → `extension.widgets` (one chip per widget with its lines). `widgetPlacement` is ignored. |
+| `setWidget` | `gentle-agents` → `gentle_core::activity::parse` + `retain_finished` (the legacy helper source, used only until `list_subagents` seeds; see “Agents and jobs”). Any other key → `extension.widgets` (one chip per widget with its lines). `widgetPlacement` is ignored. |
 | `setTitle` | Tab title. |
 | `set_editor_text` | Replaces the composer text. |
 
@@ -286,19 +346,18 @@ App paths: `dirs::data_dir()/gentle-shell-gpui/` (on macOS, `~/Library/Applicati
 | `<agent>/auth.json` | Pi | R (Pi writes it via `login-helper.mjs`) | `usage/credentials.rs`, `settings/snapshot.rs`, `setup/extras.rs` |
 | `<agent>/settings.json` | Pi | R/W | `themes.rs` (`theme`), `sessions/discovery.rs` (`sessionDir`), `profiles/files.rs` (orchestrator), `setup/gentle.rs` (`packages`) |
 | `<agent>/models.json`, `<agent>/mcp.json` | Pi | R (`mcp.json` changes only through `gentle-shell mcp add`, so Pi writes it) | `settings/snapshot.rs`, `setup/extras.rs`, `setup/maestro.rs` |
-| `<agent>/subagents.json`, `<cwd>/.pi/subagents.json` | Gentle AI | R/W | `profiles/env.rs`, `profiles/apply.rs` |
-| `<agent>/gentle-ai/managed-assets.json` | Gentle AI installer | R/W | `profiles/apply.rs` |
+| `<agent>/subagents.json`, `<cwd>/.pi/subagents.json` | Gentle AI | R/W (over RPC, read as the `subagents` store; written only by Make default) | `profiles/env.rs`, `profiles/apply.rs` |
+| `<agent>/gentle-ai/managed-assets.json` | Gentle AI installer | R/W (over RPC, read as the `managed_assets` store; written only by Make default) | `profiles/apply.rs` |
 | `<agent>/claude-bridge.json` | Claude bridge | R/W | `settings/claude.rs` |
 | `<agent>/themes/*.json` | User | R | `shared/themes.rs` |
-| `<config>/profiles.json`, `<config>/models.json`, `<config>/profile-fallbacks.json` | Gentle AI | R/W | `profiles/files.rs`, `profiles/env.rs` |
+| `<config>/profiles.json`, `<config>/models.json`, `<config>/profile-fallbacks.json` | Gentle AI | R/W (over RPC: the `profiles`, `models`, `profile_fallbacks` stores; Make default still writes `profiles.json` and `models.json` directly) | `profiles/files.rs`, `profiles/env.rs` |
 | `<config>/permission-mode.json` (2 keys, 0600, atomic write) | Gentle AI | R/W | `shared/gentle_state.rs` |
 | `<config>/notifications.json` | Gentle AI | R/W | `features/alerts/policy.rs` |
 | `<config>/background-subagents.json`, `<cwd>/.pi/gentle-ai/background-subagents.json` | Gentle AI | R (changes via shell command) | `settings/background.rs` |
 | `<config>/banner.json` | Gentle AI | R | `shared/banner.rs`, `settings/snapshot.rs` |
 | `<config>/persona.json`, `<cwd>/.pi/gentle-ai/persona.json` | Gentle AI | R | `settings/snapshot.rs` |
-| `<cwd>/.pi/gentle-ai/profile.json`, `<git common>/gentle-ai/profile-pin.json` | Gentle AI | R/W | `profiles/pins.rs` |
+| `<cwd>/.pi/gentle-ai/profile.json`, `<git common>/gentle-ai/profile-pin.json` | Gentle AI | R/W (over RPC: the `pins` store, clone layer written by name; Make default's repo-scoped pin still writes the file) | `profiles/pins.rs` |
 | `*.jsonl` sessions | Pi | R | `sessions/`, `usage/stats.rs` |
-| gentle-stream's runtime folder (`$XDG_RUNTIME_DIR/gentle-stream`, else `~/.cache/gentle-stream/run`): `authkey`, `player.sock` | gentle-stream | R (the key, to authenticate) | `music/client.rs` |
 | `~/.cache/gentle-stream/FluidR3_GM.sf2` | gentle-stream (`setup-samples`) | R (exists?) | `setup/music.rs` |
 
 `<agent>` and `<config>` are `pi_rpc::resolve_homes()`. When writing a Gentle Shell file, its exact schema is respected (e.g. `permission-mode.json` rejects extra keys) and it is written atomically (temp file + `rename`), as `shared/gentle_state.rs` and `profiles/files.rs` do.
@@ -316,6 +375,8 @@ Its own JSONL protocol: the app sends `list`, `login` (`provider`, `authType: oa
 Blocking HTTP GET (ureq, 8 s, no redirects) on the background executor. Base URL: `ENGRAM_URL`, otherwise `http://127.0.0.1:${ENGRAM_PORT}`, default port `7437`. `ENGRAM_HTTP_TOKEN` adds `Authorization: Bearer`. Routes: `/project/current?cwd=`, `/observations/recent?…&limit=60`, `/search?q=…&limit=40` (with `project=` or `all_projects=true`). The `Observation` model, `encode` and `parse_observations` are in `gentle_core::engram`. The app does not start Engram: Gentle Shell does it with the first session.
 
 ### Subscription usage (`features/usage/`)
+
+The preferred path is the Gentle Desktop RPC slice (see "Subscription usage" under RPC protocol). The legacy path below runs only when there is no agent tab, or the backend's `capabilities` are known not to offer `get_subscription_usage` (or answered `unsupported_method`).
 
 `credentials.rs` reads `<agent>/auth.json` and resolves keys the way Pi does (`$VAR`, `!command`); `fetch.rs` makes one GET per card (20 s, no redirects so the token never leaves the origin, `User-Agent: gentle-pi`): Codex at `https://chatgpt.com/backend-api/wham/usage` and NaN at `https://cloud-api.nan.builders/api/usage/quota`. The parsers are `gentle_core::usage::subscription`.
 
@@ -339,21 +400,20 @@ Same as the launcher's startup check (`lib/gentle-shell-startup-update.ts`): `re
 | ClaudeBridge | `gentle-shell install npm:<bridge>` |
 | Engram | `Gentleman-Programming/engram` release from GitHub, verified, into `toolchain/bin` |
 | Maestro (Settings → UI testing, not part of this checklist) | Java 17+ is looked up (`toolchain/java`, `JAVA_HOME`, macOS `/usr/libexec/java_home -v 17+`, the `java` on the PATH, each checked by its `release` file); without one, the latest Temurin 21 JRE from `api.adoptium.net`, checked against Adoptium's sha256, into `toolchain/java`. The CLI is looked up (`toolchain/maestro/bin`, PATH, `~/.maestro/bin`); without one, `maestro.zip` from `mobile-dev-inc/maestro`'s latest GitHub release, checked against its `checksums_sha256.txt`, into `toolchain/maestro`. Then `gentle-shell mcp add maestro --env JAVA_HOME=<home> --description … -- <maestro> mcp` (`cmd /c <maestro.bat> mcp` on Windows). `status` reports the CLI (and whether it is the app's own), Java and whether Pi's `mcp.json` has an enabled `maestro` server; `test_connection` runs `gentle-shell mcp list` and returns the `maestro:` line; `disconnect` runs `gentle-shell mcp remove maestro`; `remove` disconnects and deletes `toolchain/maestro` and `toolchain/java`. Install and disconnect emit `SettingsEvent::Changed`, so tabs restart when idle and load or drop the tools. |
-| Music (Settings → Music, not part of this checklist) | macOS and Linux only. The player is looked up (`toolchain/music/bin`, `gentle-stream` on the PATH, Gentle Shell's `~/.gentle-shell/music/bin`) with the Python of its own virtualenv next to its real path. Install mirrors Gentle Shell's `/gentle:music` offer: uv 0.13.6 (its pinned sha256, `fetch.rs` `install_uv`) into `toolchain/music/uv`, then `uv tool install --python 3.13 'gentle-stream[samples] @ <pinned archive>'` with every uv folder inside `toolchain/music` and inherited `UV_*`/`PYTHON*`/`PIP_*` dropped; without the system FluidSynth library it retries without `[samples]`. Sampled instruments run `gentle-stream setup-samples`. Remove stops the player and deletes `toolchain/music`. |
+| Music (Settings → Music, not part of this checklist) | macOS and Linux only. The player is looked up (`toolchain/music/bin`, `gentle-stream` on the PATH, Gentle Shell's `~/.gentle-shell/music/bin`) and driven over its `ctl` CLI. Install mirrors Gentle Shell's `/gentle:music` offer: uv 0.13.6 (its pinned sha256, `fetch.rs` `install_uv`) into `toolchain/music/uv`, then `uv tool install --python 3.13 'gentle-stream[samples] @ <pinned archive>'` with every uv folder inside `toolchain/music` and inherited `UV_*`/`PYTHON*`/`PIP_*` dropped; without the system FluidSynth library it retries without `[samples]`. Sampled instruments run `gentle-stream setup-samples`. Remove stops the player and deletes `toolchain/music`. |
 | Provider | Providers screen |
 
 Anything that needs `sudo` or an interactive login is delivered as `Fix::Terminal`, and `features/onboarding/` opens it in a terminal tab. After installing, `refresh_paths` (= `forget_cached` + `apply_toolchain_path`).
 
 ### Music (`features/music/`)
 
-gentle-stream's background player (one per user, `gentle-stream daemon`) owns the audio and keeps playing after its clients leave. The app talks to it the way gentle-stream's own TUI does:
+gentle-stream's background player (one per user, `gentle-stream daemon`) owns the audio and keeps playing after its clients leave. The app controls it through the same `ctl` CLI gentle-stream itself ships, one short process per request:
 
-- **Socket.** `client.rs` connects to `player.sock` in the runtime folder (`gentle_core::music::runtime_dir`, same rule as gentle-stream) and speaks Python's `multiprocessing.connection`: 4-byte big-endian length frames, then a mutual HMAC-SHA256 challenge with the `authkey` file (the player challenges first; the app's 40-byte nonce comes from `/dev/urandom`). Requests are JSON: `state` (with `bands` for the spectrum), `toggle`, `next`, `set_volume`, `stop`. The player authenticates one client at a time with a listen queue of one, so a refused connect is retried briefly.
-- **Helper.** Starting the player and turning a mood into a style run a short Python script (`HELPER` in `music/mod.rs`) with the player's own Python: `client.ensure()` (gentle-stream's startup, ready pipe included), then `GentleShell(binary=<launcher>).interpret_with_usage(mood, player.style)` and `set_style`. The launcher is `pi_rpc::resolve_backend`'s program; the call uses Gentle Shell's default model and reports its tokens and cost.
-- **Polling.** Every 4 s while nothing plays (a player started from a terminal shows up), every 1.5 s while one plays, every 70 ms with 40 bands while the popover is open. One connection is kept and reopened after a drop.
-- **Quitting.** The app stops a player it started; one started elsewhere keeps playing.
+- **CLI.** `client.rs` runs `gentle-stream ctl <action> --json` with the resolved player binary (`setup::music::player`), `pi_rpc::command` and `pi_rpc::child_path()` as `PATH`. Actions: `start` (attaches to or starts the player), `status`, `volume 0..100`, `mood <text>`, `toggle`, `next`, `stop`. A successful answer is one machine envelope with `running`, `playing`, `volume` (a whole percent), `name`, `genre` and `mood`; failures are structured (`nothing_playing`, `invalid_request`, `unavailable`). Only `start` may spawn a player; `mood` passes `--gentle-shell <launcher>` so Gentle Shell's model reads the text, and the app starts the player first when nothing is playing.
+- **Polling.** Every 4 s while nothing plays (a player started from a terminal shows up), every 1.5 s while one plays, every 1 s while the popover is open. Each poll is one `ctl status --json` process, so a poll never spawns a second player.
+- **Quitting.** The app stops a player it started (`ctl stop`); one started elsewhere keeps playing.
 
-These are gentle-stream internals, not a public CLI (its CLI only has `ctl play|pause|toggle|next|stop|status`); the archive the app installs is pinned, so a player installed some other way may differ.
+The snapshot guarantees no key, mode, bpm or spectrum, so those displays degrade to empty (the popover's spectrum stays flat); the app never invents them.
 
 ### Git (`features/git/`)
 
@@ -361,15 +421,15 @@ These are gentle-stream internals, not a public CLI (its CLI only has `ctl play|
 
 ### Browser for Gentle Design (`features/browser/`)
 
-The canvas is detected from the `gentle_design` result (`details.url`, `refreshed`, `stopped`) or from a `notify` "Design canvas: <url>" / "Design canvas refreshed: <url>" / "Design canvas stopped."; only loopback URLs are accepted (`http://127.0.0.1:` or `http://localhost:`). The window shows it in `BrowserPanel`. Implementation per OS: `macos.rs` (WKWebView as a subview), `windows.rs` (WebView2 in its own popup that follows the window), `linux.rs` (WebKitGTK as a child of the X11 window; on Wayland the canvas stays in the browser that Gentle Shell opened).
+The canvas is detected from the Gentle Desktop `design_canvas` events and seed (see Design canvas under RPC protocol), from the `gentle_design` result (`details.url`, `refreshed`, `stopped`) or from a `notify` "Design canvas: <url>" / "Design canvas refreshed: <url>" / "Design canvas stopped."; only loopback URLs are accepted (`http://127.0.0.1:` or `http://localhost:`). The window shows it in `BrowserPanel`. Implementation per OS: `macos.rs` (WKWebView as a subview), `windows.rs` (WebView2 in its own popup that follows the window), `linux.rs` (WebKitGTK as a child of the X11 window; on Wayland the canvas stays in the browser that Gentle Shell opened).
 
 ## Limits of an RPC host
 
-- Gentle Shell does not publish the model, tokens or cost of live helpers.
-- Claude subscription windows only arrive as response headers inside the TUI; the app sees the limit notices (`notify`) but not the full windows.
-- Only the agent can stop helpers and background jobs ("Ask to stop" asks it to run `subagent_cancel`).
+- Helpers' model, tokens and cost arrive only from backends whose `capabilities` offer `list_subagents`; the token breakdown is unavailable while a helper is in flight. Older Shells keep the legacy `gentle-agents` widget without model/usage/cost.
+- Claude subscription windows arrive through the `rate_limit` event when the backend advertises `get_subscription_usage`; without it the app sees only the legacy limit notices (`notify`), not the full windows.
+- Helpers and background jobs stop directly only when the backend offers `cancel_subagent`/`cancel_job`; without them the Agents panel keeps the legacy "ask the agent to run `subagent_cancel`" prompt, and jobs have no cancel.
 - Auto mode may reject actions: input over RPC does not count as a live human decision.
-- The permission mode of a live session can only change from the TUI: the app saves `permission-mode.json` and restarts the backend on the same conversation.
+- The permission mode of a live session changes over the Gentle Desktop RPC channel when the backend advertises `set_permission_mode`; a backend without that method keeps the legacy path (save `permission-mode.json` and restart). See “Permission mode” under RPC protocol.
 - Gentle Shell does not play sounds for RPC hosts (`notificationContextAllowed`): `features/alerts/` plays them.
 - `ctx.ui.custom()` screens do not arrive: they are rebuilt natively or hidden.
 - New credentials are only read when the backend starts.

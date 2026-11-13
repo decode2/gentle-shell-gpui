@@ -12,6 +12,7 @@ use pi_rpc::PiProcess;
 
 use super::SessionView;
 use super::state::BackendStatus;
+use super::state::desktop::permission::Report;
 use super::view;
 use gentle_core::transcript::{NoticeLevel, Transcript};
 
@@ -141,12 +142,33 @@ impl SessionView {
         self.in_window(cx, |this, window, cx| this.restart_backend(window, cx));
     }
 
-    /// Switch this session to `mode` now. Gentle Shell only switches a live
-    /// session from its terminal UI, but a session it hasn't seen in this
-    /// process starts in the saved default: so save `mode` as the default and
-    /// restart the backend on the same conversation (mid-turn, once the turn
-    /// ends). New sessions start in it too.
+    /// Switch this session to `mode`. When the backend offers
+    /// `set_permission_mode`, the picker's selection is the consent and the
+    /// request switches the live session over RPC (`persist: true`); the
+    /// confirmed state moves only when the server answers, and a successful
+    /// switch never writes the default file or restarts. A Shell without the
+    /// method keeps the legacy path below.
     pub(super) fn choose_mode(
+        &mut self,
+        mode: gentle_core::gentle_state::PermissionMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let wire_mode = super::to_desktop_mode(mode);
+        let applied =
+            self.permission
+                .set_permission_mode(self.desktop.session(), wire_mode, Some(true));
+        match mode_action(applied.report.as_ref()) {
+            ModeAction::Legacy => self.legacy_choose_mode(mode, window, cx),
+            ModeAction::Request | ModeAction::Report => self.apply_permission(applied, cx),
+        }
+    }
+
+    /// The legacy mode switch: save `mode` as the default and restart the
+    /// backend on the same conversation (mid-turn, once the turn ends). New
+    /// sessions start in it too. Used only when Gentle Desktop cannot switch
+    /// the live session over RPC.
+    fn legacy_choose_mode(
         &mut self,
         mode: gentle_core::gentle_state::PermissionMode,
         window: &mut Window,
@@ -187,6 +209,40 @@ impl SessionView {
         cx.notify();
     }
 
+    /// A server that advertised `set_permission_mode` answered
+    /// `unsupported_method`. Keep the legacy save+restart behavior once, but
+    /// defer the restart through `restart_pending` so the batch that delivered
+    /// the response finishes against the backend being replaced.
+    pub(super) fn legacy_choose_mode_deferred(
+        &mut self,
+        mode: gentle_core::gentle_state::PermissionMode,
+        cx: &mut Context<Self>,
+    ) {
+        let config = pi_rpc::resolve_homes().config;
+        if let Err(error) = crate::shared::gentle_state::save_default_mode(&config, mode) {
+            self.transcript.notice(
+                NoticeLevel::Error,
+                format!("Could not save the permission mode: {error}"),
+            );
+            cx.notify();
+            return;
+        }
+        self.default_mode = Some(mode);
+        if self.mode == Some(mode) || !self.backend.started {
+            cx.notify();
+            return;
+        }
+        self.backend.restart_pending = true;
+        self.transcript.notice(
+            NoticeLevel::Info,
+            format!(
+                "Permissions switch to {} when the current turn ends.",
+                mode.label()
+            ),
+        );
+        cx.notify();
+    }
+
     /// Restart the backend on the same conversation now, or, mid-turn or with
     /// a dialog open, once that settles (`waiting` tells the user).
     fn restart_when_idle(&mut self, waiting: &str, window: &mut Window, cx: &mut Context<Self>) {
@@ -222,6 +278,10 @@ impl SessionView {
         self.backend.started = true;
         self.backend.status = BackendStatus::Starting;
         self.models.loaded = false;
+        // This tab now has a backend of its own to ask: the previous one's
+        // Desktop answers and event numbering are gone.
+        self.desktop.reset();
+        self.permission.reset(self.desktop.session());
         self.transcript = Transcript::default();
         self.markdown.clear();
         self.expanded.clear();
@@ -343,9 +403,33 @@ fn drain_queued<T>(first: T, rx: &async_channel::Receiver<T>) -> Vec<T> {
     batch
 }
 
+/// What one picker selection should do, from the permission slice's answer to
+/// `set_permission_mode`.
+enum ModeAction {
+    /// Send the RPC request and wait for the server's truth: never write the
+    /// default file or restart for this.
+    Request,
+    /// The peer does not offer the live switch: keep the legacy save+restart
+    /// path once.
+    Legacy,
+    /// A failure (or a second in-flight selection): report, never fall back.
+    Report,
+}
+
+fn mode_action(report: Option<&Report>) -> ModeAction {
+    match report {
+        None => ModeAction::Request,
+        Some(Report::Unsupported) | Some(Report::UnsupportedMethod) => ModeAction::Legacy,
+        Some(_) => ModeAction::Report,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::drain_queued;
+    use pi_rpc::desktop_rpc::{DesktopErrorInfo, DesktopRpcError};
+
+    use super::Report;
+    use super::{ModeAction, drain_queued, mode_action};
 
     #[test]
     fn batches_drain_everything_queued_in_order() {
@@ -366,5 +450,41 @@ mod tests {
         tx.try_send(7).unwrap();
         drop(tx);
         assert_eq!(drain_queued(rx.try_recv().unwrap(), &rx), vec![6, 7]);
+    }
+
+    #[test]
+    fn a_picker_selection_requests_legacy_or_reports() {
+        // No report: the RPC request goes out; never a file write or restart.
+        assert!(matches!(mode_action(None), ModeAction::Request));
+        // Missing capability or a server `unsupported_method` keeps the legacy
+        // save+restart path once.
+        assert!(matches!(
+            mode_action(Some(&Report::Unsupported)),
+            ModeAction::Legacy
+        ));
+        assert!(matches!(
+            mode_action(Some(&Report::UnsupportedMethod)),
+            ModeAction::Legacy
+        ));
+        // Every other failure is reported, never silently fallen back to.
+        let failure = Report::Failure(DesktopRpcError::RequestInFlight {
+            request_id: "desktop-1".into(),
+        });
+        assert!(matches!(mode_action(Some(&failure)), ModeAction::Report));
+        let persist = Report::PersistError(DesktopErrorInfo {
+            code: "readonly".into(),
+            message: "nope".into(),
+        });
+        assert!(matches!(mode_action(Some(&persist)), ModeAction::Report));
+        // Capabilities still loading, and a timeout, must report instead of
+        // writing the default file or restarting through the legacy path.
+        assert!(matches!(
+            mode_action(Some(&Report::NotReady)),
+            ModeAction::Report
+        ));
+        assert!(matches!(
+            mode_action(Some(&Report::Timeout)),
+            ModeAction::Report
+        ));
     }
 }

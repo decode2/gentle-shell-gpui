@@ -9,6 +9,8 @@ use gpui_kit::component::{Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
+use pi_rpc::desktop_rpc::JobExitCode;
+
 use super::{NARROW, TINY, clock};
 use crate::features::session::SessionView;
 use crate::shared::ui;
@@ -153,8 +155,8 @@ impl SessionView {
                         .tooltip(move |window, cx| Tooltip::new(tip.clone()).build(window, cx)),
                 )
             })
-            .when(!self.activity.jobs.is_empty(), |this| {
-                this.child(self.render_jobs_chip())
+            .when(self.jobs_visible(), |this| {
+                this.child(self.render_jobs_chip(cx))
             })
             .when(self.activity.queued > 0, |this| {
                 this.child(ui::chip(
@@ -169,13 +171,9 @@ impl SessionView {
             .when(width >= NARROW, |this| {
                 this.children(self.render_usage_chip())
             })
-            .when(
-                self.activity
-                    .agents
-                    .as_ref()
-                    .is_some_and(|a| !a.tasks.is_empty()),
-                |this| this.child(self.render_helpers_chip(cx)),
-            )
+            .when(self.helpers_visible(), |this| {
+                this.child(self.render_helpers_chip(cx))
+            })
             .children(self.extension.rate_limits.iter().filter(|_| !collapse).map(
                 |(window, limit)| {
                     let color = if limit.percent >= 95 {
@@ -212,45 +210,132 @@ impl SessionView {
     // ── Status chips (Tern-style: everything that used to sit in a side
     //    panel lives in small chips over the composer, each opening a card) ──
 
-    /// Background jobs: "⧗ 2 running" or "Jobs 3", with the list on click.
-    fn render_jobs_chip(&self) -> impl IntoElement + use<> {
-        let running = self.activity.jobs.iter().filter(|j| j.is_running()).count();
-        let total = self.activity.jobs.len();
+    /// Whether a job's status word means it is still running.
+    fn jobs_visible(&self) -> bool {
+        if self.desktop.jobs_ready() {
+            !self.desktop.jobs().is_empty()
+        } else {
+            !self.activity.jobs.is_empty()
+        }
+    }
+
+    /// Whether the helpers chip has anything to show (structured or legacy).
+    fn helpers_visible(&self) -> bool {
+        if self.desktop.subagents_ready() {
+            !self.desktop.subagents().is_empty()
+        } else {
+            self.activity
+                .agents
+                .as_ref()
+                .is_some_and(|a| !a.tasks.is_empty())
+        }
+    }
+
+    /// Background jobs: "⧗ 2 running" or "Jobs 3", with the list on click and
+    /// a cancel action for running jobs once the peer offers `cancel_job`.
+    fn render_jobs_chip(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let structured = self.desktop.jobs_ready();
+        let cancel_supported = self.desktop.cancel_job_supported();
+        // Counts use the full list, never the truncated display rows, so a
+        // >20-job session still reports its real running/total.
+        let (running, total) = if structured {
+            let jobs = self.desktop.jobs();
+            (
+                jobs.iter()
+                    .filter(|job| running_status(&job.status))
+                    .count(),
+                jobs.len(),
+            )
+        } else {
+            (
+                self.activity
+                    .jobs
+                    .iter()
+                    .filter(|job| job.is_running())
+                    .count(),
+                self.activity.jobs.len(),
+            )
+        };
+        let rows: Vec<JobChipRow> = if structured {
+            self.desktop
+                .jobs()
+                .iter()
+                .take(20)
+                .map(|job| {
+                    let running = running_status(&job.status);
+                    let (glyph, color) = if running {
+                        ("⧗", ui::accent())
+                    } else if matches!(job.exit_code, Some(JobExitCode::Code(0)))
+                        && job.status != "failed"
+                    {
+                        ("✓", ui::success())
+                    } else {
+                        ("✗", ui::danger())
+                    };
+                    let state = match &job.exit_code {
+                        Some(JobExitCode::Code(code)) => format!("exit {code}"),
+                        Some(JobExitCode::Null) => "no exit code".to_string(),
+                        None => job.status.clone(),
+                    };
+                    let label = if job.label.is_empty() {
+                        format!("job {}", job.id)
+                    } else {
+                        job.label.clone()
+                    };
+                    JobChipRow {
+                        id: job.id.clone(),
+                        label,
+                        glyph,
+                        color,
+                        state,
+                        running,
+                    }
+                })
+                .collect()
+        } else {
+            self.activity
+                .jobs
+                .iter()
+                .take(20)
+                .map(|job| {
+                    let (glyph, color) = if job.is_running() {
+                        ("⧗", ui::accent())
+                    } else if job.exit_code.unwrap_or(0) == 0 && job.status != "failed" {
+                        ("✓", ui::success())
+                    } else {
+                        ("✗", ui::danger())
+                    };
+                    let label = if job.label.is_empty() {
+                        format!("job {}", job.id)
+                    } else {
+                        job.label.clone()
+                    };
+                    let state = match job.exit_code {
+                        Some(code) => format!("exit {code}"),
+                        None => job.status.clone(),
+                    };
+                    JobChipRow {
+                        id: job.id.clone(),
+                        label,
+                        glyph,
+                        color,
+                        state,
+                        running: job.is_running(),
+                    }
+                })
+                .collect()
+        };
         let color = if running > 0 {
             ui::accent()
         } else {
             ui::muted()
         };
-        let rows: Vec<(String, &'static str, Hsla, String)> = self
-            .activity
-            .jobs
-            .iter()
-            .take(20)
-            .map(|job| {
-                let (glyph, color) = if job.is_running() {
-                    ("⧗", ui::accent())
-                } else if job.exit_code.unwrap_or(0) == 0 && job.status != "failed" {
-                    ("✓", ui::success())
-                } else {
-                    ("✗", ui::danger())
-                };
-                let label = if job.label.is_empty() {
-                    format!("job {}", job.id)
-                } else {
-                    job.label.clone()
-                };
-                let state = match job.exit_code {
-                    Some(code) => format!("exit {code}"),
-                    None => job.status.clone(),
-                };
-                (label, glyph, color, state)
-            })
-            .collect();
         let label = if running > 0 {
             format!("{running} running")
         } else {
             format!("Jobs {total}")
         };
+        let weak = cx.entity().downgrade();
         chip_popover(
             "jobs",
             IconName::Activity,
@@ -260,11 +345,11 @@ impl SessionView {
             format!("{running}/{total}"),
             move || {
                 rows.iter()
-                    .map(|(label, glyph, color, state)| {
-                        h_flex()
+                    .map(|row| {
+                        let mut item = h_flex()
                             .gap_2()
                             .text_size(px(12.))
-                            .child(div().flex_none().text_color(*color).child(*glyph))
+                            .child(div().flex_none().text_color(row.color).child(row.glyph))
                             .child(
                                 div()
                                     .flex_1()
@@ -272,15 +357,31 @@ impl SessionView {
                                     .truncate()
                                     .font_family(ui::MONO)
                                     .text_color(ui::fg())
-                                    .child(label.clone()),
+                                    .child(row.label.clone()),
                             )
                             .child(
                                 div()
                                     .flex_none()
                                     .text_color(ui::faint())
-                                    .child(state.clone()),
-                            )
-                            .into_any_element()
+                                    .child(row.state.clone()),
+                            );
+                        if row.running && cancel_supported {
+                            let id = row.id.clone();
+                            let weak = weak.clone();
+                            item = item.child(
+                                Button::new(SharedString::from(format!("job-cancel-{id}")))
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(Icon::new(IconName::OctagonX))
+                                    .tooltip("Cancel this job over the Desktop channel")
+                                    .on_click(move |_, _, cx| {
+                                        let _ = weak.update(cx, |this, cx| {
+                                            this.cancel_running_job(id.clone(), cx)
+                                        });
+                                    }),
+                            );
+                        }
+                        item.into_any_element()
                     })
                     .collect()
             },
@@ -328,28 +429,54 @@ impl SessionView {
     /// Helpers (subagents): "1/3" active of total; the card lists each with
     /// its status, task and last step, and opens the full Agents window.
     fn render_helpers_chip(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let (active, rows) = match &self.activity.agents {
-            Some(activity) => (
-                activity.summary.running + activity.summary.waiting + activity.summary.queued,
-                activity
-                    .tasks
+        let (active, rows) = if self.desktop.subagents_ready() {
+            let agents = self.desktop.subagents();
+            (
+                agents
+                    .iter()
+                    .filter(|agent| {
+                        matches!(agent.status.as_str(), "running" | "queued" | "waiting")
+                    })
+                    .count(),
+                agents
                     .iter()
                     .take(20)
-                    .map(|task| {
-                        let s = &task.summary;
+                    .map(|agent| {
                         (
-                            s.agent.clone(),
-                            s.status.clone(),
-                            crate::features::session::agents::status_color(&s.status),
-                            s.label.clone(),
-                            s.last_step
-                                .as_deref()
-                                .map(|step| gentle_core::text::first_line(step, 60)),
+                            agent.agent.clone(),
+                            agent.status.clone(),
+                            crate::features::session::agents::status_color(&agent.status),
+                            None,
+                            Some(agent.last_step.to_string()),
                         )
                     })
                     .collect::<Vec<_>>(),
-            ),
-            None => (0, Vec::new()),
+            )
+        } else {
+            match &self.activity.agents {
+                Some(activity) => (
+                    (activity.summary.running + activity.summary.waiting + activity.summary.queued)
+                        as usize,
+                    activity
+                        .tasks
+                        .iter()
+                        .take(20)
+                        .map(|task| {
+                            let s = &task.summary;
+                            (
+                                s.agent.clone(),
+                                s.status.clone(),
+                                crate::features::session::agents::status_color(&s.status),
+                                s.label.clone(),
+                                s.last_step
+                                    .as_deref()
+                                    .map(|step| gentle_core::text::first_line(step, 60)),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                None => (0, Vec::new()),
+            }
         };
         let total = rows.len();
         let color = if active > 0 {
@@ -467,6 +594,23 @@ impl SessionView {
             },
         ))
     }
+}
+
+/// One row of the background-jobs chip, from either the structured channel or
+/// the legacy `details.gentleJobs` source.
+struct JobChipRow {
+    id: String,
+    label: String,
+    glyph: &'static str,
+    color: Hsla,
+    state: String,
+    running: bool,
+}
+
+/// Whether a job's status word means it is still running, the same vocabulary
+/// the legacy `gentle_core::gentle_state::Job` uses.
+fn running_status(status: &str) -> bool {
+    matches!(status, "running" | "started" | "")
 }
 
 /// A status chip over the composer that opens a card above it: icon, title,

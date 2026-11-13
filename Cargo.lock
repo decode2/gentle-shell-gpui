@@ -2175,11 +2175,9 @@ dependencies = [
 name = "gentle-core"
 version = "0.1.13"
 dependencies = [
- "hmac",
  "regex",
  "serde",
  "serde_json",
- "sha2 0.10.9",
 ]
 
 [[package]]
@@ -5312,6 +5310,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "dunce",
+ "pollster",
  "serde",
  "serde_json",
  "which",

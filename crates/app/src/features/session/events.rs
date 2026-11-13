@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
+use pi_rpc::desktop_rpc::{DesktopMethod, DesktopRecord, DesktopRpcError, decode_widget};
 use pi_rpc::{Incoming, UiAnswer, UiMethod, UiRequest};
 use serde_json::Value;
 
+use super::state::desktop;
 use super::state::{BackendStatus, Dialog, TurnActivity};
 use super::{SessionEvent, SessionView, view};
 use crate::features::browser::CanvasNotice;
@@ -65,6 +67,9 @@ impl SessionView {
                 self.backend.status = BackendStatus::Exited(code);
                 self.transcript.interrupt();
                 self.extension.dialogs.clear();
+                // Nothing the dead backend said or numbered applies any more.
+                self.desktop.reset();
+                self.permission.reset(self.desktop.session());
             }
         }
     }
@@ -120,7 +125,8 @@ impl SessionView {
                 }
                 self.activity.tool_ended(event);
                 if event["toolName"] == "gentle_design"
-                    && let Some(canvas) = design_canvas(details)
+                    && let Some(canvas) =
+                        tool_design_canvas(details, self.desktop.design_events_ready())
                 {
                     cx.emit(SessionEvent::DesignCanvas(canvas));
                 }
@@ -160,6 +166,13 @@ impl SessionView {
     }
 
     fn handle_ui(&mut self, request: UiRequest, window: &mut Window, cx: &mut Context<Self>) {
+        // Gentle Desktop's records travel as a widget but are control traffic:
+        // the adapter correlates them, so they never land in widget storage.
+        // Every other widget keeps the handling below unchanged.
+        if desktop::is_desktop_widget(&request) {
+            self.handle_desktop_ui(&request, cx);
+            return;
+        }
         if request.method.is_dialog() {
             if let Some(timeout) = request.timeout {
                 let id = request.id.clone();
@@ -195,13 +208,12 @@ impl SessionView {
                 notify_type,
             } => {
                 let level = notice_level(notify_type.as_deref());
-                match crate::features::browser::canvas_notice(&message) {
-                    Some(canvas) => cx.emit(SessionEvent::DesignCanvas(canvas)),
-                    None => {
-                        if let Some(url) = web::loopback_url(&message) {
-                            cx.emit(SessionEvent::AgentWeb(url));
-                        }
+                match notify_target(&message, self.desktop.design_events_ready()) {
+                    Some(NotifyTarget::Canvas(canvas)) => {
+                        cx.emit(SessionEvent::DesignCanvas(canvas))
                     }
+                    Some(NotifyTarget::Web(url)) => cx.emit(SessionEvent::AgentWeb(url)),
+                    None => {}
                 }
                 let error = level == NoticeLevel::Error;
                 // Usage warnings repeat every turn: keep them as a composer chip.
@@ -267,6 +279,200 @@ impl SessionView {
             }
             _ => {}
         }
+    }
+
+    /// Route one Desktop widget record to the slice that owns it, then hand
+    /// the original request to that slice so the shared session accepts it
+    /// exactly once. Permission responses go to whoever's request is pending;
+    /// permission events to the permission slice; everything else stays on the
+    /// channel (probe, sequencing, resync, and every benign foreign record).
+    fn handle_desktop_ui(&mut self, request: &UiRequest, cx: &mut Context<Self>) {
+        let decoded = decode_widget(request);
+        let pending = self.desktop.session().pending().map(|(_, method)| method);
+        match route_desktop_widget(&decoded, pending) {
+            DesktopRoute::Permission => {
+                // Capture the intent before the slice consumes it, so a server
+                // `unsupported_method` can still fall back to the legacy
+                // save+restart path once.
+                let requested_mode = self
+                    .permission
+                    .requested()
+                    .map(|requested| super::from_desktop_mode(requested.mode));
+                let applied = self.permission.apply(self.desktop.session(), request);
+                let mut legacy_fallback = false;
+                match applied.report.as_ref() {
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync. The record was already accepted by the permission
+                    // slice, so it is never accepted again here.
+                    Some(desktop::permission::Report::OutOfOrderSequence) => {
+                        let sends = self.desktop.resync();
+                        self.send_desktop(sends, cx);
+                    }
+                    Some(desktop::permission::Report::UnsupportedMethod) => {
+                        if let Some(mode) = requested_mode {
+                            self.legacy_choose_mode_deferred(mode, cx);
+                            legacy_fallback = true;
+                        } else {
+                            self.apply_permission(applied, cx);
+                        }
+                    }
+                    _ => self.apply_permission(applied, cx),
+                }
+                if !legacy_fallback {
+                    self.sync_supervision(cx);
+                    self.sync_design(cx);
+                    self.sync_config(cx);
+                }
+            }
+            DesktopRoute::Supervision => {
+                let applied = self.desktop.supervision_apply(request);
+                match applied.report.as_ref() {
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync, and the lists re-seed once it lands.
+                    Some(desktop::supervision::Report::OutOfOrderSequence) => {
+                        let sends = self.desktop.resync();
+                        self.send_desktop(sends, cx);
+                    }
+                    Some(desktop::supervision::Report::UnsupportedMethod) => {
+                        // The server refused a cancel it advertised: keep the
+                        // legacy prompt path once, with the exact id.
+                        if let Some(target) = self.desktop.take_cancel_target() {
+                            self.legacy_cancel(target, cx);
+                        } else {
+                            self.apply_supervision(applied, cx);
+                        }
+                    }
+                    _ => self.apply_supervision(applied, cx),
+                }
+                self.sync_supervision(cx);
+                self.sync_design(cx);
+                self.sync_config(cx);
+            }
+            DesktopRoute::Subscription => {
+                let applied = self.desktop.subscription_apply(request);
+                match applied.report.as_ref() {
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync. The record was already accepted, so it is never
+                    // accepted again.
+                    Some(desktop::subscription::Report::OutOfOrderSequence) => {
+                        let sends = self.desktop.resync();
+                        self.send_desktop(sends, cx);
+                    }
+                    _ => self.apply_subscription(applied, cx),
+                }
+                self.sync_design(cx);
+                self.sync_config(cx);
+            }
+            DesktopRoute::Design => {
+                let applied = self.desktop.design_apply(request);
+                match applied.report.as_ref() {
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync, and the canvas re-seeds once it lands.
+                    Some(desktop::design::Report::OutOfOrderSequence) => {
+                        let sends = self.desktop.resync();
+                        self.send_desktop(sends, cx);
+                    }
+                    _ => self.apply_design(applied, cx),
+                }
+                self.sync_supervision(cx);
+                self.sync_design(cx);
+                self.sync_config(cx);
+            }
+            DesktopRoute::Config => {
+                let applied = self.desktop.config_apply(request);
+                match applied.report.as_ref() {
+                    // Events were lost: the channel owns the get_snapshot
+                    // resync, and the Profiles screen re-reads every store
+                    // behind it. The record was already accepted, so it is
+                    // never accepted again.
+                    Some(desktop::config::Report::OutOfOrderSequence) => {
+                        let sends = self.desktop.resync();
+                        self.send_desktop(sends, cx);
+                        cx.notify();
+                    }
+                    _ => self.apply_config(applied, cx),
+                }
+                self.sync_supervision(cx);
+                self.sync_design(cx);
+                self.sync_config(cx);
+            }
+            DesktopRoute::Channel => {
+                let applied = self.desktop.ui(request);
+                self.apply_desktop(applied, cx);
+                self.sync_permission_capabilities(cx);
+                self.sync_supervision(cx);
+                self.sync_design(cx);
+                self.sync_config(cx);
+            }
+        }
+    }
+
+    /// Seed the design canvas once the probe and any in-flight request
+    /// settle; it chains behind the other seeds the same way supervision does.
+    fn sync_design(&mut self, cx: &mut Context<Self>) {
+        let applied = self.desktop.design_seed();
+        self.apply_design(applied, cx);
+    }
+
+    /// Seed the subagent and job lists once the probe and any in-flight
+    /// request settle. Called after every channel and supervision record, so
+    /// the two lists chain behind the snapshot and permission seeds without
+    /// blocking the initial probe.
+    fn sync_supervision(&mut self, cx: &mut Context<Self>) {
+        let applied = self.desktop.supervision_seed();
+        self.apply_supervision(applied, cx);
+    }
+
+    /// A server that advertised `cancel_subagent` answered `unsupported_method`:
+    /// keep the legacy "ask the agent to run subagent_cancel" prompt exactly
+    /// once. Jobs have no legacy prompt, so their failure is reported instead.
+    fn legacy_cancel(
+        &mut self,
+        target: desktop::supervision::CancelTarget,
+        cx: &mut Context<Self>,
+    ) {
+        if !target.is_subagent() {
+            self.transcript.notice(
+                NoticeLevel::Warning,
+                desktop::supervision::Report::UnsupportedMethod.message(),
+            );
+            cx.notify();
+            return;
+        }
+        let id = target.id().to_string();
+        let agent = self
+            .desktop
+            .subagents()
+            .iter()
+            .find(|agent| agent.id == id)
+            .map(|agent| agent.agent.clone())
+            .or_else(|| {
+                self.activity.agents.as_ref().and_then(|activity| {
+                    activity
+                        .tasks
+                        .iter()
+                        .find(|task| task.summary.id == id)
+                        .map(|task| task.summary.agent.clone())
+                })
+            })
+            .unwrap_or_default();
+        let text = format!(
+            "Stop the subagent task {id} ({agent}) now with subagent_cancel, then tell me what it had done."
+        );
+        self.send_prompt(text, cx);
+    }
+
+    /// Keep the permission slice's view of the peer's capabilities in step with
+    /// the channel's probe, and seed the confirmed mode once those capabilities
+    /// are known.
+    fn sync_permission_capabilities(&mut self, cx: &mut Context<Self>) {
+        if let Some(capabilities) = self.desktop.capabilities().cloned() {
+            self.permission.set_capabilities(capabilities);
+        }
+        // The seed waits for any in-flight request, so the probe and the
+        // permission slice never issue two requests at once.
+        let seeded = self.permission.seed(self.desktop.session());
+        self.apply_permission(seeded, cx);
     }
 
     /// Point keyboard focus at the front dialog: its text field, or the
@@ -355,6 +561,105 @@ impl SessionView {
     }
 }
 
+/// Which slice owns one incoming Desktop record. A record is routed to the
+/// permission slice only when it is a permission response or the advertised
+/// permission event; supervision owns its responses and events; subscription
+/// owns its responses and `rate_limit`; design owns `get_design_canvas` and
+/// `design_canvas`; config owns `get_config`/`set_config` and
+/// `config_changed`; everything else belongs to the channel
+/// (probe, resync, and every benign foreign/late record). The shared session
+/// then accepts the record exactly once, in the slice that owns it.
+enum DesktopRoute {
+    Permission,
+    Supervision,
+    Subscription,
+    Design,
+    Config,
+    Channel,
+}
+
+/// Where a `notify` message's URL goes.
+#[derive(Debug, PartialEq, Eq)]
+enum NotifyTarget {
+    Canvas(CanvasNotice),
+    Web(String),
+}
+
+/// The legacy "Design canvas…" text drives the canvas only while the
+/// structured `design_canvas` events are not its source; once they are, the
+/// text would navigate a second time, so it is dropped (and never falls
+/// through to the generic loopback opener). Any other loopback URL still
+/// opens as a web app.
+fn notify_target(message: &str, design_events_ready: bool) -> Option<NotifyTarget> {
+    match crate::features::browser::canvas_notice(message) {
+        Some(_) if design_events_ready => None,
+        Some(canvas) => Some(NotifyTarget::Canvas(canvas)),
+        None => web::loopback_url(message).map(NotifyTarget::Web),
+    }
+}
+
+fn route_desktop_widget(
+    decoded: &Result<Option<DesktopRecord>, DesktopRpcError>,
+    pending: Option<DesktopMethod>,
+) -> DesktopRoute {
+    match decoded {
+        Ok(Some(DesktopRecord::Response(_))) => {
+            if matches!(
+                pending,
+                Some(DesktopMethod::GetPermissionMode) | Some(DesktopMethod::SetPermissionMode)
+            ) {
+                DesktopRoute::Permission
+            } else if matches!(
+                pending,
+                Some(DesktopMethod::ListSubagents)
+                    | Some(DesktopMethod::ListJobs)
+                    | Some(DesktopMethod::CancelSubagent)
+                    | Some(DesktopMethod::CancelJob)
+            ) {
+                DesktopRoute::Supervision
+            } else if matches!(
+                pending,
+                Some(DesktopMethod::GetSubscriptionUsage)
+                    | Some(DesktopMethod::RefreshSubscriptionUsage)
+            ) {
+                DesktopRoute::Subscription
+            } else if pending == Some(DesktopMethod::GetDesignCanvas) {
+                DesktopRoute::Design
+            } else if matches!(
+                pending,
+                Some(DesktopMethod::GetConfig) | Some(DesktopMethod::SetConfig)
+            ) {
+                DesktopRoute::Config
+            } else {
+                DesktopRoute::Channel
+            }
+        }
+        Ok(Some(DesktopRecord::Event(event)))
+            if event.event == desktop::permission::PERMISSION_MODE_CHANGED =>
+        {
+            DesktopRoute::Permission
+        }
+        Ok(Some(DesktopRecord::Event(event)))
+            if event.event == desktop::supervision::AGENTS_UPDATE
+                || event.event == desktop::supervision::JOBS_UPDATE =>
+        {
+            DesktopRoute::Supervision
+        }
+        Ok(Some(DesktopRecord::Event(event)))
+            if event.event == desktop::subscription::RATE_LIMIT =>
+        {
+            DesktopRoute::Subscription
+        }
+        Ok(Some(DesktopRecord::Event(event))) if event.event == desktop::design::DESIGN_CANVAS => {
+            DesktopRoute::Design
+        }
+        Ok(Some(DesktopRecord::Event(event))) if event.event == desktop::config::CONFIG_CHANGED => {
+            DesktopRoute::Config
+        }
+        _ => DesktopRoute::Channel,
+    }
+}
+
 impl TurnActivity {
     /// `tool_execution_start`: the phase the call implies, and the label of
     /// a background command for the job it will report.
@@ -435,6 +740,16 @@ fn design_canvas(details: &Value) -> Option<CanvasNotice> {
     }
 }
 
+/// A `gentle_design` result drives the canvas only while the structured
+/// `design_canvas` events are not its source; once they are, it would
+/// navigate a second time.
+fn tool_design_canvas(details: &Value, design_events_ready: bool) -> Option<CanvasNotice> {
+    if design_events_ready {
+        return None;
+    }
+    design_canvas(details)
+}
+
 /// An extension `notify` type as a notice level; unknown types are info.
 fn notice_level(notify_type: Option<&str>) -> NoticeLevel {
     match notify_type {
@@ -455,10 +770,13 @@ fn git_refresh_wait(since_last: Option<Duration>) -> Duration {
 mod tests {
     use std::time::Duration;
 
-    use serde_json::json;
+    use pi_rpc::desktop_rpc::{DesktopMethod, SCHEMA, WIDGET_KEY, decode_widget};
+    use pi_rpc::{UiMethod, UiRequest};
+    use serde_json::{Value, json};
 
     use super::{
-        GIT_REFRESH_INTERVAL, design_canvas, git_refresh_wait, notice_level, queued_count,
+        DesktopRoute, GIT_REFRESH_INTERVAL, NotifyTarget, design_canvas, git_refresh_wait,
+        notice_level, notify_target, queued_count, route_desktop_widget, tool_design_canvas,
         tool_output,
     };
     use crate::features::browser::CanvasNotice;
@@ -521,6 +839,60 @@ mod tests {
     }
 
     #[test]
+    fn design_results_yield_to_design_events() {
+        let opened = json!({"url": "http://127.0.0.1:4100/tok/d/landing/"});
+        let stopped = json!({"stopped": true});
+
+        // An old Shell, or a channel not ready yet: the result drives the
+        // canvas. Predicates, so a failure never prints the canvas URL.
+        assert!(matches!(
+            tool_design_canvas(&opened, false),
+            Some(CanvasNotice::Open { url, refreshed: false })
+                if url == "http://127.0.0.1:4100/tok/d/landing/"
+        ));
+        assert!(matches!(
+            tool_design_canvas(&stopped, false),
+            Some(CanvasNotice::Stopped)
+        ));
+
+        // Design events are the source: the result would navigate twice.
+        assert!(tool_design_canvas(&opened, true).is_none());
+        assert!(tool_design_canvas(&stopped, true).is_none());
+    }
+
+    #[test]
+    fn legacy_canvas_notices_yield_to_design_events() {
+        let url = "http://127.0.0.1:4100/tok/d/landing/";
+        let opened = format!("Design canvas: {url}");
+
+        // An old Shell, or a channel not ready yet: the legacy text navigates.
+        // Predicates, so a failure never prints the canvas URL.
+        assert!(matches!(
+            notify_target(&opened, false),
+            Some(NotifyTarget::Canvas(CanvasNotice::Open { url: shown, refreshed: false }))
+                if shown == url
+        ));
+        assert!(matches!(
+            notify_target("Design canvas stopped.", false),
+            Some(NotifyTarget::Canvas(CanvasNotice::Stopped))
+        ));
+
+        // Design events are the source: the text neither navigates the canvas
+        // nor falls through to the generic loopback opener.
+        assert!(notify_target(&opened, true).is_none());
+        assert!(notify_target("Design canvas stopped.", true).is_none());
+
+        // Other loopback URLs keep opening as web apps either way.
+        for ready in [false, true] {
+            assert_eq!(
+                notify_target("Dev server on http://localhost:5173/", ready),
+                Some(NotifyTarget::Web("http://localhost:5173/".into()))
+            );
+            assert_eq!(notify_target("All done", ready), None);
+        }
+    }
+
+    #[test]
     fn notify_types_map_to_levels() {
         assert_eq!(notice_level(Some("error")), NoticeLevel::Error);
         assert_eq!(notice_level(Some("warning")), NoticeLevel::Warning);
@@ -565,5 +937,205 @@ mod tests {
         activity.tool_started(&json!({"toolName": "unknown_tool", "args": {}}));
         assert_eq!(activity.phase, Some("exploring"));
         assert!(activity.job_commands.is_empty());
+    }
+
+    /// A Desktop widget as Pi delivers a record.
+    fn widget(lines: Option<Vec<String>>) -> UiRequest {
+        UiRequest {
+            id: "ui-1".into(),
+            timeout: None,
+            method: UiMethod::SetWidget {
+                key: WIDGET_KEY.into(),
+                lines,
+                placement: None,
+            },
+        }
+    }
+
+    fn record(value: Value) -> Vec<String> {
+        vec![value.to_string()]
+    }
+
+    #[test]
+    fn desktop_records_route_to_the_slice_that_owns_them() {
+        // Responses go to whoever's request is pending.
+        let response = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": "desktop-1",
+            "ok": true,
+            "data": {"mode": "yolo", "default_mode": "yolo"},
+        }))));
+        let decoded = decode_widget(&response);
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::SetPermissionMode)),
+            DesktopRoute::Permission
+        ));
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::Capabilities)),
+            DesktopRoute::Channel
+        ));
+
+        // The advertised permission event goes to the permission slice; every
+        // other event stays on the channel for sequencing and resync.
+        let permission_event = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "event",
+            "seq": 1,
+            "event": "permission_mode_changed",
+            "data": {
+                "mode": "yolo",
+                "previous_mode": "normal",
+                "default_mode": "yolo",
+                "persisted": true,
+                "source": "desktop",
+            },
+        }))));
+        let decoded = decode_widget(&permission_event);
+        assert!(matches!(
+            route_desktop_widget(&decoded, None),
+            DesktopRoute::Permission
+        ));
+
+        let state_event = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "event",
+            "seq": 1,
+            "event": "state_changed",
+            "data": {},
+        }))));
+        let decoded = decode_widget(&state_event);
+        assert!(matches!(
+            route_desktop_widget(&decoded, None),
+            DesktopRoute::Channel
+        ));
+
+        // Subscription responses and the advertised `rate_limit` event go to
+        // the subscription slice.
+        let usage_response = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": "desktop-1",
+            "ok": true,
+            "data": {"providers": []},
+        }))));
+        let decoded = decode_widget(&usage_response);
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::GetSubscriptionUsage)),
+            DesktopRoute::Subscription
+        ));
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::RefreshSubscriptionUsage)),
+            DesktopRoute::Subscription
+        ));
+
+        let rate_limit_event = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "event",
+            "seq": 1,
+            "event": "rate_limit",
+            "data": {"source": "response", "snapshots": []},
+        }))));
+        let decoded = decode_widget(&rate_limit_event);
+        assert!(matches!(
+            route_desktop_widget(&decoded, None),
+            DesktopRoute::Subscription
+        ));
+
+        // The design canvas response and its advertised event go to the
+        // design slice.
+        let canvas_response = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": "desktop-1",
+            "ok": true,
+            "data": {"running": false, "slug": null, "connectedClients": 0, "designs": []},
+        }))));
+        let decoded = decode_widget(&canvas_response);
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::GetDesignCanvas)),
+            DesktopRoute::Design
+        ));
+        let canvas_event = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "event",
+            "seq": 1,
+            "event": "design_canvas",
+            "data": {"transition": "stop", "running": false, "slug": null, "connectedClients": 0, "designs": []},
+        }))));
+        let decoded = decode_widget(&canvas_event);
+        assert!(matches!(
+            route_desktop_widget(&decoded, None),
+            DesktopRoute::Design
+        ));
+
+        // A cleared widget and a broken record are not this protocol's answer:
+        // the channel owns them, and they stay benign.
+        let cleared = decode_widget(&widget(None));
+        assert!(matches!(
+            route_desktop_widget(&cleared, None),
+            DesktopRoute::Channel
+        ));
+        let broken = decode_widget(&widget(Some(vec!["not json".into()])));
+        assert!(matches!(
+            route_desktop_widget(&broken, None),
+            DesktopRoute::Channel
+        ));
+    }
+
+    #[test]
+    fn config_records_route_to_the_config_slice_only() {
+        // A config answer goes to the config slice only while its request is
+        // the pending one; the same record answers nothing else.
+        let answer = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": "desktop-3",
+            "ok": false,
+            "error": {"code": "revision_conflict", "message": "changed"},
+        }))));
+        let decoded = decode_widget(&answer);
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::GetConfig)),
+            DesktopRoute::Config
+        ));
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::SetConfig)),
+            DesktopRoute::Config
+        ));
+        assert!(matches!(
+            route_desktop_widget(&decoded, Some(DesktopMethod::GetSnapshot)),
+            DesktopRoute::Channel
+        ));
+        assert!(matches!(
+            route_desktop_widget(&decoded, None),
+            DesktopRoute::Channel
+        ));
+
+        // Exactly `config_changed`; a look-alike name stays on the channel.
+        let changed = |event: &str| {
+            decode_widget(&widget(Some(record(json!({
+                "schema": SCHEMA,
+                "kind": "event",
+                "seq": 1,
+                "event": event,
+                "data": {
+                    "store": "profiles",
+                    "scope": "global",
+                    "writeTarget": "global",
+                    "revision": "sha256:1",
+                    "writeRevision": "sha256:2",
+                    "source": "desktop",
+                },
+            })))))
+        };
+        assert!(matches!(
+            route_desktop_widget(&changed("config_changed"), None),
+            DesktopRoute::Config
+        ));
+        assert!(matches!(
+            route_desktop_widget(&changed("config_changed_v2"), None),
+            DesktopRoute::Channel
+        ));
     }
 }

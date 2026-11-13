@@ -3,17 +3,59 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::*;
 use pi_rpc::PiProcess;
+use pi_rpc::desktop_rpc::{ConfigStore, ConfigWrite, DesktopMethod};
 use serde_json::{Value, json};
 
+use super::state::desktop::config::Applied as ConfigApplied;
+use super::state::desktop::design::Applied as DesignApplied;
+use super::state::desktop::permission::Applied as PermissionApplied;
+use super::state::desktop::subscription::Applied as SubscriptionApplied;
+use super::state::desktop::supervision::Applied as SupervisionApplied;
+use super::state::desktop::{self, Applied as DesktopApplied, Send as DesktopSend};
 use super::state::{BackendStatus, ModelInfo};
-use super::{SessionView, attachments, builtins};
+use super::{SessionEvent, SessionView, attachments, builtins};
+use crate::features::profiles::{
+    ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport, ConfigTicket,
+};
 use gentle_core::transcript::NoticeLevel;
+
+/// How long a Desktop request may stay unanswered before the tab drops it.
+/// The extension answers from the same session, so this only fires when
+/// something is genuinely wrong.
+const DESKTOP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Whether Pi's `get_commands` answer lists the Gentle Desktop extension. A
+/// failed request lists nothing, so its prompt is never sent.
+fn discovers_desktop(result: &Result<Value>) -> bool {
+    result
+        .as_ref()
+        .is_ok_and(|data| desktop::registers_desktop(&parse_commands(data)))
+}
+
+/// Pi's `get_commands` data as `(name, description)`, skipping anything that is
+/// not a named command.
+fn parse_commands(data: &Value) -> Vec<(String, String)> {
+    data["commands"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|command| {
+            Some((
+                command["name"].as_str()?.to_string(),
+                command["description"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            ))
+        })
+        .collect()
+}
 
 impl SessionView {
     pub(super) fn process(&self) -> Option<Arc<PiProcess>> {
@@ -61,6 +103,362 @@ impl SessionView {
         }
     }
 
+    /// Act on a Desktop decision: say what failed through the tab's report
+    /// path, then send whatever the channel asked for.
+    pub(super) fn apply_desktop(&mut self, applied: DesktopApplied, cx: &mut Context<Self>) {
+        if let Some(report) = applied.report {
+            self.transcript
+                .notice(NoticeLevel::Warning, report.message());
+            cx.notify();
+        }
+        self.send_desktop(applied.sends, cx);
+    }
+
+    /// Act on a supervision decision: say what failed through the tab's report
+    /// path, then send whatever the subagent/job channel asked for.
+    pub(super) fn apply_supervision(
+        &mut self,
+        applied: SupervisionApplied,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(report) = applied.report {
+            self.transcript
+                .notice(NoticeLevel::Warning, report.message());
+            cx.notify();
+        }
+        self.send_desktop(applied.sends, cx);
+    }
+
+    /// Act on a subscription decision: say what failed through the tab's report
+    /// path (legacy signals are the Usage screen's concern, not a session
+    /// error), then send whatever the usage slice asked for.
+    pub(super) fn apply_subscription(
+        &mut self,
+        applied: SubscriptionApplied,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(report) = &applied.report
+            && !report.is_legacy()
+        {
+            self.transcript
+                .notice(NoticeLevel::Warning, report.message());
+            cx.notify();
+        }
+        self.send_desktop(applied.sends, cx);
+    }
+
+    /// Act on a design decision: say what failed (old Shells without the
+    /// method stay silent, their legacy canvas path still works), send what
+    /// the slice asked for, and hand the canvas notice to the browser flow.
+    /// The report never carries the canvas URL; only the notice does.
+    pub(super) fn apply_design(&mut self, applied: DesignApplied, cx: &mut Context<Self>) {
+        if let Some(report) = &applied.report
+            && !report.is_legacy()
+        {
+            self.transcript
+                .notice(NoticeLevel::Warning, report.message());
+            cx.notify();
+        }
+        self.send_desktop(applied.sends, cx);
+        // A gap seen while the design request was in flight is due now that it
+        // settled or rolled back: one snapshot, and the canvas re-seeds behind.
+        let resync = self.desktop.flush_resync();
+        self.send_desktop(resync, cx);
+        if let Some(canvas) = applied.notice {
+            cx.emit(SessionEvent::DesignCanvas(canvas));
+        }
+    }
+
+    /// Act on a config decision: say what failed (old Shells without the
+    /// methods stay silent, the Profiles screen keeps its direct-file path),
+    /// send what the slice asked for, and wake the screen, which takes its
+    /// outcomes and changes from the session.
+    pub(super) fn apply_config(&mut self, applied: ConfigApplied, cx: &mut Context<Self>) {
+        if let Some(report) = &applied.report
+            && !report.is_legacy()
+        {
+            self.transcript
+                .notice(NoticeLevel::Warning, report.message());
+        }
+        self.send_desktop(applied.sends, cx);
+        // A gap seen while the config request was in flight is due now that it
+        // settled or rolled back.
+        let resync = self.desktop.flush_resync();
+        self.send_desktop(resync, cx);
+        cx.notify();
+    }
+
+    /// Send the next queued config request once the channel is free.
+    pub(super) fn sync_config(&mut self, cx: &mut Context<Self>) {
+        let applied = self.desktop.config_pump();
+        if !applied.sends.is_empty() || applied.report.is_some() {
+            self.apply_config(applied, cx);
+        }
+    }
+
+    /// Whether the Profiles screen edits this tab's config over Desktop RPC,
+    /// waits for the probe, or keeps its direct-file path. No backend to ask
+    /// (it failed or exited) is the direct-file path too: there is no writer
+    /// to race.
+    pub(crate) fn config_support(&self) -> ConfigSupport {
+        match self.backend.status {
+            BackendStatus::Failed(_) | BackendStatus::Exited(_) => ConfigSupport::Legacy,
+            BackendStatus::Starting | BackendStatus::Ready(_) => self.desktop.config_support(),
+        }
+    }
+
+    /// Read one config store over the channel; the answer arrives as an
+    /// outcome for the returned ticket.
+    pub(crate) fn config_get(
+        &mut self,
+        store: ConfigStore,
+        cx: &mut Context<Self>,
+    ) -> Result<ConfigTicket, ConfigFailure> {
+        let ticket = self.desktop.config_get(store)?;
+        self.sync_config(cx);
+        Ok(ticket)
+    }
+
+    /// Replace one config store (or pin layer) guarded by the `writeRevision`
+    /// last read; the answer arrives as an outcome for the returned ticket.
+    pub(crate) fn config_set(
+        &mut self,
+        write: ConfigWrite,
+        expected_revision: String,
+        cx: &mut Context<Self>,
+    ) -> Result<ConfigTicket, ConfigFailure> {
+        let ticket = self.desktop.config_set(write, expected_revision)?;
+        self.sync_config(cx);
+        Ok(ticket)
+    }
+
+    /// The answers to config tickets since the last call (the Profiles
+    /// screen's to take).
+    pub(crate) fn take_config_outcomes(&mut self) -> Vec<(ConfigTicket, ConfigOutcome)> {
+        self.desktop.take_config_outcomes()
+    }
+
+    /// The stores that changed (or may have) since the last call.
+    pub(crate) fn take_config_changes(&mut self) -> Vec<ConfigChange> {
+        self.desktop.take_config_changes()
+    }
+
+    /// The Usage screen's snapshot of this session's subscription usage. Pure
+    /// read: the screen decides how to render, never this session.
+    pub(crate) fn subscription_snapshot(&self) -> super::state::desktop::subscription::Snapshot {
+        self.desktop.subscription_snapshot()
+    }
+
+    /// Ask the server for the whole-account subscription usage once (the Usage
+    /// screen opened). Idempotent: a later call is a no-op.
+    pub(crate) fn subscription_seed(&mut self, cx: &mut Context<Self>) {
+        let applied = self.desktop.subscription_seed();
+        self.send_desktop(applied.sends, cx);
+    }
+
+    /// Refresh the whole-account subscription usage (the Usage screen's
+    /// refresh button).
+    pub(crate) fn subscription_refresh(&mut self, cx: &mut Context<Self>) {
+        let applied = self.desktop.subscription_refresh();
+        self.send_desktop(applied.sends, cx);
+    }
+
+    /// Reset the Gentle Desktop channel when the conversation changes on the
+    /// same backend (new/open session). It forgets the old session's pending
+    /// request and event baseline (without rewinding request ids) and returns
+    /// the channel to Idle, so the `refresh_state` that follows re-probes
+    /// capabilities and the supervision lists re-seed exactly once behind it.
+    /// The permission slice keeps its confirmed mode; its capabilities are
+    /// refreshed by the same re-probe. The subscription and design slices are
+    /// reset with the channel; the design canvas re-seeds once behind the new
+    /// probe.
+    fn reset_desktop_channel(&mut self) {
+        self.desktop.reset();
+    }
+
+    /// Cancel one running background job over `cancel_job`. There is no job
+    /// start method and no restart: only the running job the user picked is
+    /// affected, and the server's answer is the truth.
+    pub(super) fn cancel_running_job(&mut self, id: String, cx: &mut Context<Self>) {
+        let applied = self.desktop.cancel_job(id);
+        self.apply_supervision(applied, cx);
+    }
+
+    /// Act on a permission decision: say what failed or warn about a default
+    /// that could not be saved, then send whatever the permission slice asked
+    /// for and reflect the server-confirmed mode into the picker.
+    pub(super) fn apply_permission(&mut self, applied: PermissionApplied, cx: &mut Context<Self>) {
+        if let Some(report) = applied.report {
+            self.transcript
+                .notice(NoticeLevel::Warning, report.message());
+            cx.notify();
+        }
+        self.send_desktop(applied.sends, cx);
+        // A gap seen while this request was in flight is due now that it
+        // settled or rolled back: ask the channel for a fresh snapshot once.
+        let resync = self.desktop.flush_resync();
+        self.send_desktop(resync, cx);
+        self.sync_permission_ui(cx);
+    }
+
+    /// The server's confirmed permission state is truth: move the picker's
+    /// live and default modes only from it, never optimistically from the
+    /// request the user just picked.
+    fn sync_permission_ui(&mut self, cx: &mut Context<Self>) {
+        let confirmed = self.permission.confirmed();
+        let mut changed = false;
+        if let Some(mode) = confirmed.mode.map(super::from_desktop_mode)
+            && self.mode != Some(mode)
+        {
+            self.mode = Some(mode);
+            changed = true;
+        }
+        if let Some(default_mode) = confirmed.default_mode.map(super::from_desktop_mode)
+            && self.default_mode != Some(default_mode)
+        {
+            self.default_mode = Some(default_mode);
+            changed = true;
+        }
+        if changed {
+            cx.notify();
+        }
+    }
+
+    /// Hand Gentle Desktop requests to the backend. Each one is a `prompt` the
+    /// transport answers with a disposition, and the domain answer arrives
+    /// later as the Desktop widget; a guarded timer drops one that never comes.
+    pub(super) fn send_desktop(&mut self, sends: Vec<DesktopSend>, cx: &mut Context<Self>) {
+        for send in sends {
+            self.send_one_desktop(send, cx);
+        }
+    }
+
+    fn send_one_desktop(&mut self, send: DesktopSend, cx: &mut Context<Self>) {
+        let generation = send.generation;
+        let method = send.request.method();
+        if self.process().is_none() {
+            // No backend to answer: drop it like a timeout, silently, in the
+            // slice that owns the request.
+            self.expire_desktop(generation, method, cx);
+            return;
+        }
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(DESKTOP_TIMEOUT).await;
+            let _ = this.update(cx, |this, cx| {
+                // Only its own request: a newer one has another generation.
+                this.expire_desktop(generation, method, cx);
+            });
+        })
+        .detach();
+        self.request(
+            send.request.prompt_command(),
+            cx,
+            move |this, result, cx| {
+                // `handled` only means the prompt was accepted; nothing but that
+                // keeps the request waiting for its widget record.
+                let handled = result.is_ok_and(|data| data["disposition"] == "handled");
+                this.outer_desktop(generation, method, handled, cx);
+            },
+        );
+    }
+
+    /// A pending timeout fired: hand it to the slice that issued the request,
+    /// so a probe timer never abandons a permission request and vice versa.
+    fn expire_desktop(&mut self, generation: u64, method: DesktopMethod, cx: &mut Context<Self>) {
+        match method {
+            DesktopMethod::Capabilities | DesktopMethod::GetSnapshot => {
+                let sends = self.desktop.expire(generation);
+                self.send_desktop(sends, cx);
+            }
+            DesktopMethod::GetPermissionMode | DesktopMethod::SetPermissionMode => {
+                let applied = self.permission.expire(self.desktop.session(), generation);
+                self.apply_permission(applied, cx);
+            }
+            DesktopMethod::ListSubagents
+            | DesktopMethod::ListJobs
+            | DesktopMethod::CancelSubagent
+            | DesktopMethod::CancelJob => {
+                let applied = self.desktop.supervision_expire(generation);
+                self.apply_supervision(applied, cx);
+            }
+            DesktopMethod::GetSubscriptionUsage | DesktopMethod::RefreshSubscriptionUsage => {
+                let applied = self.desktop.subscription_expire(generation);
+                self.apply_subscription(applied, cx);
+            }
+            DesktopMethod::GetDesignCanvas => {
+                let applied = self.desktop.design_expire(generation);
+                self.apply_design(applied, cx);
+            }
+            DesktopMethod::GetConfig | DesktopMethod::SetConfig => {
+                let applied = self.desktop.config_expire(generation);
+                self.apply_config(applied, cx);
+            }
+        }
+        // Whichever request was dropped, the shared slot may be free for the
+        // next queued config request.
+        self.sync_config(cx);
+    }
+
+    /// Pi answered the outer prompt: hand the disposition to the slice that
+    /// issued the request.
+    fn outer_desktop(
+        &mut self,
+        generation: u64,
+        method: DesktopMethod,
+        handled: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match method {
+            DesktopMethod::Capabilities | DesktopMethod::GetSnapshot => {
+                let applied = self.desktop.outer(generation, handled);
+                self.apply_desktop(applied, cx);
+            }
+            DesktopMethod::GetPermissionMode | DesktopMethod::SetPermissionMode => {
+                let applied = self
+                    .permission
+                    .outer(self.desktop.session(), generation, handled);
+                self.apply_permission(applied, cx);
+            }
+            DesktopMethod::ListSubagents
+            | DesktopMethod::ListJobs
+            | DesktopMethod::CancelSubagent
+            | DesktopMethod::CancelJob => {
+                let applied = self.desktop.supervision_outer(generation, handled);
+                self.apply_supervision(applied, cx);
+            }
+            DesktopMethod::GetSubscriptionUsage | DesktopMethod::RefreshSubscriptionUsage => {
+                let applied = self.desktop.subscription_outer(generation, handled);
+                self.apply_subscription(applied, cx);
+            }
+            DesktopMethod::GetDesignCanvas => {
+                let applied = self.desktop.design_outer(generation, handled);
+                self.apply_design(applied, cx);
+            }
+            DesktopMethod::GetConfig | DesktopMethod::SetConfig => {
+                let applied = self.desktop.config_outer(generation, handled);
+                self.apply_config(applied, cx);
+            }
+        }
+        self.sync_config(cx);
+    }
+
+    /// Pi's command list: what the `/` menu offers, and the discovery that
+    /// decides whether Gentle Desktop's extension is there at all. The prompt
+    /// carrying a Desktop record must never be sent on a guess, because a Shell
+    /// without the command would run that JSON as a conversation prompt.
+    fn refresh_commands(&mut self, cx: &mut Context<Self>) {
+        self.request(json!({"type": "get_commands"}), cx, |this, result, cx| {
+            // Read before the result is consumed: a failed listing leaves the
+            // channel closed, and `report` puts that error in the conversation.
+            let registered = discovers_desktop(&result);
+            if let Some(data) = this.report(result) {
+                this.commands = parse_commands(&data);
+                let applied = this.desktop.ready(registered);
+                this.apply_desktop(applied, cx);
+            }
+        });
+    }
+
     pub(super) fn refresh_state(&mut self, cx: &mut Context<Self>) {
         self.request(json!({"type": "get_state"}), cx, |this, result, _| {
             if let Some(state) = this.report(result) {
@@ -88,21 +486,7 @@ impl SessionView {
             },
         );
         self.refresh_thinking_levels(cx);
-        self.request(json!({"type": "get_commands"}), cx, |this, result, _| {
-            if let Some(data) = this.report(result) {
-                this.commands = data["commands"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|c| {
-                        Some((
-                            c["name"].as_str()?.to_string(),
-                            c["description"].as_str().unwrap_or_default().to_string(),
-                        ))
-                    })
-                    .collect();
-            }
-        });
+        self.refresh_commands(cx);
         self.request(json!({"type": "get_messages"}), cx, |this, result, _| {
             if let Some(data) = this.report(result) {
                 let messages = data["messages"].as_array().cloned().unwrap_or_default();
@@ -210,6 +594,7 @@ impl SessionView {
                 && data["cancelled"] != true
             {
                 this.reset_conversation();
+                this.reset_desktop_channel();
                 this.refresh_state(cx);
                 this.refresh_git(cx);
             }
@@ -229,6 +614,7 @@ impl SessionView {
             if switched {
                 this.reset_conversation();
                 this.session_file = Some(path);
+                this.reset_desktop_channel();
                 this.refresh_state(cx);
             }
         });
@@ -486,7 +872,40 @@ fn export_file_stem(title: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::export_file_stem;
+    use anyhow::anyhow;
+    use serde_json::{Value, json};
+
+    use super::{discovers_desktop, export_file_stem, parse_commands};
+
+    #[test]
+    fn only_a_listed_desktop_command_opens_the_channel() {
+        let listed = Ok(json!({"commands": [
+            {"name": "gentle:mode", "description": "Permissions"},
+            {"name": "gentle:desktop", "description": "Desktop records"},
+        ]}));
+        assert!(discovers_desktop(&listed));
+
+        // Another Gentle Shell command is not the extension.
+        let other = Ok(json!({"commands": [{"name": "gentle:mode"}]}));
+        assert!(!discovers_desktop(&other));
+
+        // A failed listing, or data without commands, opens nothing: its prompt
+        // would reach Pi as raw JSON.
+        let failed: anyhow::Result<Value> = Err(anyhow!("get_commands failed"));
+        assert!(!discovers_desktop(&failed));
+        assert!(!discovers_desktop(&Ok(json!({"commands": "nope"}))));
+    }
+
+    #[test]
+    fn command_lists_keep_their_names_and_descriptions() {
+        let commands = parse_commands(&json!({"commands": [
+            {"name": "a", "description": "d"},
+            {"description": "no name"},
+            "junk",
+        ]}));
+        assert_eq!(commands, vec![("a".to_string(), "d".to_string())]);
+        assert!(parse_commands(&json!({})).is_empty());
+    }
 
     #[test]
     fn export_names_are_safe_file_names() {

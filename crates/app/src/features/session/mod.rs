@@ -77,6 +77,11 @@ struct Chrome {
 pub struct SessionView {
     cwd: PathBuf,
     backend: state::Backend,
+    /// Gentle Desktop's RPC channel on this backend (see [`state::desktop`]).
+    desktop: state::desktop::Desktop,
+    /// Gentle Desktop's permission-mode state on this backend (see
+    /// [`state::desktop::permission`]); it borrows `desktop`'s session.
+    permission: state::desktop::permission::Permission,
     transcript: Transcript,
     /// Rendered Markdown per (item, block), with the byte length already pushed.
     markdown: HashMap<(usize, usize), (Entity<TextViewState>, usize)>,
@@ -231,6 +236,8 @@ impl SessionView {
         let mut this = Self {
             cwd,
             backend: state::Backend::new(prompt),
+            desktop: state::desktop::Desktop::default(),
+            permission: state::desktop::permission::Permission::default(),
             transcript: Transcript::default(),
             markdown: HashMap::new(),
             expanded: HashSet::new(),
@@ -439,6 +446,60 @@ impl SessionView {
             self.stop(cx);
         } else {
             cx.propagate();
+        }
+    }
+}
+
+/// The wire permission mode for the picker's mode.
+pub(in crate::features::session) fn to_desktop_mode(
+    mode: gentle_core::gentle_state::PermissionMode,
+) -> pi_rpc::desktop_rpc::PermissionMode {
+    match mode {
+        gentle_core::gentle_state::PermissionMode::Normal => {
+            pi_rpc::desktop_rpc::PermissionMode::Normal
+        }
+        gentle_core::gentle_state::PermissionMode::Auto => {
+            pi_rpc::desktop_rpc::PermissionMode::Auto
+        }
+        gentle_core::gentle_state::PermissionMode::Yolo => {
+            pi_rpc::desktop_rpc::PermissionMode::Yolo
+        }
+        gentle_core::gentle_state::PermissionMode::SuperYolo => {
+            pi_rpc::desktop_rpc::PermissionMode::SuperYolo
+        }
+    }
+}
+
+/// The picker's mode for a server-reported wire mode.
+pub(in crate::features::session) fn from_desktop_mode(
+    mode: pi_rpc::desktop_rpc::PermissionMode,
+) -> gentle_core::gentle_state::PermissionMode {
+    match mode {
+        pi_rpc::desktop_rpc::PermissionMode::Normal => {
+            gentle_core::gentle_state::PermissionMode::Normal
+        }
+        pi_rpc::desktop_rpc::PermissionMode::Auto => {
+            gentle_core::gentle_state::PermissionMode::Auto
+        }
+        pi_rpc::desktop_rpc::PermissionMode::Yolo => {
+            gentle_core::gentle_state::PermissionMode::Yolo
+        }
+        pi_rpc::desktop_rpc::PermissionMode::SuperYolo => {
+            gentle_core::gentle_state::PermissionMode::SuperYolo
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gentle_core::gentle_state::PermissionMode;
+
+    use super::{from_desktop_mode, to_desktop_mode};
+
+    #[test]
+    fn desktop_permission_modes_round_trip() {
+        for mode in PermissionMode::ALL {
+            assert_eq!(from_desktop_mode(to_desktop_mode(mode)), mode);
         }
     }
 }

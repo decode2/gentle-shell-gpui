@@ -1,149 +1,331 @@
-//! A connection to gentle-stream's background player: its Unix socket, the
-//! shared-key handshake and JSON requests (the wire format is
-//! `gentle_core::music`). Blocking; callers run it off the main thread.
+//! Runs gentle-stream's `ctl --json` CLI to control the background player.
+//! Blocking; callers run it off the main thread. Every request is one short
+//! process (no socket, no key), started with `pi_rpc::command` and the app's
+//! combined PATH.
 
+use std::ffi::OsString;
+use std::io::Read;
 use std::path::Path;
+use std::process::Stdio;
+use std::time::{Duration, Instant};
 
-#[cfg(not(unix))]
-use gentle_core::music::MusicState;
+use gentle_core::music::{self, MusicState};
 
 /// Why a request didn't get an answer.
-#[derive(Debug)]
-// Without a player (Windows) nothing can fail talking to one.
-#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// Nothing is playing: no player, or it stopped while we talked.
+    /// The player answered `nothing_playing`: this action needs one.
     NoPlayer,
     Failed(String),
 }
 
-#[cfg(unix)]
-pub use unix::Connection;
-
-#[cfg(unix)]
-mod unix {
-    use std::io::{ErrorKind, Read as _, Write as _};
-    use std::os::unix::net::UnixStream;
-    use std::path::Path;
-    use std::time::Duration;
-
-    use gentle_core::music::{self as wire, MusicState};
-
-    use super::Error;
-
-    /// A request answers in microseconds; a player that takes this long is stuck.
-    const TIMEOUT: Duration = Duration::from_secs(3);
-
-    fn io(error: std::io::Error) -> Error {
-        match error.kind() {
-            ErrorKind::NotFound
-            | ErrorKind::ConnectionRefused
-            | ErrorKind::UnexpectedEof
-            | ErrorKind::BrokenPipe
-            | ErrorKind::ConnectionReset => Error::NoPlayer,
-            _ => Error::Failed(format!("the player didn't answer: {error}")),
-        }
+/// The ctl arguments for one action: `--gentle-shell <shell> ctl <action>
+/// [value] --json`. The launcher precedes `ctl` (only `mood` passes one), and
+/// `value` is one argument (`volume`'s percent, or `mood`'s text, spaces
+/// included).
+pub fn args(action: &str, value: Option<&str>, shell: Option<&Path>) -> Vec<OsString> {
+    let mut out: Vec<OsString> = Vec::new();
+    if let Some(shell) = shell {
+        out.push("--gentle-shell".into());
+        out.push(shell.as_os_str().to_os_string());
     }
+    out.push("ctl".into());
+    out.push(action.into());
+    if let Some(value) = value {
+        out.push(value.into());
+    }
+    out.push("--json".into());
+    out
+}
 
-    pub struct Connection(UnixStream);
+/// One ctl request against `program`, bounded by `timeout`.
+pub fn run(
+    program: &Path,
+    action: &str,
+    value: Option<&str>,
+    shell: Option<&Path>,
+    timeout: Duration,
+) -> Result<Option<MusicState>, Error> {
+    run_with(program, action, value, shell, timeout, spawn)
+}
 
-    impl Connection {
-        /// Connect to the player whose socket and key are in `dir`, proving
-        /// both ends hold the key.
-        pub fn open(dir: &Path) -> Result<Self, Error> {
-            let key = std::fs::read(dir.join("authkey")).map_err(io)?;
-            let stream = Self::connect(&dir.join("player.sock"))?;
-            stream.set_read_timeout(Some(TIMEOUT)).map_err(io)?;
-            stream.set_write_timeout(Some(TIMEOUT)).map_err(io)?;
-            let mut conn = Self(stream);
-            // The player challenges first (Python's Listener), then we do.
-            let challenge = conn.recv(wire::MAX_HANDSHAKE)?;
-            conn.send(&wire::answer(&key, &challenge).map_err(Error::Failed)?)?;
-            if conn.recv(wire::MAX_HANDSHAKE)? != wire::WELCOME {
-                return Err(Error::Failed("the player refused this app's key".into()));
+/// What the process runner reports back.
+#[derive(Clone, Debug)]
+struct Output {
+    success: bool,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run `program args…` with the app's combined PATH, reading both pipes to
+/// the end and killing the child past `timeout`.
+fn spawn(program: &Path, args: &[OsString], timeout: Duration) -> Result<Output, String> {
+    let mut child = pi_rpc::command(program)
+        .args(args)
+        .env("PATH", pi_rpc::child_path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("gentle-stream didn't start: {e}"))?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let deadline = Instant::now() + timeout;
+    let success = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.success(),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
             }
-            let mut nonce = [0u8; 40];
-            std::fs::File::open("/dev/urandom")
-                .and_then(|mut random| random.read_exact(&mut nonce))
-                .map_err(io)?;
-            let (send, message) = wire::challenge(&nonce);
-            conn.send(&send)?;
-            let reply = conn.recv(wire::MAX_HANDSHAKE)?;
-            if !wire::verify(&key, &message, &reply) {
-                let _ = conn.send(wire::FAILURE);
-                return Err(Error::Failed(
-                    "something other than gentle-stream answered on its socket".into(),
-                ));
-            }
-            conn.send(wire::WELCOME)?;
-            Ok(conn)
-        }
-
-        /// The player authenticates one client at a time with a listen queue of
-        /// one, so a client arriving during another's handshake (the helper,
-        /// `/gentle:music` in a terminal) is refused for a moment: try again
-        /// briefly before calling it gone.
-        fn connect(socket: &Path) -> Result<UnixStream, Error> {
-            let mut tries = 0;
-            loop {
-                match UnixStream::connect(socket) {
-                    Err(error) if error.kind() == ErrorKind::ConnectionRefused && tries < 4 => {
-                        tries += 1;
-                        std::thread::sleep(Duration::from_millis(60));
-                    }
-                    result => return result.map_err(io),
-                }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("gentle-stream didn't answer in time.".into());
             }
         }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    Ok(Output {
+        success,
+        stdout,
+        stderr,
+    })
+}
 
-        fn send(&mut self, payload: &[u8]) -> Result<(), Error> {
-            self.0.write_all(&wire::frame(payload)).map_err(io)
-        }
+/// The process runner, injectable so tests can drive [`run_with`] without a
+/// real player, socket or network.
+type Runner = fn(&Path, &[OsString], Duration) -> Result<Output, String>;
 
-        fn recv(&mut self, max: usize) -> Result<Vec<u8>, Error> {
-            let mut header = [0u8; 4];
-            self.0.read_exact(&mut header).map_err(io)?;
-            let len = wire::frame_len(header)
-                .filter(|len| *len <= max)
-                .ok_or_else(|| Error::Failed("the player sent an oversized message".into()))?;
-            let mut body = vec![0u8; len];
-            self.0.read_exact(&mut body).map_err(io)?;
-            Ok(body)
-        }
+fn run_with(
+    program: &Path,
+    action: &str,
+    value: Option<&str>,
+    shell: Option<&Path>,
+    timeout: Duration,
+    runner: Runner,
+) -> Result<Option<MusicState>, Error> {
+    let args = args(action, value, shell);
+    let output = runner(program, &args, timeout).map_err(Error::Failed)?;
+    interpret(&output)
+}
 
-        /// One request; the player's state after it (`None` after `stop`).
-        pub fn request(
-            &mut self,
-            request: &serde_json::Value,
-        ) -> Result<Option<MusicState>, Error> {
-            let bytes = serde_json::to_vec(request).expect("a JSON value serializes");
-            self.send(&bytes)?;
-            let answer = self.recv(wire::MAX_MESSAGE)?;
-            wire::parse_answer(&answer).map_err(Error::Failed)
-        }
+fn interpret(output: &Output) -> Result<Option<MusicState>, Error> {
+    match music::parse_ctl(&String::from_utf8_lossy(&output.stdout)) {
+        Ok(state) => Ok(state),
+        Err(music::CtlError::NothingPlaying) => Err(Error::NoPlayer),
+        Err(music::CtlError::InvalidRequest(message)) => Err(Error::Failed(message)),
+        Err(music::CtlError::Unavailable(message)) => Err(Error::Failed(message)),
+        Err(music::CtlError::Malformed) => Err(Error::Failed(last_stderr(output))),
     }
 }
 
-/// gentle-stream has no player outside Unix: nothing ever plays.
-#[cfg(not(unix))]
-pub struct Connection(std::convert::Infallible);
-
-#[cfg(not(unix))]
-impl Connection {
-    pub fn open(_: &Path) -> Result<Self, Error> {
-        Err(Error::NoPlayer)
-    }
-
-    pub fn request(&mut self, _: &serde_json::Value) -> Result<Option<MusicState>, Error> {
-        match self.0 {}
-    }
+fn last_stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr)
+        .lines()
+        .rfind(|line| !line.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            if output.success {
+                "gentle-stream didn't answer".into()
+            } else {
+                "gentle-stream failed".into()
+            }
+        })
 }
 
-/// The player's folder, as gentle-stream computes it.
-pub fn runtime_dir() -> std::path::PathBuf {
-    gentle_core::music::runtime_dir(
-        std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
-        std::env::var_os("XDG_CACHE_HOME").as_deref(),
-        &dirs::home_dir().unwrap_or_else(|| Path::new("/").to_path_buf()),
-    )
+/// Read a child's pipe to the end on its own thread, so neither pipe fills
+/// while the other is read.
+fn drain(stream: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        if let Some(mut stream) = stream {
+            let _ = stream.read_to_end(&mut bytes);
+        }
+        bytes
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::path::PathBuf;
+
+    thread_local! {
+        static RUNS: RefCell<Vec<RunCall>> = const { RefCell::new(Vec::new()) };
+        static REPLY: RefCell<Result<Output, String>> = const { RefCell::new(Ok(Output {
+            success: true,
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        })) };
+    }
+
+    #[derive(Clone, Debug)]
+    struct RunCall {
+        program: PathBuf,
+        args: Vec<OsString>,
+        timeout: Duration,
+    }
+
+    fn fake(program: &Path, args: &[OsString], timeout: Duration) -> Result<Output, String> {
+        RUNS.with(|runs| {
+            runs.borrow_mut().push(RunCall {
+                program: program.to_path_buf(),
+                args: args.to_vec(),
+                timeout,
+            })
+        });
+        REPLY.with(|reply| reply.borrow().clone())
+    }
+
+    fn reply_ok(stdout: &str) {
+        REPLY.with(|reply| {
+            *reply.borrow_mut() = Ok(Output {
+                success: true,
+                stdout: stdout.as_bytes().to_vec(),
+                stderr: Vec::new(),
+            })
+        });
+    }
+
+    fn reply_err(stderr: &str) {
+        REPLY.with(|reply| {
+            *reply.borrow_mut() = Err(stderr.to_string());
+        })
+    }
+
+    fn os(args: &[&str]) -> Vec<OsString> {
+        args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn builds_exact_args_for_every_action() {
+        assert_eq!(args("start", None, None), os(&["ctl", "start", "--json"]));
+        assert_eq!(args("status", None, None), os(&["ctl", "status", "--json"]));
+        assert_eq!(args("toggle", None, None), os(&["ctl", "toggle", "--json"]));
+        assert_eq!(args("next", None, None), os(&["ctl", "next", "--json"]));
+        assert_eq!(args("stop", None, None), os(&["ctl", "stop", "--json"]));
+        assert_eq!(
+            args("volume", Some("60"), None),
+            os(&["ctl", "volume", "60", "--json"])
+        );
+        // The launcher precedes `ctl`, and the mood text is one argument.
+        assert_eq!(
+            args(
+                "mood",
+                Some("rainy night"),
+                Some(Path::new("/bin/gentle-shell"))
+            ),
+            os(&[
+                "--gentle-shell",
+                "/bin/gentle-shell",
+                "ctl",
+                "mood",
+                "rainy night",
+                "--json"
+            ])
+        );
+    }
+
+    #[test]
+    fn runs_the_resolved_binary_with_the_given_timeout() {
+        reply_ok(r#"{"ok": true, "running": false}"#);
+        let program = Path::new("/tc/music/bin/gentle-stream");
+        let result = run_with(program, "status", None, None, Duration::from_secs(5), fake);
+        assert_eq!(result, Ok(None));
+        let run = RUNS.with(|runs| runs.borrow()[0].clone());
+        assert_eq!(run.program, program);
+        assert_eq!(run.args, os(&["ctl", "status", "--json"]));
+        assert_eq!(run.timeout, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn maps_a_snapshot_and_nothing_playing() {
+        reply_ok(
+            r#"{"ok": true, "running": true, "playing": true, "volume": 80, "name": "Cafe Rain", "genre": "jazz", "mood": "rainy cafe"}"#,
+        );
+        let state = run_with(
+            Path::new("g"),
+            "status",
+            None,
+            None,
+            Duration::from_secs(1),
+            fake,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.name, "Cafe Rain");
+        assert_eq!(state.volume, 0.8);
+
+        reply_ok(
+            r#"{"ok": false, "error": {"code": "nothing_playing", "message": "nothing is playing"}}"#,
+        );
+        assert_eq!(
+            run_with(
+                Path::new("g"),
+                "toggle",
+                None,
+                None,
+                Duration::from_secs(1),
+                fake
+            ),
+            Err(Error::NoPlayer)
+        );
+    }
+
+    #[test]
+    fn maps_structured_and_process_failures() {
+        reply_ok(
+            r#"{"ok": false, "error": {"code": "unavailable", "message": "the player is unavailable"}}"#,
+        );
+        assert_eq!(
+            run_with(
+                Path::new("g"),
+                "start",
+                None,
+                None,
+                Duration::from_secs(1),
+                fake
+            ),
+            Err(Error::Failed("the player is unavailable".into()))
+        );
+
+        reply_err("gentle-stream didn't start: no such file");
+        assert_eq!(
+            run_with(
+                Path::new("g"),
+                "status",
+                None,
+                None,
+                Duration::from_secs(1),
+                fake
+            ),
+            Err(Error::Failed(
+                "gentle-stream didn't start: no such file".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn malformed_output_falls_back_to_stderr() {
+        REPLY.with(|reply| {
+            *reply.borrow_mut() = Ok(Output {
+                success: false,
+                stdout: b"not json".to_vec(),
+                stderr: b"boom\n".to_vec(),
+            })
+        });
+        assert_eq!(
+            run_with(
+                Path::new("g"),
+                "status",
+                None,
+                None,
+                Duration::from_secs(1),
+                fake
+            ),
+            Err(Error::Failed("boom".into()))
+        );
+    }
 }

@@ -1,10 +1,16 @@
 //! Where the screen reads and writes: Gentle Shell's homes, the installed
-//! `gentle-pi` package and the agents discoverable from them.
+//! `gentle-pi` package and the agents discoverable from them, or Gentle
+//! Shell's config stores over Desktop RPC ([`Remote`] through a
+//! [`ConfigPort`]) when the tab's Shell serves them.
 
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use gentle_core::profiles::{AgentEntry, AgentSource, parse_agent_name};
+use pi_rpc::desktop_rpc::{
+    ConfigErrorCode, ConfigState, ConfigStore, ConfigWrite, SetConfigResult,
+};
 
 /// `CORE_MODEL_AGENT_NAMES`: listed first, the rest alphabetically.
 const CORE_AGENTS: [&str; 3] = ["jd-judge-a", "jd-judge-b", "jd-fix-agent"];
@@ -217,4 +223,391 @@ pub fn discover_agents(env: &Env) -> Vec<AgentEntry> {
     });
     ordered.extend(rest);
     ordered
+}
+
+// ---------------------------------------------------------------------------
+// Gentle Shell's config stores over Desktop RPC
+// ---------------------------------------------------------------------------
+
+/// One config request the tab's session accepted on the screen's behalf.
+pub(crate) type ConfigTicket = u64;
+
+/// Where the screen's stores live on this tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ConfigSupport {
+    /// The Shell has not reported its capabilities yet: wait, never guess.
+    NotReady,
+    /// The Shell confirms it lacks the config methods (or there is no Shell
+    /// to ask): the direct-file path.
+    Legacy,
+    /// The Desktop channel failed on this backend: neither path is safe to
+    /// pick, so the screen says so.
+    Unavailable,
+    /// `get_config` and `set_config` are served.
+    Rpc,
+}
+
+/// Why a config request did not produce its answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ConfigFailure {
+    /// The capabilities do not list the method.
+    Unsupported,
+    /// The server answered `unsupported_method` for it.
+    UnsupportedMethod,
+    /// Capabilities are not known yet.
+    NotReady,
+    /// The server did not answer in time.
+    Timeout,
+    /// The backend was replaced or the channel stopped before the answer.
+    Dropped,
+    /// A documented config failure (`revision_conflict`, `invalid_data`…).
+    Rejected {
+        code: ConfigErrorCode,
+        message: String,
+    },
+    /// A transport, decoding or request failure.
+    Failure(String),
+    /// Make default is writing the files: no store write is sent until it
+    /// finishes.
+    Held,
+}
+
+impl ConfigFailure {
+    /// Only these mean the direct-file path; every other failure is reported
+    /// and never falls back to writing files.
+    pub(crate) fn is_legacy(&self) -> bool {
+        matches!(self, Self::Unsupported | Self::UnsupportedMethod)
+    }
+
+    pub(crate) fn message(&self) -> String {
+        match self {
+            Self::Unsupported | Self::UnsupportedMethod => {
+                "This Gentle Shell does not serve its configuration to Desktop.".to_string()
+            }
+            Self::NotReady => {
+                "Gentle Shell is still starting in this tab; try again in a moment.".to_string()
+            }
+            Self::Timeout => {
+                "Gentle Shell did not answer in time; nothing is confirmed.".to_string()
+            }
+            Self::Dropped => {
+                "Gentle Shell restarted before it answered; nothing is confirmed.".to_string()
+            }
+            Self::Rejected { code, message } => match code {
+                ConfigErrorCode::RevisionConflict => {
+                    "The configuration changed in Gentle Shell since it was read.".to_string()
+                }
+                ConfigErrorCode::InvalidData => {
+                    format!("Gentle Shell refused the data ({message}).")
+                }
+                ConfigErrorCode::WriteFailed => {
+                    format!("Gentle Shell could not write it ({message}).")
+                }
+                ConfigErrorCode::ConfigUnavailable => {
+                    format!("Gentle Shell's configuration is unavailable ({message}).")
+                }
+                ConfigErrorCode::UnknownStore | ConfigErrorCode::ReadOnly => {
+                    format!("Gentle Shell refused the request ({code}: {message}).")
+                }
+            },
+            Self::Failure(reason) => format!("The configuration request failed ({reason})."),
+            Self::Held => "Make default is still writing the files; wait for Make default to finish, then save again.".to_string(),
+        }
+    }
+}
+
+/// What a ticket was answered with.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum ConfigOutcome {
+    Read(ConfigState),
+    Written(SetConfigResult),
+    Failed(ConfigFailure),
+}
+
+/// A store that changed on the server (`config_changed`, with its new read
+/// revision), or that may have while events were lost (`revision: None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfigChange {
+    pub(crate) store: ConfigStore,
+    pub(crate) revision: Option<String>,
+}
+
+/// Where the screen's config requests go: the tab's Desktop session in the
+/// app, a recording double in tests.
+pub(crate) trait ConfigPort {
+    fn get(&mut self, store: ConfigStore) -> Result<ConfigTicket, ConfigFailure>;
+    fn set(
+        &mut self,
+        write: ConfigWrite,
+        expected_revision: String,
+    ) -> Result<ConfigTicket, ConfigFailure>;
+}
+
+/// Every store the screen reads: the three it writes and the three it only
+/// shows.
+pub(super) const SCREEN_STORES: [ConfigStore; 6] = ConfigStore::ALL;
+
+/// What one answer meant for the screen. `K` is what the screen wants done
+/// once its write lands; it comes back exactly once, or is dropped with the
+/// write when the direct-file path takes over.
+pub(super) enum Landed<K> {
+    /// Not a ticket this screen holds (late, repeated, or another screen's).
+    Ignored,
+    /// A store read was adopted.
+    Read(ConfigStore),
+    /// The re-read after a revision conflict was adopted.
+    Refreshed(ConfigStore),
+    /// A store read failed; the last good state (if any) is kept.
+    ReadFailed(ConfigStore, ConfigFailure),
+    /// The write landed; its re-read state was adopted.
+    Written(K, SetConfigResult),
+    /// The store changed since it was read: it is being re-read, and the
+    /// write is not retried.
+    Conflict(K, ConfigStore),
+    /// The write was refused or lost; nothing was adopted.
+    Rejected(K, ConfigFailure),
+    /// The Shell lacks the methods: the screen switches to the direct-file
+    /// path.
+    Legacy(ConfigFailure),
+}
+
+/// The screen's view of Gentle Shell's config stores: the last state read
+/// for each, and the tickets still open. Pure on purpose: requests go out
+/// through a [`ConfigPort`] and answers come back through [`Self::land`].
+pub(super) struct Remote<K> {
+    states: HashMap<ConfigStore, ConfigState>,
+    failures: HashMap<ConfigStore, ConfigFailure>,
+    reads: HashMap<ConfigTicket, ConfigStore>,
+    writes: HashMap<ConfigTicket, (ConfigStore, K)>,
+    /// Stores being re-read after a revision conflict.
+    conflicted: HashSet<ConfigStore>,
+    /// Stores asked for again while a read of them was open: one more read
+    /// follows that one, so its answer cannot predate the request.
+    dirty: HashSet<ConfigStore>,
+    /// Make default is writing the files: every write is refused.
+    held: bool,
+}
+
+impl<K> Remote<K> {
+    pub(super) fn new() -> Self {
+        Self {
+            states: HashMap::new(),
+            failures: HashMap::new(),
+            reads: HashMap::new(),
+            writes: HashMap::new(),
+            conflicted: HashSet::new(),
+            dirty: HashSet::new(),
+            held: false,
+        }
+    }
+
+    /// Make default starts writing the files: refuse every store write
+    /// until [`Self::release`].
+    pub(super) fn hold(&mut self) {
+        self.held = true;
+    }
+
+    /// Make default finished (or failed): writes may go out again.
+    pub(super) fn release(&mut self) {
+        self.held = false;
+    }
+
+    pub(super) fn held(&self) -> bool {
+        self.held
+    }
+
+    /// No read or write of `store` is open or owed: its state is the
+    /// freshest this screen can know.
+    pub(super) fn settled(&self, store: ConfigStore) -> bool {
+        !self.reads.values().any(|reading| *reading == store)
+            && !self.writes.values().any(|(writing, _)| *writing == store)
+            && !self.dirty.contains(&store)
+    }
+
+    /// The last state read for `store`.
+    pub(super) fn state(&self, store: ConfigStore) -> Option<&ConfigState> {
+        self.states.get(&store)
+    }
+
+    /// Why the last read of `store` failed, while it has not succeeded since.
+    pub(super) fn failure(&self, store: ConfigStore) -> Option<&ConfigFailure> {
+        self.failures.get(&store)
+    }
+
+    /// Reads are still open.
+    pub(super) fn loading(&self) -> bool {
+        !self.reads.is_empty()
+    }
+
+    /// Writes are still open.
+    pub(super) fn writing(&self) -> bool {
+        !self.writes.is_empty()
+    }
+
+    /// Read `stores`. A store already being read is not asked twice at
+    /// once: it is marked dirty, and exactly one more read follows the open
+    /// one.
+    pub(super) fn read(
+        &mut self,
+        port: &mut dyn ConfigPort,
+        stores: &[ConfigStore],
+    ) -> Result<(), ConfigFailure> {
+        for &store in stores {
+            if self.reads.values().any(|reading| *reading == store) {
+                self.dirty.insert(store);
+                continue;
+            }
+            let ticket = port.get(store)?;
+            self.reads.insert(ticket, store);
+        }
+        Ok(())
+    }
+
+    /// Send `write` guarded by the `writeRevision` its target had when last
+    /// read. A store without that target (a read-only store, or pins outside
+    /// a worktree) is refused here, and one write per store is open at a
+    /// time.
+    pub(super) fn write(
+        &mut self,
+        port: &mut dyn ConfigPort,
+        write: ConfigWrite,
+        then: K,
+    ) -> Result<ConfigTicket, ConfigFailure> {
+        if self.held {
+            return Err(ConfigFailure::Held);
+        }
+        let store = write.store();
+        if self.writes.values().any(|(writing, _)| *writing == store) {
+            return Err(ConfigFailure::Failure(format!(
+                "another change to {store} is still being saved"
+            )));
+        }
+        let target = write.write_target();
+        let Some(expected) = self
+            .states
+            .get(&store)
+            .and_then(|state| state.write_revision(target))
+        else {
+            return Err(ConfigFailure::Failure(format!(
+                "{store} offers no {target} file to write here"
+            )));
+        };
+        let ticket = port.set(write, expected.to_string())?;
+        self.writes.insert(ticket, (store, then));
+        Ok(ticket)
+    }
+
+    /// A ticket was answered.
+    pub(super) fn land(
+        &mut self,
+        port: &mut dyn ConfigPort,
+        ticket: ConfigTicket,
+        outcome: ConfigOutcome,
+    ) -> Landed<K> {
+        if let Some(store) = self.reads.remove(&ticket) {
+            let landed = self.land_read(store, outcome);
+            // Asked again while this read was open: one follow-up read, and
+            // the screen keeps waiting for it.
+            if self.dirty.remove(&store)
+                && let Err(failure) = self.read(port, &[store])
+            {
+                self.conflicted.remove(&store);
+                self.failures.insert(store, failure.clone());
+                return Landed::ReadFailed(store, failure);
+            }
+            return landed;
+        }
+        let Some((store, then)) = self.writes.remove(&ticket) else {
+            return Landed::Ignored;
+        };
+        match outcome {
+            ConfigOutcome::Written(result) if result.state.store == store => {
+                self.states.insert(store, result.state.clone());
+                self.failures.remove(&store);
+                Landed::Written(then, result)
+            }
+            ConfigOutcome::Written(_) | ConfigOutcome::Read(_) => Landed::Rejected(
+                then,
+                ConfigFailure::Failure(format!("the answer to a {store} write did not match it")),
+            ),
+            ConfigOutcome::Failed(ConfigFailure::Rejected {
+                code: ConfigErrorCode::RevisionConflict,
+                ..
+            }) => {
+                // Never a retry: the fresh state is read, and the screen
+                // decides again from it.
+                self.conflicted.insert(store);
+                if let Err(failure) = self.read(port, &[store]) {
+                    self.conflicted.remove(&store);
+                    self.failures.insert(store, failure);
+                }
+                Landed::Conflict(then, store)
+            }
+            ConfigOutcome::Failed(failure) if failure.is_legacy() => Landed::Legacy(failure),
+            ConfigOutcome::Failed(failure) => Landed::Rejected(then, failure),
+        }
+    }
+
+    fn land_read(&mut self, store: ConfigStore, outcome: ConfigOutcome) -> Landed<K> {
+        let failure = match outcome {
+            ConfigOutcome::Read(state) if state.store == store => {
+                self.states.insert(store, state);
+                self.failures.remove(&store);
+                if self.dirty.contains(&store) {
+                    // A follow-up read is owed; that one completes it.
+                    return Landed::Read(store);
+                }
+                return if self.conflicted.remove(&store) {
+                    Landed::Refreshed(store)
+                } else {
+                    Landed::Read(store)
+                };
+            }
+            ConfigOutcome::Read(state) => ConfigFailure::Failure(format!(
+                "asked for {store}, Gentle Shell answered {}",
+                state.store
+            )),
+            ConfigOutcome::Written(_) => {
+                ConfigFailure::Failure(format!("a {store} read was answered as a write"))
+            }
+            ConfigOutcome::Failed(failure) if failure.is_legacy() => {
+                return Landed::Legacy(failure);
+            }
+            ConfigOutcome::Failed(failure) => failure,
+        };
+        self.conflicted.remove(&store);
+        self.failures.insert(store, failure.clone());
+        Landed::ReadFailed(store, failure)
+    }
+
+    /// Stores changed on the server: re-read each one whose revision differs
+    /// from the one held (a write's own echo does not), or every one named
+    /// after a gap.
+    pub(super) fn changed(
+        &mut self,
+        port: &mut dyn ConfigPort,
+        changes: &[ConfigChange],
+    ) -> Result<(), ConfigFailure> {
+        let mut stale: Vec<ConfigStore> = Vec::new();
+        for change in changes {
+            let held = self
+                .states
+                .get(&change.store)
+                .map(|state| state.revision.as_str());
+            let moved = change.revision.is_none() || change.revision.as_deref() != held;
+            if moved && !stale.contains(&change.store) {
+                stale.push(change.store);
+            }
+        }
+        self.read(port, &stale)
+    }
+
+    /// Forget every open ticket (the session went away or the screen
+    /// switched to files): their answers are ignored from here on.
+    pub(super) fn forget(&mut self) {
+        self.reads.clear();
+        self.writes.clear();
+        self.conflicted.clear();
+        self.dirty.clear();
+    }
 }
