@@ -9,9 +9,10 @@ use gentle_core::profiles::{
     create_profile, evaluate_pin, serialize_profiles, update_frontmatter_routing,
 };
 use pi_rpc::desktop_rpc::{
-    ConfigErrorCode, ConfigLayer, ConfigLayerSource, ConfigScope, ConfigState, ConfigStatus,
-    ConfigStore, ConfigWrite, ConfigWriteTarget, ConfigWriteTargetState, PinSource,
-    SetConfigResult,
+    ApplyProfileOutcome, ApplyProfileResult, ConfigErrorCode, ConfigLayer, ConfigLayerSource,
+    ConfigScope, ConfigState, ConfigStatus, ConfigStore, ConfigWrite, ConfigWriteTarget,
+    ConfigWriteTargetState, PinSource, ProfileApplyErrorCode, ProfileApplyMode,
+    ProfileConfirmation, ProfileNote, ProfileNoteLevel, SetConfigResult,
 };
 use serde_json::{Value, json};
 
@@ -19,8 +20,8 @@ use super::apply::{
     SettingsWrite, apply_orchestrator_settings, make_default, sha256_hex, update_managed_ownership,
 };
 use super::env::{
-    ConfigChange, ConfigFailure, ConfigOutcome, ConfigPort, ConfigTicket, Env, Landed, Remote,
-    SCREEN_STORES, discover_agents,
+    ApplyAnswer, ConfigChange, ConfigFailure, ConfigOutcome, ConfigPort, ConfigTicket, Env, Landed,
+    ProfileApply, Remote, SCREEN_STORES, discover_agents,
 };
 use super::files::{
     RpcLoad, StoreRead, fallbacks_write, files_job_start, follow_fallbacks, followed_fallbacks,
@@ -351,6 +352,7 @@ struct FakePort {
     next: ConfigTicket,
     gets: Vec<(ConfigTicket, ConfigStore)>,
     sets: Vec<(ConfigTicket, ConfigWrite, String)>,
+    applies: Vec<(ConfigTicket, ProfileApply)>,
     refuse: Option<ConfigFailure>,
 }
 
@@ -374,6 +376,15 @@ impl ConfigPort for FakePort {
         }
         self.next += 1;
         self.sets.push((self.next, write, expected_revision));
+        Ok(self.next)
+    }
+
+    fn apply(&mut self, request: ProfileApply) -> Result<ConfigTicket, ConfigFailure> {
+        if let Some(failure) = self.refuse.clone() {
+            return Err(failure);
+        }
+        self.next += 1;
+        self.applies.push((self.next, request));
         Ok(self.next)
     }
 }
@@ -1234,4 +1245,356 @@ fn a_reread_asked_while_a_read_is_open_follows_it_exactly_once() {
         panic!()
     };
     assert!(file.has("made-default"));
+}
+
+// ---------------------------------------------------------------------------
+// Make default and Use in this session through Gentle Shell's `apply_profile`
+// ---------------------------------------------------------------------------
+
+fn apply_result(mode: ProfileApplyMode, outcome: ApplyProfileOutcome) -> ApplyProfileResult {
+    ApplyProfileResult {
+        profile: "deep".into(),
+        mode,
+        outcome,
+    }
+}
+
+fn confirmation(token: &str) -> ApplyProfileOutcome {
+    ApplyProfileOutcome::ConfirmationRequired(ProfileConfirmation {
+        title: "Apply profile \"deep\"?".into(),
+        message:
+            "Applying it will replace global routing.\nworker: anthropic/opus (added). Continue?"
+                .into(),
+        token: token.into(),
+    })
+}
+
+/// Land the open apply and turn Gentle Shell's answer into the screen's next
+/// step.
+fn answer(
+    remote: &mut Remote<&'static str>,
+    port: &mut FakePort,
+    outcome: ConfigOutcome,
+) -> ApplyAnswer {
+    let (ticket, request) = port.applies.last().unwrap().clone();
+    match remote.land(port, ticket, outcome) {
+        Landed::Applied(landed, result) => {
+            assert_eq!(landed, request, "the answer is for the request sent");
+            ApplyAnswer::new(&landed, result)
+        }
+        _ => panic!("an apply answer lands as an apply"),
+    }
+}
+
+#[test]
+fn shell_confirmation_is_shown_exactly_and_resent_only_with_its_token() {
+    let mut port = FakePort::default();
+    let mut remote = opened(&mut port);
+    let first = ProfileApply::new("deep", ProfileApplyMode::Default);
+    remote.apply(&mut port, first.clone()).unwrap();
+    assert_eq!(port.applies[0].1, first);
+    assert_eq!(
+        first.confirmation, None,
+        "the first request carries no token"
+    );
+
+    let ask = answer(
+        &mut remote,
+        &mut port,
+        ConfigOutcome::Applied(apply_result(ProfileApplyMode::Default, confirmation("t1"))),
+    );
+    let ApplyAnswer::Confirm {
+        title,
+        message,
+        retry,
+    } = ask
+    else {
+        panic!("Gentle Shell asked first")
+    };
+    // Gentle Shell's own text, untouched: the token is bound to it.
+    assert_eq!(title, "Apply profile \"deep\"?");
+    assert_eq!(
+        message,
+        "Applying it will replace global routing.\nworker: anthropic/opus (added). Continue?"
+    );
+    assert_eq!(retry, first.confirmed("t1"));
+    // Asking writes nothing and sends nothing more by itself.
+    assert_eq!(port.applies.len(), 1);
+    assert!(port.sets.is_empty());
+    assert!(!remote.applying(), "the card is not a lock on the screen");
+
+    // The human's Apply resends the same request with the token.
+    remote.apply(&mut port, retry).unwrap();
+    assert_eq!(port.applies.len(), 2);
+    let resent = &port.applies[1].1;
+    assert_eq!(resent.profile, "deep");
+    assert_eq!(resent.mode, ProfileApplyMode::Default);
+    assert_eq!(resent.confirmation.as_deref(), Some("t1"));
+
+    let notes = vec![ProfileNote {
+        level: ProfileNoteLevel::Info,
+        text: "Applied profile \"deep\".".into(),
+    }];
+    assert_eq!(
+        answer(
+            &mut remote,
+            &mut port,
+            ConfigOutcome::Applied(apply_result(
+                ProfileApplyMode::Default,
+                ApplyProfileOutcome::Applied(notes.clone()),
+            )),
+        ),
+        ApplyAnswer::Done {
+            applied: true,
+            notes,
+        }
+    );
+    assert!(!remote.applying());
+}
+
+#[test]
+fn cancelling_shell_confirmation_sends_nothing() {
+    let mut port = FakePort::default();
+    let mut remote = opened(&mut port);
+    remote
+        .apply(
+            &mut port,
+            ProfileApply::new("deep", ProfileApplyMode::Default),
+        )
+        .unwrap();
+    let ask = answer(
+        &mut remote,
+        &mut port,
+        ConfigOutcome::Applied(apply_result(ProfileApplyMode::Default, confirmation("t1"))),
+    );
+    assert!(matches!(ask, ApplyAnswer::Confirm { .. }));
+    // Cancel drops the card: no request is sent, no token goes out, and the
+    // screen may write again.
+    drop(ask);
+    assert_eq!(port.applies.len(), 1);
+    assert!(
+        port.applies
+            .iter()
+            .all(|(_, sent)| sent.confirmation.is_none())
+    );
+    assert!(port.sets.is_empty());
+    let RpcLoad::Ready { file, .. } = rpc_load(&remote).unwrap() else {
+        panic!()
+    };
+    remote
+        .write(&mut port, profiles_write(&file).unwrap(), "save")
+        .unwrap();
+}
+
+#[test]
+fn a_stale_token_is_asked_again_never_answered() {
+    let mut port = FakePort::default();
+    let mut remote = opened(&mut port);
+    let approved = ProfileApply::new("deep", ProfileApplyMode::Default).confirmed("t1");
+    remote.apply(&mut port, approved.clone()).unwrap();
+    // The routing changed since the dialog was shown: Gentle Shell asks
+    // again with a new text and token, and the screen shows it again.
+    let ask = answer(
+        &mut remote,
+        &mut port,
+        ConfigOutcome::Applied(apply_result(ProfileApplyMode::Default, confirmation("t2"))),
+    );
+    let ApplyAnswer::Confirm { retry, .. } = ask else {
+        panic!("asked again")
+    };
+    assert_eq!(retry.confirmation.as_deref(), Some("t2"));
+    assert_eq!(port.applies.len(), 1, "nothing resent without the human");
+}
+
+#[test]
+fn not_applied_and_session_answers_carry_their_notes() {
+    let mut port = FakePort::default();
+    let mut remote = opened(&mut port);
+    remote
+        .apply(
+            &mut port,
+            ProfileApply::new("deep", ProfileApplyMode::Session),
+        )
+        .unwrap();
+    let notes = vec![ProfileNote {
+        level: ProfileNoteLevel::Warning,
+        text: "Profile \"deep\" was not applied.".into(),
+    }];
+    assert_eq!(
+        answer(
+            &mut remote,
+            &mut port,
+            ConfigOutcome::Applied(apply_result(
+                ProfileApplyMode::Session,
+                ApplyProfileOutcome::NotApplied(notes.clone()),
+            )),
+        ),
+        ApplyAnswer::Done {
+            applied: false,
+            notes,
+        }
+    );
+    // `session` binds the profile without writing a store from here.
+    assert!(port.sets.is_empty());
+}
+
+#[test]
+fn a_shell_apply_holds_every_write_until_it_answers() {
+    let mut port = FakePort::default();
+    let mut remote = opened(&mut port);
+    let RpcLoad::Ready { file, .. } = rpc_load(&remote).unwrap() else {
+        panic!()
+    };
+    remote
+        .apply(
+            &mut port,
+            ProfileApply::new("deep", ProfileApplyMode::Default),
+        )
+        .unwrap();
+    assert!(remote.applying());
+    assert_eq!(
+        remote
+            .write(&mut port, profiles_write(&file).unwrap(), "save")
+            .unwrap_err(),
+        ConfigFailure::Applying
+    );
+    assert_eq!(
+        remote
+            .apply(
+                &mut port,
+                ProfileApply::new("other", ProfileApplyMode::Session)
+            )
+            .unwrap_err(),
+        ConfigFailure::Applying
+    );
+    assert!(
+        files_job_start(&mut remote).is_err(),
+        "nor Make default's files"
+    );
+    assert!(!remote.held());
+    assert!(port.sets.is_empty());
+    assert_eq!(port.applies.len(), 1);
+
+    // A documented refusal is said, never a switch to the files, and the
+    // hold ends with it.
+    let (ticket, _) = port.applies[0].clone();
+    let busy = ConfigFailure::ApplyRefused {
+        code: ProfileApplyErrorCode::ProfileApplyBusy,
+        message: "busy".into(),
+    };
+    match remote.land(&mut port, ticket, ConfigOutcome::Failed(busy.clone())) {
+        Landed::ApplyFailed(_, failure) => {
+            assert_eq!(failure, busy);
+            assert!(!failure.is_legacy());
+            assert!(failure.message().contains("nothing was written"));
+        }
+        _ => panic!("a refused apply is reported"),
+    }
+    assert!(!remote.applying());
+    remote
+        .write(&mut port, profiles_write(&file).unwrap(), "save")
+        .unwrap();
+
+    // Nor does an apply start while a store write is still open.
+    assert!(
+        remote
+            .apply(
+                &mut port,
+                ProfileApply::new("deep", ProfileApplyMode::Default)
+            )
+            .is_err()
+    );
+    assert_eq!(port.applies.len(), 1);
+}
+
+#[test]
+fn an_apply_answer_for_another_profile_is_not_adopted() {
+    let mut port = FakePort::default();
+    let mut remote = opened(&mut port);
+    remote
+        .apply(
+            &mut port,
+            ProfileApply::new("other", ProfileApplyMode::Default),
+        )
+        .unwrap();
+    let (ticket, _) = port.applies[0].clone();
+    // `apply_result` answers for "deep".
+    assert!(matches!(
+        remote.land(
+            &mut port,
+            ticket,
+            ConfigOutcome::Applied(apply_result(ProfileApplyMode::Default, confirmation("t1"))),
+        ),
+        Landed::ApplyFailed(_, ConfigFailure::Failure(_))
+    ));
+    assert!(!remote.applying());
+    // Forgetting (the session went away) also ends an open apply.
+    remote
+        .apply(
+            &mut port,
+            ProfileApply::new("deep", ProfileApplyMode::Default),
+        )
+        .unwrap();
+    remote.forget();
+    assert!(!remote.applying());
+}
+
+#[test]
+fn a_write_refused_while_an_apply_runs_elsewhere_is_kept_for_a_retry() {
+    // Another session (or the TUI) is applying a profile: Gentle Shell
+    // refuses every profile store write until it finishes.
+    let writes = |remote: &Remote<&'static str>| {
+        let RpcLoad::Ready { file, pin, .. } = rpc_load(remote).unwrap() else {
+            panic!()
+        };
+        let fallbacks = remote.state(ConfigStore::ProfileFallbacks).unwrap().clone();
+        [
+            (ConfigStore::Profiles, profiles_write(&file).unwrap()),
+            (
+                ConfigStore::ProfileFallbacks,
+                fallbacks_write(&fallbacks, "deep", Some("deeper"))
+                    .unwrap()
+                    .unwrap(),
+            ),
+            (
+                ConfigStore::Pins,
+                local_pin_write(pin.as_ref(), "other").unwrap().0,
+            ),
+        ]
+    };
+    let mut port = FakePort::default();
+    let mut remote = opened(&mut port);
+    for (store, write) in writes(&remote) {
+        let ticket = remote.write(&mut port, write, "save").unwrap();
+        let (gets, sets) = (port.gets.len(), port.sets.len());
+        match remote.land(
+            &mut port,
+            ticket,
+            rejected(ConfigErrorCode::ProfileApplyBusy),
+        ) {
+            Landed::Busy("save", busy) => assert_eq!(busy, store),
+            _ => panic!("{store}: a busy refusal keeps the edit for a retry"),
+        }
+        // Never retried, never a switch to the files, and the held state
+        // still guards the next save.
+        assert_eq!((port.gets.len(), port.sets.len()), (gets, sets), "{store}");
+        assert!(!remote.writing());
+        let failure = ConfigFailure::Rejected {
+            code: ConfigErrorCode::ProfileApplyBusy,
+            message: String::new(),
+        };
+        assert!(!failure.is_legacy());
+        assert!(failure.message().contains("applying a profile"));
+    }
+    assert_eq!(
+        remote
+            .state(ConfigStore::Profiles)
+            .unwrap()
+            .write_revision(ConfigWriteTarget::Global),
+        Some("sha256:g1")
+    );
+    // Once the apply finishes, the same edit saves with the revision held.
+    let (_, write) = writes(&remote).into_iter().next().unwrap();
+    remote.write(&mut port, write, "again").unwrap();
+    assert_eq!(port.sets.last().unwrap().2, "sha256:g1");
 }

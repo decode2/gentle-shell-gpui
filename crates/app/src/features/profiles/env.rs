@@ -9,7 +9,8 @@ use std::path::{Path, PathBuf};
 
 use gentle_core::profiles::{AgentEntry, AgentSource, parse_agent_name};
 use pi_rpc::desktop_rpc::{
-    ConfigErrorCode, ConfigState, ConfigStore, ConfigWrite, SetConfigResult,
+    ApplyProfileOutcome, ApplyProfileResult, ConfigErrorCode, ConfigState, ConfigStore,
+    ConfigWrite, ProfileApplyErrorCode, ProfileApplyMode, ProfileNote, SetConfigResult,
 };
 
 /// `CORE_MODEL_AGENT_NAMES`: listed first, the rest alphabetically.
@@ -270,6 +271,15 @@ pub(crate) enum ConfigFailure {
     /// Make default is writing the files: no store write is sent until it
     /// finishes.
     Held,
+    /// Gentle Shell is applying a profile (`apply_profile`): no store write
+    /// is sent until it answers.
+    Applying,
+    /// A documented `apply_profile` failure (`unknown_profile`,
+    /// `profile_apply_busy`, `profiles_unavailable`).
+    ApplyRefused {
+        code: ProfileApplyErrorCode,
+        message: String,
+    },
 }
 
 impl ConfigFailure {
@@ -306,12 +316,28 @@ impl ConfigFailure {
                 ConfigErrorCode::ConfigUnavailable => {
                     format!("Gentle Shell's configuration is unavailable ({message}).")
                 }
+                ConfigErrorCode::ProfileApplyBusy => {
+                    "Gentle Shell is applying a profile right now, so nothing was written."
+                        .to_string()
+                }
                 ConfigErrorCode::UnknownStore | ConfigErrorCode::ReadOnly => {
                     format!("Gentle Shell refused the request ({code}: {message}).")
                 }
             },
             Self::Failure(reason) => format!("The configuration request failed ({reason})."),
             Self::Held => "Make default is still writing the files; wait for Make default to finish, then save again.".to_string(),
+            Self::Applying => "Gentle Shell is still applying a profile; wait for it to finish, then try again.".to_string(),
+            Self::ApplyRefused { code, message } => match code {
+                ProfileApplyErrorCode::UnknownProfile => {
+                    format!("Gentle Shell has no saved profile by that name ({message}).")
+                }
+                ProfileApplyErrorCode::ProfileApplyBusy => {
+                    "Gentle Shell is already applying a profile; nothing was written. Try again once it finishes.".to_string()
+                }
+                ProfileApplyErrorCode::ProfilesUnavailable => {
+                    format!("Gentle Shell's profiles are unavailable in this tab ({message}).")
+                }
+            },
         }
     }
 }
@@ -321,7 +347,78 @@ impl ConfigFailure {
 pub(crate) enum ConfigOutcome {
     Read(ConfigState),
     Written(SetConfigResult),
+    Applied(ApplyProfileResult),
     Failed(ConfigFailure),
+}
+
+/// One `apply_profile` request: run the `/gentle:profiles` screen's Make
+/// default (`Default`) or Use in this session (`Session`) on a saved
+/// profile. `confirmation` is set only when resending the token of a dialog
+/// the human approved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProfileApply {
+    pub(crate) profile: String,
+    pub(crate) mode: ProfileApplyMode,
+    pub(crate) confirmation: Option<String>,
+}
+
+impl ProfileApply {
+    /// The first request, without a token.
+    pub(crate) fn new(profile: impl Into<String>, mode: ProfileApplyMode) -> Self {
+        Self {
+            profile: profile.into(),
+            mode,
+            confirmation: None,
+        }
+    }
+
+    /// The same request, resent with the token of the approved dialog.
+    pub(crate) fn confirmed(&self, token: impl Into<String>) -> Self {
+        Self {
+            confirmation: Some(token.into()),
+            ..self.clone()
+        }
+    }
+}
+
+/// What the screen does with Gentle Shell's answer to an apply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum ApplyAnswer {
+    /// Show Gentle Shell's dialog exactly. Only the human's Apply sends
+    /// `retry`; Cancel sends nothing. A confirmation is asked again (never
+    /// answered here) even for a request that already carried a token: the
+    /// text or the profile changed since it was shown.
+    Confirm {
+        title: String,
+        message: String,
+        retry: ProfileApply,
+    },
+    /// Finished. `applied` is whether Gentle Shell applied it; the notes
+    /// say how, or why not.
+    Done {
+        applied: bool,
+        notes: Vec<ProfileNote>,
+    },
+}
+
+impl ApplyAnswer {
+    pub(super) fn new(request: &ProfileApply, result: ApplyProfileResult) -> Self {
+        match result.outcome {
+            ApplyProfileOutcome::ConfirmationRequired(confirmation) => Self::Confirm {
+                title: confirmation.title,
+                message: confirmation.message,
+                retry: request.confirmed(confirmation.token),
+            },
+            ApplyProfileOutcome::Applied(notes) => Self::Done {
+                applied: true,
+                notes,
+            },
+            ApplyProfileOutcome::NotApplied(notes) => Self::Done {
+                applied: false,
+                notes,
+            },
+        }
+    }
 }
 
 /// A store that changed on the server (`config_changed`, with its new read
@@ -341,6 +438,7 @@ pub(crate) trait ConfigPort {
         write: ConfigWrite,
         expected_revision: String,
     ) -> Result<ConfigTicket, ConfigFailure>;
+    fn apply(&mut self, request: ProfileApply) -> Result<ConfigTicket, ConfigFailure>;
 }
 
 /// Every store the screen reads: the three it writes and the three it only
@@ -364,11 +462,21 @@ pub(super) enum Landed<K> {
     /// The store changed since it was read: it is being re-read, and the
     /// write is not retried.
     Conflict(K, ConfigStore),
+    /// Gentle Shell is applying a profile (started anywhere) and wrote
+    /// nothing; the write is not retried, and the edit stays to save again
+    /// once the apply finishes.
+    Busy(K, ConfigStore),
     /// The write was refused or lost; nothing was adopted.
     Rejected(K, ConfigFailure),
     /// The Shell lacks the methods: the screen switches to the direct-file
     /// path.
     Legacy(ConfigFailure),
+    /// Gentle Shell answered the apply (a confirmation, applied, or not
+    /// applied); the hold on writes is released.
+    Applied(ProfileApply, ApplyProfileResult),
+    /// The apply was refused or lost. Never a reason to switch to the files:
+    /// the screen says why and nothing is retried.
+    ApplyFailed(ProfileApply, ConfigFailure),
 }
 
 /// The screen's view of Gentle Shell's config stores: the last state read
@@ -386,6 +494,9 @@ pub(super) struct Remote<K> {
     dirty: HashSet<ConfigStore>,
     /// Make default is writing the files: every write is refused.
     held: bool,
+    /// The `apply_profile` request Gentle Shell has not answered yet: every
+    /// write is refused until it does.
+    applying: Option<(ConfigTicket, ProfileApply)>,
 }
 
 impl<K> Remote<K> {
@@ -398,6 +509,7 @@ impl<K> Remote<K> {
             conflicted: HashSet::new(),
             dirty: HashSet::new(),
             held: false,
+            applying: None,
         }
     }
 
@@ -444,6 +556,35 @@ impl<K> Remote<K> {
         !self.writes.is_empty()
     }
 
+    /// An `apply_profile` request is still open.
+    pub(super) fn applying(&self) -> bool {
+        self.applying.is_some()
+    }
+
+    /// Ask Gentle Shell to apply a saved profile. It starts only when no
+    /// store write, Make default or other apply is open, and holds every
+    /// store write until Gentle Shell answers, like Make default's files job.
+    pub(super) fn apply(
+        &mut self,
+        port: &mut dyn ConfigPort,
+        request: ProfileApply,
+    ) -> Result<ConfigTicket, ConfigFailure> {
+        if self.held {
+            return Err(ConfigFailure::Held);
+        }
+        if self.applying.is_some() {
+            return Err(ConfigFailure::Applying);
+        }
+        if self.writing() {
+            return Err(ConfigFailure::Failure(
+                "a profile change is still being saved".to_string(),
+            ));
+        }
+        let ticket = port.apply(request.clone())?;
+        self.applying = Some((ticket, request));
+        Ok(ticket)
+    }
+
     /// Read `stores`. A store already being read is not asked twice at
     /// once: it is marked dirty, and exactly one more read follows the open
     /// one.
@@ -476,6 +617,9 @@ impl<K> Remote<K> {
         if self.held {
             return Err(ConfigFailure::Held);
         }
+        if self.applying.is_some() {
+            return Err(ConfigFailure::Applying);
+        }
         let store = write.store();
         if self.writes.values().any(|(writing, _)| *writing == store) {
             return Err(ConfigFailure::Failure(format!(
@@ -504,6 +648,20 @@ impl<K> Remote<K> {
         ticket: ConfigTicket,
         outcome: ConfigOutcome,
     ) -> Landed<K> {
+        if let Some((_, request)) = self.applying.take_if(|(open, _)| *open == ticket) {
+            return match outcome {
+                ConfigOutcome::Applied(result)
+                    if result.profile == request.profile && result.mode == request.mode =>
+                {
+                    Landed::Applied(request, result)
+                }
+                ConfigOutcome::Failed(failure) => Landed::ApplyFailed(request, failure),
+                _ => Landed::ApplyFailed(
+                    request,
+                    ConfigFailure::Failure("the answer to the apply did not match it".to_string()),
+                ),
+            };
+        }
         if let Some(store) = self.reads.remove(&ticket) {
             let landed = self.land_read(store, outcome);
             // Asked again while this read was open: one follow-up read, and
@@ -526,10 +684,14 @@ impl<K> Remote<K> {
                 self.failures.remove(&store);
                 Landed::Written(then, result)
             }
-            ConfigOutcome::Written(_) | ConfigOutcome::Read(_) => Landed::Rejected(
-                then,
-                ConfigFailure::Failure(format!("the answer to a {store} write did not match it")),
-            ),
+            ConfigOutcome::Written(_) | ConfigOutcome::Read(_) | ConfigOutcome::Applied(_) => {
+                Landed::Rejected(
+                    then,
+                    ConfigFailure::Failure(format!(
+                        "the answer to a {store} write did not match it"
+                    )),
+                )
+            }
             ConfigOutcome::Failed(ConfigFailure::Rejected {
                 code: ConfigErrorCode::RevisionConflict,
                 ..
@@ -543,6 +705,10 @@ impl<K> Remote<K> {
                 }
                 Landed::Conflict(then, store)
             }
+            ConfigOutcome::Failed(ConfigFailure::Rejected {
+                code: ConfigErrorCode::ProfileApplyBusy,
+                ..
+            }) => Landed::Busy(then, store),
             ConfigOutcome::Failed(failure) if failure.is_legacy() => Landed::Legacy(failure),
             ConfigOutcome::Failed(failure) => Landed::Rejected(then, failure),
         }
@@ -569,6 +735,9 @@ impl<K> Remote<K> {
             )),
             ConfigOutcome::Written(_) => {
                 ConfigFailure::Failure(format!("a {store} read was answered as a write"))
+            }
+            ConfigOutcome::Applied(_) => {
+                ConfigFailure::Failure(format!("a {store} read was answered as an apply"))
             }
             ConfigOutcome::Failed(failure) if failure.is_legacy() => {
                 return Landed::Legacy(failure);
@@ -609,5 +778,6 @@ impl<K> Remote<K> {
         self.writes.clear();
         self.conflicted.clear();
         self.dirty.clear();
+        self.applying = None;
     }
 }

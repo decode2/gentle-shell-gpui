@@ -627,7 +627,9 @@ fn route_desktop_widget(
                 DesktopRoute::Design
             } else if matches!(
                 pending,
-                Some(DesktopMethod::GetConfig) | Some(DesktopMethod::SetConfig)
+                Some(DesktopMethod::GetConfig)
+                    | Some(DesktopMethod::SetConfig)
+                    | Some(DesktopMethod::ApplyProfile)
             ) {
                 DesktopRoute::Config
             } else {
@@ -653,7 +655,10 @@ fn route_desktop_widget(
         Ok(Some(DesktopRecord::Event(event))) if event.event == desktop::design::DESIGN_CANVAS => {
             DesktopRoute::Design
         }
-        Ok(Some(DesktopRecord::Event(event))) if event.event == desktop::config::CONFIG_CHANGED => {
+        Ok(Some(DesktopRecord::Event(event)))
+            if event.event == desktop::config::CONFIG_CHANGED
+                || event.event == desktop::config::PROFILE_APPLIED =>
+        {
             DesktopRoute::Config
         }
         _ => DesktopRoute::Channel,
@@ -1135,6 +1140,38 @@ mod tests {
         ));
         assert!(matches!(
             route_desktop_widget(&changed("config_changed_v2"), None),
+            DesktopRoute::Channel
+        ));
+    }
+
+    #[test]
+    fn profile_apply_records_route_to_the_config_slice() {
+        let answer = widget(Some(record(json!({
+            "schema": SCHEMA,
+            "kind": "response",
+            "requestId": "desktop-4",
+            "ok": false,
+            "error": {"code": "profile_apply_busy", "message": "busy"},
+        }))));
+        assert!(matches!(
+            route_desktop_widget(&decode_widget(&answer), Some(DesktopMethod::ApplyProfile)),
+            DesktopRoute::Config
+        ));
+        let applied = |event: &str| {
+            decode_widget(&widget(Some(record(json!({
+                "schema": SCHEMA,
+                "kind": "event",
+                "seq": 1,
+                "event": event,
+                "data": {"profile": "deep", "mode": "default", "source": "desktop"},
+            })))))
+        };
+        assert!(matches!(
+            route_desktop_widget(&applied("profile_applied"), None),
+            DesktopRoute::Config
+        ));
+        assert!(matches!(
+            route_desktop_widget(&applied("profile_applied_v2"), None),
             DesktopRoute::Channel
         ));
     }

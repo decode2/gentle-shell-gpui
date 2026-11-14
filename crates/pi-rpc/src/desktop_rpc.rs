@@ -25,6 +25,8 @@
 //! before sending — `set_config` refuses an empty `expectedRevision` and an
 //! empty pin profile (a clear is an explicit `profile: null`), both of which
 //! the server would only answer with `revision_conflict` / `invalid_data`.
+//! `apply_profile` likewise refuses a profile name or confirmation token
+//! outside the documented 1–128 characters.
 
 use crate::record::{Response as PiResponse, UiMethod, UiRequest};
 use serde::Deserialize;
@@ -60,6 +62,7 @@ pub enum DesktopMethod {
     GetDesignCanvas,
     GetConfig,
     SetConfig,
+    ApplyProfile,
 }
 
 impl DesktopMethod {
@@ -79,14 +82,16 @@ impl DesktopMethod {
             Self::GetDesignCanvas => "get_design_canvas",
             Self::GetConfig => "get_config",
             Self::SetConfig => "set_config",
+            Self::ApplyProfile => "apply_profile",
         }
     }
 
     /// Whether the method's params can only be built by its typed
-    /// constructor: the config methods name a store, never a path, so the
-    /// generic `params` path is closed to them.
+    /// constructor: the config methods name a store, never a path, and
+    /// `apply_profile` takes exactly its documented keys, so the generic
+    /// `params` path is closed to them.
     fn requires_typed_params(self) -> bool {
-        matches!(self, Self::GetConfig | Self::SetConfig)
+        matches!(self, Self::GetConfig | Self::SetConfig | Self::ApplyProfile)
     }
 
     /// Parse a wire method name.
@@ -105,6 +110,7 @@ impl DesktopMethod {
             "get_design_canvas" => Ok(Self::GetDesignCanvas),
             "get_config" => Ok(Self::GetConfig),
             "set_config" => Ok(Self::SetConfig),
+            "apply_profile" => Ok(Self::ApplyProfile),
             other => Err(DesktopRpcError::UnsupportedMethod(other.to_string())),
         }
     }
@@ -478,10 +484,28 @@ impl DesktopRequest {
         )
     }
 
+    /// The `apply_profile` request. Params are exactly `{ profile, mode }`,
+    /// plus `confirmation` when resending with the token of a
+    /// `confirmation_required` answer the human approved. A profile name or
+    /// token outside 1–128 characters is refused before sending.
+    pub fn apply_profile(
+        request_id: impl Into<String>,
+        profile: &str,
+        mode: ProfileApplyMode,
+        confirmation: Option<&str>,
+    ) -> Result<Self, DesktopRpcError> {
+        Self::build(
+            request_id,
+            DesktopMethod::ApplyProfile,
+            apply_profile_params(profile, mode, confirmation)?,
+        )
+    }
+
     /// A request for a known method, validated against the id and size limits
     /// before anything reaches the transport. The config methods are refused
     /// here: their params come only from [`Self::get_config`] and
-    /// [`Self::set_config`].
+    /// [`Self::set_config`], as `apply_profile`'s come only from
+    /// [`Self::apply_profile`].
     pub fn new(
         request_id: impl Into<String>,
         method: DesktopMethod,
@@ -565,6 +589,12 @@ impl DesktopErrorInfo {
     /// The documented config failure this error reports, if it is one.
     pub fn config_error(&self) -> Option<ConfigErrorCode> {
         ConfigErrorCode::parse(&self.code)
+    }
+
+    /// The documented `apply_profile` failure this error reports, if it is
+    /// one.
+    pub fn profile_apply_error(&self) -> Option<ProfileApplyErrorCode> {
+        ProfileApplyErrorCode::parse(&self.code)
     }
 }
 
@@ -654,6 +684,11 @@ impl DesktopResponse {
         SetConfigResult::from_data(self.data()?)
     }
 
+    /// The response to `apply_profile`.
+    pub fn apply_profile(&self) -> Result<ApplyProfileResult, DesktopRpcError> {
+        ApplyProfileResult::from_data(self.data()?)
+    }
+
     fn data(&self) -> Result<&Value, DesktopRpcError> {
         self.result
             .as_ref()
@@ -711,6 +746,13 @@ impl DesktopEvent {
     pub fn config_changed(&self) -> Result<ConfigChanged, DesktopRpcError> {
         expect_event(self, "config_changed")?;
         ConfigChanged::from_data(&self.data)
+    }
+
+    /// Decode the data of a `profile_applied` event, verifying the exact
+    /// event name before the shape, exactly like [`Self::agents_update`].
+    pub fn profile_applied(&self) -> Result<ProfileApplied, DesktopRpcError> {
+        expect_event(self, "profile_applied")?;
+        ProfileApplied::from_data(&self.data)
     }
 }
 
@@ -2243,6 +2285,9 @@ fn set_config_params(
 
 /// The documented `get_config` / `set_config` failure codes. Other codes
 /// (`invalid_request`, `internal_error`) are not config-specific.
+/// `profile_apply_busy` is also an `apply_profile` failure: `set_config` for
+/// `profiles`, `profile_fallbacks` or `pins` answers it while an apply runs,
+/// and writes nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigErrorCode {
     UnknownStore,
@@ -2251,17 +2296,19 @@ pub enum ConfigErrorCode {
     RevisionConflict,
     WriteFailed,
     ConfigUnavailable,
+    ProfileApplyBusy,
 }
 
 impl ConfigErrorCode {
     /// Every config failure code, in documented order.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::UnknownStore,
         Self::ReadOnly,
         Self::InvalidData,
         Self::RevisionConflict,
         Self::WriteFailed,
         Self::ConfigUnavailable,
+        Self::ProfileApplyBusy,
     ];
 
     /// The wire code.
@@ -2273,6 +2320,7 @@ impl ConfigErrorCode {
             Self::RevisionConflict => "revision_conflict",
             Self::WriteFailed => "write_failed",
             Self::ConfigUnavailable => "config_unavailable",
+            Self::ProfileApplyBusy => "profile_apply_busy",
         }
     }
 
@@ -2530,6 +2578,276 @@ impl ConfigChanged {
     }
 }
 
+/// Longest `apply_profile` profile name and confirmation token, in UTF-16
+/// code units like the request id.
+const MAX_PROFILE_APPLY_UNITS: usize = 128;
+
+/// Whether `text` is 1 to [`MAX_PROFILE_APPLY_UNITS`] UTF-16 code units.
+fn within_apply_limit(text: &str) -> bool {
+    (1..=MAX_PROFILE_APPLY_UNITS).contains(&text.encode_utf16().count())
+}
+
+/// What `apply_profile` does with the saved profile: the `/gentle:profiles`
+/// screen's Make default for new sessions, or its Use in this session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProfileApplyMode {
+    Default,
+    Session,
+}
+
+impl ProfileApplyMode {
+    /// Every mode the protocol speaks, in wire order.
+    pub const ALL: [Self; 2] = [Self::Default, Self::Session];
+
+    /// The wire name of the mode.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Session => "session",
+        }
+    }
+}
+
+impl std::str::FromStr for ProfileApplyMode {
+    type Err = DesktopRpcError;
+
+    fn from_str(mode: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == mode)
+            .ok_or_else(|| DesktopRpcError::InvalidProfileApplyMode(mode.to_string()))
+    }
+}
+
+impl fmt::Display for ProfileApplyMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// The wire `params` object for `apply_profile`: exactly `{ profile, mode }`
+/// and, only when given, `confirmation`.
+fn apply_profile_params(
+    profile: &str,
+    mode: ProfileApplyMode,
+    confirmation: Option<&str>,
+) -> Result<Value, DesktopRpcError> {
+    if !within_apply_limit(profile) {
+        return Err(DesktopRpcError::InvalidProfileName);
+    }
+    let mut params = json!({ "profile": profile, "mode": mode.as_str() });
+    if let Some(token) = confirmation {
+        if !within_apply_limit(token) {
+            return Err(DesktopRpcError::InvalidConfirmationToken);
+        }
+        params["confirmation"] = json!(token);
+    }
+    Ok(params)
+}
+
+/// The closed `level` vocabulary of an `apply_profile` note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProfileNoteLevel {
+    Info,
+    Warning,
+    Error,
+}
+
+impl ProfileNoteLevel {
+    /// Every level the protocol speaks, in wire order.
+    pub const ALL: [Self; 3] = [Self::Info, Self::Warning, Self::Error];
+
+    /// The wire name of the level.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Info => "info",
+            Self::Warning => "warning",
+            Self::Error => "error",
+        }
+    }
+}
+
+impl std::str::FromStr for ProfileNoteLevel {
+    type Err = DesktopRpcError;
+
+    fn from_str(level: &str) -> Result<Self, Self::Err> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == level)
+            .ok_or_else(|| DesktopRpcError::InvalidProfileNoteLevel(level.to_string()))
+    }
+}
+
+impl fmt::Display for ProfileNoteLevel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+/// One notice the `/gentle:profiles` screen raised while applying, in order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileNote {
+    pub level: ProfileNoteLevel,
+    pub text: String,
+}
+
+impl ProfileNote {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            level: closed_field(data, "level")?,
+            text: string_field(data, "text")?,
+        })
+    }
+}
+
+/// The dialog the screen would show before writing global routing. Desktop
+/// shows `title` and `message` to the human and resends with `token` only
+/// when they approve; the token is bound to this exact text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileConfirmation {
+    pub title: String,
+    pub message: String,
+    pub token: String,
+}
+
+impl ProfileConfirmation {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        let token = string_field(data, "token")?;
+        if token.is_empty() {
+            return Err(DesktopRpcError::MalformedPayload(
+                "confirmation token must not be empty".into(),
+            ));
+        }
+        Ok(Self {
+            title: string_field(data, "title")?,
+            message: string_field(data, "message")?,
+            token,
+        })
+    }
+}
+
+/// How an `apply_profile` request ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ApplyProfileOutcome {
+    /// Nothing was written: the human must see this dialog first.
+    ConfirmationRequired(ProfileConfirmation),
+    /// The screen's last notice was `info`; a `profile_applied` event follows.
+    Applied(Vec<ProfileNote>),
+    /// The screen ended with a warning or with no notice; the notes say why.
+    NotApplied(Vec<ProfileNote>),
+}
+
+/// The decoded `apply_profile` data: the profile and mode it answers, and
+/// its outcome.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplyProfileResult {
+    pub profile: String,
+    pub mode: ProfileApplyMode,
+    pub outcome: ApplyProfileOutcome,
+}
+
+impl ApplyProfileResult {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        let profile = profile_field(data)?;
+        let mode = closed_field(data, "mode")?;
+        let status = string_field(data, "status")?;
+        let outcome = match status.as_str() {
+            "confirmation_required" => ApplyProfileOutcome::ConfirmationRequired(
+                ProfileConfirmation::from_data(field_object(data, "confirmation")?)?,
+            ),
+            "applied" => ApplyProfileOutcome::Applied(note_entries(data)?),
+            "not_applied" => ApplyProfileOutcome::NotApplied(note_entries(data)?),
+            _ => return Err(DesktopRpcError::InvalidProfileApplyStatus(status)),
+        };
+        Ok(Self {
+            profile,
+            mode,
+            outcome,
+        })
+    }
+}
+
+/// The data of a `profile_applied` event: the profile and mode an
+/// `applied` answer just reported. `source` is `desktop` because an apply
+/// from the `/gentle:profiles` screen emits nothing on this channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileApplied {
+    pub profile: String,
+    pub mode: ProfileApplyMode,
+    pub source: String,
+}
+
+impl ProfileApplied {
+    fn from_data(data: &Value) -> Result<Self, DesktopRpcError> {
+        Ok(Self {
+            profile: profile_field(data)?,
+            mode: closed_field(data, "mode")?,
+            source: string_field(data, "source")?,
+        })
+    }
+}
+
+/// A required non-empty `profile` name.
+fn profile_field(data: &Value) -> Result<String, DesktopRpcError> {
+    let profile = string_field(data, "profile")?;
+    if profile.is_empty() {
+        return Err(DesktopRpcError::MalformedPayload(
+            "profile must not be empty".into(),
+        ));
+    }
+    Ok(profile)
+}
+
+/// A required array of `apply_profile` notes, possibly empty.
+fn note_entries(data: &Value) -> Result<Vec<ProfileNote>, DesktopRpcError> {
+    data.get("notes")
+        .and_then(Value::as_array)
+        .ok_or_else(|| DesktopRpcError::MalformedPayload("apply has no notes array".into()))?
+        .iter()
+        .map(ProfileNote::from_data)
+        .collect()
+}
+
+/// The documented `apply_profile` failure codes. Other codes
+/// (`invalid_request`, `internal_error`) are not specific to it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ProfileApplyErrorCode {
+    UnknownProfile,
+    ProfileApplyBusy,
+    ProfilesUnavailable,
+}
+
+impl ProfileApplyErrorCode {
+    /// Every apply failure code, in documented order.
+    pub const ALL: [Self; 3] = [
+        Self::UnknownProfile,
+        Self::ProfileApplyBusy,
+        Self::ProfilesUnavailable,
+    ];
+
+    /// The wire code.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::UnknownProfile => "unknown_profile",
+            Self::ProfileApplyBusy => "profile_apply_busy",
+            Self::ProfilesUnavailable => "profiles_unavailable",
+        }
+    }
+
+    /// The apply failure a wire code names, if it is one.
+    pub fn parse(code: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|candidate| candidate.as_str() == code)
+    }
+}
+
+impl fmt::Display for ProfileApplyErrorCode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// Pi's answer to the outer prompt: `disposition: "handled"` means accepted.
 /// The domain result is never here, it arrives as a widget record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2644,6 +2962,22 @@ impl DesktopSession {
         self.issue_with(
             DesktopMethod::SetConfig,
             set_config_params(&write, &expected_revision.into())?,
+        )
+    }
+
+    /// Issue `apply_profile` with exactly `{ profile, mode }` and, when
+    /// resending an approved confirmation, its `confirmation` token, refusing
+    /// the same names and tokens as [`DesktopRequest::apply_profile`] without
+    /// occupying the session.
+    pub fn issue_apply_profile(
+        &mut self,
+        profile: &str,
+        mode: ProfileApplyMode,
+        confirmation: Option<&str>,
+    ) -> Result<DesktopRequest, DesktopRpcError> {
+        self.issue_with(
+            DesktopMethod::ApplyProfile,
+            apply_profile_params(profile, mode, confirmation)?,
         )
     }
 
@@ -2989,6 +3323,16 @@ pub enum DesktopRpcError {
     InvalidPinProfile,
     /// A `set_config` request carried an empty `expectedRevision`.
     InvalidExpectedRevision,
+    /// An `apply_profile` profile name outside 1–128 characters.
+    InvalidProfileName,
+    /// An `apply_profile` confirmation token outside 1–128 characters.
+    InvalidConfirmationToken,
+    /// An `apply_profile` mode outside the closed vocabulary.
+    InvalidProfileApplyMode(String),
+    /// An `apply_profile` answer `status` outside the closed vocabulary.
+    InvalidProfileApplyStatus(String),
+    /// An `apply_profile` note `level` outside the closed vocabulary.
+    InvalidProfileNoteLevel(String),
     /// A method whose params only its typed constructor may build was sent
     /// through the generic path.
     TypedParamsRequired(DesktopMethod),
@@ -3099,6 +3443,23 @@ impl fmt::Display for DesktopRpcError {
             }
             Self::InvalidExpectedRevision => {
                 formatter.write_str("desktop expectedRevision must be a non-empty string")
+            }
+            Self::InvalidProfileName => write!(
+                formatter,
+                "desktop profile name must be 1 to {MAX_PROFILE_APPLY_UNITS} characters"
+            ),
+            Self::InvalidConfirmationToken => write!(
+                formatter,
+                "desktop confirmation token must be 1 to {MAX_PROFILE_APPLY_UNITS} characters"
+            ),
+            Self::InvalidProfileApplyMode(mode) => {
+                write!(formatter, "unknown desktop profile apply mode: {mode}")
+            }
+            Self::InvalidProfileApplyStatus(status) => {
+                write!(formatter, "unknown desktop profile apply status: {status}")
+            }
+            Self::InvalidProfileNoteLevel(level) => {
+                write!(formatter, "unknown desktop profile note level: {level}")
             }
             Self::TypedParamsRequired(method) => {
                 write!(

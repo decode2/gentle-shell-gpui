@@ -3,15 +3,17 @@
 //! adapter only builds the outer prompt and decodes the widget records.
 
 use pi_rpc::desktop_rpc::{
-    ConfigChanged, ConfigErrorCode, ConfigLayer, ConfigLayerSource, ConfigScope, ConfigState,
-    ConfigStatus, ConfigStore, ConfigWrite, ConfigWriteTarget, ConfigWriteTargetState,
-    DesignCanvas, DesignCanvasEvent, DesignEntry, DesignTransition, DesktopAgent, DesktopAgentStep,
-    DesktopAgentUsage, DesktopEvent, DesktopJob, DesktopMethod, DesktopRecord, DesktopRequest,
-    DesktopResponse, DesktopRpcError, DesktopSession, Handoff, JobExitCode, MAX_REQUEST_BYTES,
-    PROMPT_COMMAND, PermissionMode, PermissionModeChanged, PermissionModeState, PinSource,
-    ProfileFallbacksData, ProfilesData, ProviderUsage, RateLimitEvent, RateLimitSource, SCHEMA,
-    SetConfigResult, SetPermissionModeResult, UsageLimit, UsageLimitScope, UsageRefresh,
-    UsageResetAt, UsageStatus, UsageWindow, WIDGET_KEY, decode_payload, decode_widget,
+    ApplyProfileOutcome, ApplyProfileResult, ConfigChanged, ConfigErrorCode, ConfigLayer,
+    ConfigLayerSource, ConfigScope, ConfigState, ConfigStatus, ConfigStore, ConfigWrite,
+    ConfigWriteTarget, ConfigWriteTargetState, DesignCanvas, DesignCanvasEvent, DesignEntry,
+    DesignTransition, DesktopAgent, DesktopAgentStep, DesktopAgentUsage, DesktopEvent, DesktopJob,
+    DesktopMethod, DesktopRecord, DesktopRequest, DesktopResponse, DesktopRpcError, DesktopSession,
+    Handoff, JobExitCode, MAX_REQUEST_BYTES, PROMPT_COMMAND, PermissionMode, PermissionModeChanged,
+    PermissionModeState, PinSource, ProfileApplied, ProfileApplyErrorCode, ProfileApplyMode,
+    ProfileConfirmation, ProfileFallbacksData, ProfileNote, ProfileNoteLevel, ProfilesData,
+    ProviderUsage, RateLimitEvent, RateLimitSource, SCHEMA, SetConfigResult,
+    SetPermissionModeResult, UsageLimit, UsageLimitScope, UsageRefresh, UsageResetAt, UsageStatus,
+    UsageWindow, WIDGET_KEY, decode_payload, decode_widget,
 };
 use pi_rpc::{Response, UiMethod, UiRequest};
 use serde_json::{Value, json};
@@ -3741,6 +3743,8 @@ fn config_failures_keep_their_documented_codes() {
         (ConfigErrorCode::RevisionConflict, "revision_conflict"),
         (ConfigErrorCode::WriteFailed, "write_failed"),
         (ConfigErrorCode::ConfigUnavailable, "config_unavailable"),
+        // A profile store write refused while an apply runs elsewhere.
+        (ConfigErrorCode::ProfileApplyBusy, "profile_apply_busy"),
     ];
     assert_eq!(ConfigErrorCode::ALL.len(), codes.len());
     for (code, name) in codes {
@@ -3984,4 +3988,495 @@ fn capabilities_expose_the_config_methods_and_event() {
     assert!(without.supports(DesktopMethod::GetConfig));
     assert!(!without.supports(DesktopMethod::SetConfig));
     assert!(!without.emits("config_changed"));
+}
+
+// --- profile apply: apply_profile and profile_applied ---------------------
+
+fn apply_response(data: Value) -> DesktopResponse {
+    record_response(
+        decode_widget(&widget(&response_line("desktop-1", data)))
+            .unwrap()
+            .unwrap(),
+    )
+}
+
+fn confirmation_data() -> Value {
+    json!({
+        "profile": "team",
+        "mode": "default",
+        "status": "confirmation_required",
+        "confirmation": {
+            "title": "Apply profile \"team\"?",
+            "message": "Profile \"team\" has agent routing entries. Continue?",
+            "token": "3f1c",
+        },
+    })
+}
+
+#[test]
+fn apply_profile_uses_the_exact_wire_names() {
+    assert_eq!(DesktopMethod::ApplyProfile.as_str(), "apply_profile");
+    assert_eq!(
+        DesktopMethod::parse("apply_profile").unwrap(),
+        DesktopMethod::ApplyProfile
+    );
+    assert_eq!(
+        ProfileApplyMode::ALL.map(ProfileApplyMode::as_str),
+        ["default", "session"]
+    );
+    for mode in ProfileApplyMode::ALL {
+        assert_eq!(mode.as_str().parse::<ProfileApplyMode>().unwrap(), mode);
+        assert_eq!(mode.to_string(), mode.as_str());
+    }
+    for unknown in ["", "Default", "global", "repo"] {
+        assert!(matches!(
+            unknown.parse::<ProfileApplyMode>(),
+            Err(DesktopRpcError::InvalidProfileApplyMode(got)) if got == unknown
+        ));
+    }
+}
+
+#[test]
+fn apply_profile_sends_exactly_profile_mode_and_an_optional_confirmation() {
+    let first =
+        DesktopRequest::apply_profile("desktop-62", "team", ProfileApplyMode::Default, None)
+            .unwrap();
+    assert_eq!(first.method(), DesktopMethod::ApplyProfile);
+    assert_eq!(
+        first.payload(),
+        format!(
+            r#"{{"schema":"{SCHEMA}","requestId":"desktop-62","method":"apply_profile","params":{{"profile":"team","mode":"default"}}}}"#
+        )
+    );
+    let confirmed = DesktopRequest::apply_profile(
+        "desktop-63",
+        "team",
+        ProfileApplyMode::Default,
+        Some("3f1c"),
+    )
+    .unwrap();
+    assert_eq!(
+        confirmed.payload(),
+        request_payload(
+            "desktop-63",
+            "apply_profile",
+            json!({ "profile": "team", "mode": "default", "confirmation": "3f1c" }),
+        )
+    );
+    let session =
+        DesktopRequest::apply_profile("desktop-64", "team", ProfileApplyMode::Session, None)
+            .unwrap();
+    assert_eq!(
+        session.payload(),
+        request_payload(
+            "desktop-64",
+            "apply_profile",
+            json!({ "profile": "team", "mode": "session" }),
+        )
+    );
+}
+
+#[test]
+fn apply_profile_rejects_unusable_names_and_tokens_before_sending() {
+    let long = "p".repeat(129);
+    for profile in ["", long.as_str()] {
+        assert!(matches!(
+            DesktopRequest::apply_profile("desktop-1", profile, ProfileApplyMode::Default, None),
+            Err(DesktopRpcError::InvalidProfileName)
+        ));
+    }
+    assert!(
+        DesktopRequest::apply_profile(
+            "desktop-1",
+            &"p".repeat(128),
+            ProfileApplyMode::Default,
+            None
+        )
+        .is_ok()
+    );
+    for token in ["", long.as_str()] {
+        assert!(matches!(
+            DesktopRequest::apply_profile(
+                "desktop-1",
+                "team",
+                ProfileApplyMode::Default,
+                Some(token)
+            ),
+            Err(DesktopRpcError::InvalidConfirmationToken)
+        ));
+    }
+    let mut session = DesktopSession::new();
+    assert!(matches!(
+        session.issue_apply_profile("", ProfileApplyMode::Session, None),
+        Err(DesktopRpcError::InvalidProfileName)
+    ));
+    // A refused request never occupies the session.
+    assert!(session.pending().is_none());
+    // Only the typed API builds the method.
+    assert!(matches!(
+        DesktopRequest::new(
+            "desktop-1",
+            DesktopMethod::ApplyProfile,
+            json!({ "profile": "team", "mode": "default", "path": "/etc" }),
+        ),
+        Err(DesktopRpcError::TypedParamsRequired(
+            DesktopMethod::ApplyProfile
+        ))
+    ));
+    assert!(matches!(
+        session.issue(DesktopMethod::ApplyProfile),
+        Err(DesktopRpcError::TypedParamsRequired(
+            DesktopMethod::ApplyProfile
+        ))
+    ));
+}
+
+#[test]
+fn apply_profile_decodes_a_confirmation_with_its_exact_text_and_token() {
+    let result = apply_response(confirmation_data()).apply_profile().unwrap();
+    assert_eq!(
+        result,
+        ApplyProfileResult {
+            profile: "team".into(),
+            mode: ProfileApplyMode::Default,
+            outcome: ApplyProfileOutcome::ConfirmationRequired(ProfileConfirmation {
+                title: "Apply profile \"team\"?".into(),
+                message: "Profile \"team\" has agent routing entries. Continue?".into(),
+                token: "3f1c".into(),
+            }),
+        }
+    );
+}
+
+#[test]
+fn apply_profile_decodes_applied_and_not_applied_with_their_notes() {
+    let applied = apply_response(json!({
+        "profile": "team",
+        "mode": "session",
+        "status": "applied",
+        "notes": [
+            { "level": "warning", "text": "Seeded profiles.json." },
+            { "level": "info", "text": "Applied profile \"team\"." },
+        ],
+    }))
+    .apply_profile()
+    .unwrap();
+    assert_eq!(applied.mode, ProfileApplyMode::Session);
+    assert_eq!(
+        applied.outcome,
+        ApplyProfileOutcome::Applied(vec![
+            ProfileNote {
+                level: ProfileNoteLevel::Warning,
+                text: "Seeded profiles.json.".into(),
+            },
+            ProfileNote {
+                level: ProfileNoteLevel::Info,
+                text: "Applied profile \"team\".".into(),
+            },
+        ])
+    );
+
+    // `not_applied` may end with no notice at all.
+    let quiet = apply_response(json!({
+        "profile": "team",
+        "mode": "default",
+        "status": "not_applied",
+        "notes": [],
+    }))
+    .apply_profile()
+    .unwrap();
+    assert_eq!(quiet.outcome, ApplyProfileOutcome::NotApplied(vec![]));
+    let failed = apply_response(json!({
+        "profile": "team",
+        "mode": "default",
+        "status": "not_applied",
+        "notes": [{ "level": "error", "text": "rolled back" }],
+    }))
+    .apply_profile()
+    .unwrap();
+    assert_eq!(
+        failed.outcome,
+        ApplyProfileOutcome::NotApplied(vec![ProfileNote {
+            level: ProfileNoteLevel::Error,
+            text: "rolled back".into(),
+        }])
+    );
+    assert_eq!(
+        ProfileNoteLevel::ALL.map(ProfileNoteLevel::as_str),
+        ["info", "warning", "error"]
+    );
+}
+
+#[test]
+fn apply_profile_rejects_answers_outside_the_contract() {
+    let applied = json!({
+        "profile": "team",
+        "mode": "default",
+        "status": "applied",
+        "notes": [{ "level": "info", "text": "ok" }],
+    });
+    let with = |base: &Value, key: &str, value: Value| {
+        let mut data = base.clone();
+        data[key] = value;
+        data
+    };
+    let without = |base: &Value, key: &str| {
+        let mut data = base.clone();
+        data.as_object_mut().unwrap().remove(key);
+        data
+    };
+    let confirmation = confirmation_data();
+    let cases: Vec<(&str, Value)> = vec![
+        ("missing profile", without(&applied, "profile")),
+        ("empty profile", with(&applied, "profile", json!(""))),
+        ("unknown mode", with(&applied, "mode", json!("global"))),
+        ("unknown status", with(&applied, "status", json!("done"))),
+        ("missing notes", without(&applied, "notes")),
+        ("notes not an array", with(&applied, "notes", json!("ok"))),
+        (
+            "unknown note level",
+            with(
+                &applied,
+                "notes",
+                json!([{ "level": "debug", "text": "x" }]),
+            ),
+        ),
+        (
+            "note without text",
+            with(&applied, "notes", json!([{ "level": "info" }])),
+        ),
+        (
+            "confirmation missing",
+            without(&confirmation, "confirmation"),
+        ),
+        (
+            "confirmation without token",
+            with(
+                &confirmation,
+                "confirmation",
+                json!({ "title": "t", "message": "m" }),
+            ),
+        ),
+        (
+            "confirmation with an empty token",
+            with(
+                &confirmation,
+                "confirmation",
+                json!({ "title": "t", "message": "m", "token": "" }),
+            ),
+        ),
+        (
+            "confirmation without a message",
+            with(
+                &confirmation,
+                "confirmation",
+                json!({ "title": "t", "token": "x" }),
+            ),
+        ),
+    ];
+    for (label, data) in cases {
+        assert!(
+            apply_response(data.clone()).apply_profile().is_err(),
+            "{label}: {data} must not decode as an apply_profile answer"
+        );
+    }
+    assert!(matches!(
+        apply_response(with(&applied, "status", json!("done"))).apply_profile(),
+        Err(DesktopRpcError::InvalidProfileApplyStatus(got)) if got == "done"
+    ));
+    assert!(matches!(
+        apply_response(with(
+            &applied,
+            "notes",
+            json!([{ "level": "debug", "text": "x" }])
+        ))
+        .apply_profile(),
+        Err(DesktopRpcError::InvalidProfileNoteLevel(got)) if got == "debug"
+    ));
+}
+
+#[test]
+fn apply_profile_failures_keep_their_documented_codes() {
+    let codes = [
+        (ProfileApplyErrorCode::UnknownProfile, "unknown_profile"),
+        (
+            ProfileApplyErrorCode::ProfileApplyBusy,
+            "profile_apply_busy",
+        ),
+        (
+            ProfileApplyErrorCode::ProfilesUnavailable,
+            "profiles_unavailable",
+        ),
+    ];
+    assert_eq!(ProfileApplyErrorCode::ALL.len(), codes.len());
+    for (code, name) in codes {
+        assert_eq!(code.as_str(), name);
+        assert_eq!(code.to_string(), name);
+        assert_eq!(ProfileApplyErrorCode::parse(name), Some(code));
+        let response = record_response(
+            decode_widget(&widget(&error_line("desktop-1", name, "nope")))
+                .unwrap()
+                .unwrap(),
+        );
+        let info = response.error().unwrap();
+        assert_eq!(info.profile_apply_error(), Some(code));
+        // Only `profile_apply_busy` is also a `set_config` failure.
+        assert_eq!(
+            info.config_error(),
+            (code == ProfileApplyErrorCode::ProfileApplyBusy)
+                .then_some(ConfigErrorCode::ProfileApplyBusy)
+        );
+        assert!(matches!(
+            response.apply_profile(),
+            Err(DesktopRpcError::RemoteError(info)) if info.code == name
+        ));
+    }
+    assert_eq!(ProfileApplyErrorCode::parse("invalid_request"), None);
+    assert_eq!(ProfileApplyErrorCode::parse("revision_conflict"), None);
+}
+
+#[test]
+fn profile_applied_decodes_its_exact_data_and_checks_the_event_name() {
+    let data = json!({ "profile": "team", "mode": "default", "source": "desktop" });
+    let event = config_event(3, "profile_applied", data.clone());
+    assert_eq!(
+        event.profile_applied().unwrap(),
+        ProfileApplied {
+            profile: "team".into(),
+            mode: ProfileApplyMode::Default,
+            source: "desktop".into(),
+        }
+    );
+    let foreign = config_event(4, "config_changed", data.clone());
+    assert!(matches!(
+        foreign.profile_applied(),
+        Err(DesktopRpcError::UnexpectedEvent { expected: "profile_applied", got })
+            if got == "config_changed"
+    ));
+    let mut bad: Vec<Value> = Vec::new();
+    for key in ["profile", "mode", "source"] {
+        let mut missing = data.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        bad.push(missing);
+    }
+    for (key, value) in [
+        ("profile", json!("")),
+        ("mode", json!("global")),
+        ("source", json!(7)),
+    ] {
+        let mut wrong = data.clone();
+        wrong[key] = value;
+        bad.push(wrong);
+    }
+    for data in bad {
+        assert!(
+            config_event(5, "profile_applied", data.clone())
+                .profile_applied()
+                .is_err(),
+            "{data} must not decode as profile_applied"
+        );
+    }
+}
+
+#[test]
+fn apply_profile_flows_through_session_correlation_and_sequence() {
+    let mut session = DesktopSession::new();
+    let ask = session
+        .issue_apply_profile("team", ProfileApplyMode::Default, None)
+        .unwrap();
+    assert_eq!(ask.request_id(), "desktop-1");
+    assert_eq!(
+        session.pending(),
+        Some(("desktop-1", DesktopMethod::ApplyProfile))
+    );
+    assert!(matches!(
+        session.issue_apply_profile("team", ProfileApplyMode::Default, Some("3f1c")),
+        Err(DesktopRpcError::RequestInFlight { .. })
+    ));
+    let answered = session
+        .accept(&widget(&response_line("desktop-1", confirmation_data())))
+        .unwrap()
+        .unwrap();
+    let ApplyProfileOutcome::ConfirmationRequired(confirmation) =
+        record_response(answered).apply_profile().unwrap().outcome
+    else {
+        panic!("a confirmation was asked")
+    };
+    assert!(session.pending().is_none());
+
+    // The human approved: the same profile and mode, with the token.
+    let confirmed = session
+        .issue_apply_profile(
+            "team",
+            ProfileApplyMode::Default,
+            Some(confirmation.token.as_str()),
+        )
+        .unwrap();
+    assert_eq!(confirmed.request_id(), "desktop-2");
+    assert_eq!(
+        confirmed.payload(),
+        request_payload(
+            "desktop-2",
+            "apply_profile",
+            json!({ "profile": "team", "mode": "default", "confirmation": "3f1c" }),
+        )
+    );
+    session
+        .accept(&widget(&error_line(
+            "desktop-2",
+            "profile_apply_busy",
+            "busy",
+        )))
+        .unwrap();
+    assert!(session.pending().is_none());
+
+    let event = session
+        .accept(&widget(&event_line(
+            7,
+            "profile_applied",
+            json!({ "profile": "team", "mode": "default", "source": "desktop" }),
+        )))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        record_event(event).profile_applied().unwrap().profile,
+        "team"
+    );
+    assert!(matches!(
+        session.accept(&widget(&event_line(
+            9,
+            "profile_applied",
+            json!({ "profile": "team", "mode": "default", "source": "desktop" }),
+        ))),
+        Err(DesktopRpcError::OutOfOrderSequence { .. })
+    ));
+}
+
+#[test]
+fn capabilities_expose_the_profile_apply_method_and_event() {
+    let capabilities = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            capabilities_data(&["capabilities", "apply_profile"], &["profile_applied"]),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .capabilities()
+    .unwrap();
+    assert!(capabilities.supports(DesktopMethod::ApplyProfile));
+    assert!(capabilities.emits("profile_applied"));
+
+    let older = record_response(
+        decode_widget(&widget(&response_line(
+            "desktop-1",
+            capabilities_data(&["capabilities", "get_config", "set_config"], &[]),
+        )))
+        .unwrap()
+        .unwrap(),
+    )
+    .capabilities()
+    .unwrap();
+    assert!(!older.supports(DesktopMethod::ApplyProfile));
+    assert!(!older.emits("profile_applied"));
 }

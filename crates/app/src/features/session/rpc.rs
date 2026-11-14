@@ -21,7 +21,7 @@ use super::state::desktop::{self, Applied as DesktopApplied, Send as DesktopSend
 use super::state::{BackendStatus, ModelInfo};
 use super::{SessionEvent, SessionView, attachments, builtins};
 use crate::features::profiles::{
-    ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport, ConfigTicket,
+    ConfigChange, ConfigFailure, ConfigOutcome, ConfigSupport, ConfigTicket, ProfileApply,
 };
 use gentle_core::transcript::NoticeLevel;
 
@@ -172,13 +172,17 @@ impl SessionView {
     /// Act on a config decision: say what failed (old Shells without the
     /// methods stay silent, the Profiles screen keeps its direct-file path),
     /// send what the slice asked for, and wake the screen, which takes its
-    /// outcomes and changes from the session.
+    /// outcomes and changes from the session. A profile Gentle Shell applied
+    /// may have switched this session's orchestrator, so its model is re-read.
     pub(super) fn apply_config(&mut self, applied: ConfigApplied, cx: &mut Context<Self>) {
         if let Some(report) = &applied.report
             && !report.is_legacy()
         {
             self.transcript
                 .notice(NoticeLevel::Warning, report.message());
+        }
+        if applied.profile_applied {
+            self.refresh_model(cx);
         }
         self.send_desktop(applied.sends, cx);
         // A gap seen while the config request was in flight is due now that it
@@ -228,6 +232,26 @@ impl SessionView {
         cx: &mut Context<Self>,
     ) -> Result<ConfigTicket, ConfigFailure> {
         let ticket = self.desktop.config_set(write, expected_revision)?;
+        self.sync_config(cx);
+        Ok(ticket)
+    }
+
+    /// Whether this tab's Gentle Shell applies saved profiles itself
+    /// (`apply_profile`); otherwise the Profiles screen applies them on its
+    /// own, as before.
+    pub(crate) fn profile_apply_supported(&self) -> bool {
+        matches!(self.backend.status, BackendStatus::Ready(_))
+            && self.desktop.profile_apply_supported()
+    }
+
+    /// Ask Gentle Shell to apply a saved profile; the answer arrives as an
+    /// outcome for the returned ticket.
+    pub(crate) fn config_apply_profile(
+        &mut self,
+        request: ProfileApply,
+        cx: &mut Context<Self>,
+    ) -> Result<ConfigTicket, ConfigFailure> {
+        let ticket = self.desktop.config_apply_profile(request)?;
         self.sync_config(cx);
         Ok(ticket)
     }
@@ -389,7 +413,7 @@ impl SessionView {
                 let applied = self.desktop.design_expire(generation);
                 self.apply_design(applied, cx);
             }
-            DesktopMethod::GetConfig | DesktopMethod::SetConfig => {
+            DesktopMethod::GetConfig | DesktopMethod::SetConfig | DesktopMethod::ApplyProfile => {
                 let applied = self.desktop.config_expire(generation);
                 self.apply_config(applied, cx);
             }
@@ -434,7 +458,7 @@ impl SessionView {
                 let applied = self.desktop.design_outer(generation, handled);
                 self.apply_design(applied, cx);
             }
-            DesktopMethod::GetConfig | DesktopMethod::SetConfig => {
+            DesktopMethod::GetConfig | DesktopMethod::SetConfig | DesktopMethod::ApplyProfile => {
                 let applied = self.desktop.config_outer(generation, handled);
                 self.apply_config(applied, cx);
             }
@@ -497,6 +521,19 @@ impl SessionView {
                 }
             }
         });
+        self.refresh_stats(cx);
+    }
+
+    /// Re-read the session's model and thinking level after something other
+    /// than the picker moved them (a profile Gentle Shell applied).
+    fn refresh_model(&mut self, cx: &mut Context<Self>) {
+        self.request(json!({"type": "get_state"}), cx, |this, result, _| {
+            if let Some(state) = this.report(result) {
+                this.models.current = ModelInfo::parse(&state["model"]);
+                this.models.thinking = state["thinkingLevel"].as_str().unwrap_or("off").to_string();
+            }
+        });
+        self.refresh_thinking_levels(cx);
         self.refresh_stats(cx);
     }
 
