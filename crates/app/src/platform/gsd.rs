@@ -177,4 +177,30 @@ mod tests {
         assert!(!is_ours(&path));
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_shim_escapes_percent_and_returns_to_the_prompt() {
+        let body = shim_body(std::path::Path::new(r"C:@%\Gentle Shell\gs.exe"));
+        assert!(body.contains(r#"start "" "C:@%%\Gentle Shell\gs.exe" --cwd %*"#));
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn unix_shim_quotes_the_path_and_runs_in_the_background() {
+        let body = shim_body(std::path::Path::new("/Apps/It's/gs"));
+        assert!(body.contains(r#"'/Apps/It'''s/gs' --cwd "$@" >/dev/null 2>&1 &"#));
+    }
+
+    #[test]
+    fn rewriting_the_same_shim_leaves_it_untouched() {
+        let dir = std::env::temp_dir().join(format!("gsd-idem-test-{}", std::process::id()));
+        let path = dir.join("gsd");
+        let exe = std::path::Path::new("/x/gs");
+        write_shim(&path, exe).unwrap();
+        let first = std::fs::metadata(&path).unwrap().modified().unwrap();
+        write_shim(&path, exe).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), first);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }

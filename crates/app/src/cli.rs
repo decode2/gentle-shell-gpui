@@ -102,4 +102,11 @@ mod tests {
         );
         std::fs::remove_dir_all(&base).unwrap();
     }
+
+    #[test]
+    fn a_missing_folder_never_falls_back_to_the_current_directory() {
+        let here = std::env::temp_dir();
+        let missing = here.join("gsd-definitely-missing-folder");
+        assert_eq!(resolve_folder(Some(missing), true, Some(here)), None);
+    }
 }
