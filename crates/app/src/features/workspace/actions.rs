@@ -197,6 +197,15 @@ impl Workspace {
         self.open_palette(Category::All, window, cx);
     }
 
+    pub(super) fn on_open_explorer(
+        &mut self,
+        _: &OpenExplorer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_explorer(window, cx);
+    }
+
     pub(super) fn on_open_workspaces(
         &mut self,
         _: &OpenWorkspaces,

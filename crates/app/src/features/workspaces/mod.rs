@@ -84,6 +84,13 @@ impl Default for SavedState {
 
 pub const VERSION: u32 = 1;
 
+/// How a workspace root is compared: canonical, so a folder reached through
+/// a symlink, `..` or another drive-letter case finds the same workspace as
+/// `gsd` (which passes canonical paths). Unresolvable paths stay as given.
+pub fn root_key(path: PathBuf) -> PathBuf {
+    dunce::canonicalize(&path).unwrap_or(path)
+}
+
 pub fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

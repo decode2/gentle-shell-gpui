@@ -95,6 +95,23 @@ impl PaletteView {
             );
         }
         rows.push(Row {
+            icon: IconName::Folder,
+            title: "Browse folders…".into(),
+            meta: String::new(),
+            detail: format!(
+                "Open Gentle Shell in any folder ({}O)",
+                if cfg!(target_os = "macos") {
+                    "⌘"
+                } else {
+                    "Ctrl+"
+                }
+            ),
+            group: "Workspaces",
+            action: PaletteAction::OpenExplorer,
+            workspace: None,
+            current: false,
+        });
+        rows.push(Row {
             icon: IconName::FolderOpen,
             title: "Create workspace from folder…".into(),
             meta: String::new(),

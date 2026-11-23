@@ -91,6 +91,18 @@ pub(super) fn screen_rows() -> Vec<Row> {
             PaletteAction::Welcome,
         ),
         row(
+            IconName::Folder,
+            "Browse folders",
+            &format!("Open Gentle Shell in any folder, oil-style ({cmd}O)"),
+            PaletteAction::OpenExplorer,
+        ),
+        row(
+            IconName::Terminal,
+            "Install `gsd` command",
+            "Type gsd in any terminal folder to open it here as a workspace",
+            PaletteAction::InstallGsd,
+        ),
+        row(
             IconName::Plus,
             "New session",
             &format!("Start a fresh conversation in this pane ({cmd}N)"),

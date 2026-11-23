@@ -7,6 +7,7 @@ pub mod alert_timing;
 pub mod commands;
 pub mod devices;
 pub mod engram;
+pub mod explorer;
 pub mod fuzzy;
 pub mod gentle_state;
 pub mod git;

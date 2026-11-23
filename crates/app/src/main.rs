@@ -15,13 +15,10 @@ fn main() {
     if args.next().as_deref() == Some("--device") {
         std::process::exit(features::devices::cli::run(args.collect()));
     }
-    // An explicit folder selects (or creates) the workspace rooted there;
-    // without one the last workspace is restored.
+    // An explicit folder (or `--cwd`, which `gsd` passes) selects or creates
+    // the workspace rooted there; without one the last workspace is restored.
     let cli = cli::parse_cli();
-    let folder = cli
-        .folder
-        .filter(|p| p.is_dir())
-        .and_then(|p| dunce::canonicalize(p).ok());
+    let folder = cli::requested_folder(&cli);
     let prompt = cli.prompt;
     let url = cli.url;
     if let Some(url) = url.as_deref()
@@ -44,6 +41,7 @@ fn main() {
     // `gentle-open` and `gentle-device` live in the toolchain folder the
     // agents get on PATH; create them before that PATH is computed.
     platform::shims::install();
+    platform::gsd::refresh();
     // What every agent is told about opening pages and devices in the app.
     pi_rpc::set_system_prompt(features::devices::agent_instructions(
         setup::devices::prefs(),

@@ -90,3 +90,20 @@ fn file_round_trip() {
     assert_eq!(load_from(&path), None);
     let _ = std::fs::remove_dir_all(dir);
 }
+
+#[test]
+fn a_folder_reached_another_way_keys_the_same_workspace() {
+    let base = std::env::temp_dir().join(format!("ws-key-test-{}", std::process::id()));
+    std::fs::create_dir_all(base.join("a")).unwrap();
+    let canonical = dunce::canonicalize(base.join("a")).unwrap();
+    // The explorer builds `dir.join(name)`; `gsd` passes a canonical path.
+    assert_eq!(
+        super::root_key(base.join("a").join("..").join("a")),
+        canonical
+    );
+    assert_eq!(super::root_key(canonical.clone()), canonical);
+    // A folder that can't be resolved keeps its path.
+    let missing = base.join("missing");
+    assert_eq!(super::root_key(missing.clone()), missing);
+    std::fs::remove_dir_all(&base).unwrap();
+}
