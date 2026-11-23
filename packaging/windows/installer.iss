@@ -36,12 +36,16 @@ SolidCompression=yes
 ; Close a running Gentle Shell before replacing it, and start it again after.
 CloseApplications=yes
 RestartApplications=yes
+; `gsd` goes on the user PATH: tell running programs the environment changed.
+ChangesEnvironment=yes
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; Flags: ignoreversion
+; `gsd`: open Gentle Shell from any terminal folder (see crates/app/src/platform/gsd.rs).
+Source: "gsd.cmd"; DestDir: "{app}\bin"; Flags: ignoreversion
 
 [Icons]
 Name: "{autoprograms}\Gentle Shell"; Filename: "{app}\gentle-shell-gpui.exe"
@@ -53,3 +57,41 @@ Filename: "{app}\gentle-shell-gpui.exe"; Description: "{cm:LaunchProgram,Gentle 
 [UninstallDelete]
 ; The previous exe an in-app update leaves until the next start.
 Type: files; Name: "{app}\gentle-shell-gpui.exe.old"
+
+[Registry]
+; Append {app}\bin to the user PATH once; the uninstaller takes it out again.
+Root: HKCU; Subkey: "Environment"; ValueType: expandsz; ValueName: "Path"; ValueData: "{olddata};{app}\bin"; Check: NeedsAddPath(ExpandConstant('{app}\bin'))
+
+[Code]
+function PathHasEntry(Path, Entry: string): Boolean;
+begin
+  Result := Pos(';' + Uppercase(Entry) + ';', ';' + Uppercase(Path) + ';') > 0;
+end;
+
+function NeedsAddPath(Entry: string): Boolean;
+var
+  Path: string;
+begin
+  if not RegQueryStringValue(HKCU, 'Environment', 'Path', Path) then
+    Path := '';
+  Result := not PathHasEntry(Path, Entry);
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+  Path, Entry: string;
+  P: Integer;
+begin
+  if CurUninstallStep <> usUninstall then
+    exit;
+  if not RegQueryStringValue(HKCU, 'Environment', 'Path', Path) then
+    exit;
+  Entry := ExpandConstant('{app}\bin');
+  Path := ';' + Path + ';';
+  P := Pos(';' + Uppercase(Entry) + ';', Uppercase(Path));
+  if P = 0 then
+    exit;
+  Delete(Path, P, Length(Entry) + 1);
+  Path := Copy(Path, 2, Length(Path) - 2);
+  RegWriteExpandStringValue(HKCU, 'Environment', 'Path', Path);
+end;

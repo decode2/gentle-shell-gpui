@@ -36,6 +36,8 @@ pub enum PaletteAction {
     Setup,
     /// The first-run welcome screen, from its intro.
     Welcome,
+    /// Put the `gsd` command on the user's PATH.
+    InstallGsd,
     Agents,
     NewSession,
     /// A new tab with an agent pane.

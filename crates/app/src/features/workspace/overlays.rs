@@ -83,6 +83,7 @@ impl Workspace {
             PaletteAction::Settings => self.open_settings(window, cx),
             PaletteAction::Setup => self.open_onboarding(None, window, cx),
             PaletteAction::Welcome => self.open_welcome(None, window, cx),
+            PaletteAction::InstallGsd => self.install_gsd(window, cx),
             PaletteAction::NewTab => self.on_new_tab(&NewTab, window, cx),
             PaletteAction::NewTerminalTab => self.on_new_terminal_tab(&NewTerminalTab, window, cx),
             PaletteAction::TilePane => self.tile(None, window, cx),
@@ -129,6 +130,24 @@ impl Workspace {
             PaletteAction::OpenFile(path) => self.open_file(path, window, cx),
             PaletteAction::SwitchBranch(branch) => self.confirm_switch_branch(branch, window, cx),
         }
+    }
+
+    /// Palette → Install `gsd` command; the result arrives as a notification.
+    fn install_gsd(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        cx.spawn_in(window, async move |_, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::platform::gsd::install() })
+                .await;
+            let _ = cx.update(|window, cx| {
+                let note = match result {
+                    Ok(message) => Notification::success(message),
+                    Err(message) => Notification::error(message),
+                };
+                window.push_notification(note, cx);
+            });
+        })
+        .detach();
     }
 
     /// Play the max-effort surge over the window; choosing max again
