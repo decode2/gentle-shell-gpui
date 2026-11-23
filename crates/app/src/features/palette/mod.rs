@@ -38,6 +38,8 @@ pub enum PaletteAction {
     Welcome,
     /// Put the `gsd` command on the user's PATH.
     InstallGsd,
+    /// The folder explorer: pick a folder and open Gentle Shell there.
+    OpenExplorer,
     Agents,
     NewSession,
     /// A new tab with an agent pane.
